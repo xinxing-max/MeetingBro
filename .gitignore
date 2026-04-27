@@ -1,0 +1,30 @@
+.env
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Frontend dependencies/build artifacts
+app/frontend/node_modules/
+app/frontend/dist/
+app/frontend/dist-node-types/
+app/frontend/*.tsbuildinfo
+app/frontend/tsconfig*.tsbuildinfo
+
+# Local runtime data
+data/*.db
+data/*.db-*
+data/meetingbro.db
+data/meetingbro.db-*
+data/voice_test_*.wav
+
+# Exports and local scratch output
+exports/*
+!exports/.gitkeep
+.backup/
+
+# Python package metadata
+*.egg-info/
+app/backend/*.egg-info/
