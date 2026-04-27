@@ -18,6 +18,8 @@ export interface TranscriptSegment {
   speaker_id: string | null;
   confidence: number;
   translations: Partial<Record<LanguageCode, string>>;
+  created_at: string;
+  emitted_at_elapsed_seconds?: number | null;
 }
 
 export interface SummarySnapshot {
@@ -34,15 +36,6 @@ export interface SummarySnapshot {
   created_at: string;
 }
 
-export interface Speaker {
-  id: string;
-  meeting_id: string;
-  display_name: string | null;
-  inferred_label: string;
-  confidence: number;
-  is_local_user: boolean;
-}
-
 export interface Note {
   id: string;
   meeting_id: string;
@@ -54,10 +47,28 @@ export interface Note {
 
 export type SessionState = "starting" | "running" | "paused" | "ended";
 
+export interface SessionStatePayload {
+  state: SessionState;
+  meeting_id: string;
+  elapsed_seconds: number;
+  source: string;
+  live_translation_language: LanguageCode | null;
+  retry_windows_total: number;
+  retry_windows_improved: number;
+  retry_windows_unchanged: number;
+  retry_windows_diverged: number;
+  last_backpressure_elapsed_seconds: number | null;
+  mixed_microphone_gain: number | null;
+  mixed_system_gain: number | null;
+  mixed_effective_microphone_gain: number | null;
+  mixed_auto_balance_enabled: boolean | null;
+}
+
 export type SessionEvent =
   | { type: "transcript_segment"; payload: TranscriptSegment }
+  | { type: "transcript_translation"; payload: { segment_id: string; language: LanguageCode; text: string } }
+  | { type: "transcript_preview"; payload: { segment: TranscriptSegment | null } }
   | { type: "summary_snapshot"; payload: SummarySnapshot }
-  | { type: "speaker_update"; payload: Speaker }
   | { type: "note_saved"; payload: Note }
-  | { type: "session_state"; payload: { state: SessionState; meeting_id: string } }
+  | { type: "session_state"; payload: SessionStatePayload }
   | { type: "error"; payload: { code: string; message: string } };

@@ -152,6 +152,14 @@ $env:MEETINGBRO_LLM_MODEL="LongCat-Flash-Chat"
 If no cloud key is configured, the backend falls back to local heuristic
 summaries and passthrough translation markers.
 
+Whisper model size is configurable. The backend default is `base`; use `small`
+or `medium` for better multilingual Chinese/English/German recognition when
+CPU speed is acceptable:
+
+```powershell
+$env:MEETINGBRO_WHISPER_SIZE="small"
+```
+
 You may also put the same settings in a project-root `.env` file. Both dotenv
 syntax and PowerShell-style syntax are accepted:
 

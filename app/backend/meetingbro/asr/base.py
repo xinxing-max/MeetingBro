@@ -16,6 +16,9 @@ class ASRSegment:
     text: str
     language: OriginalLanguage
     confidence: float
+    avg_logprob: Optional[float] = None
+    no_speech_prob: Optional[float] = None
+    compression_ratio: Optional[float] = None
 
 
 class ASRAdapter(ABC):
@@ -34,5 +37,7 @@ class ASRAdapter(ABC):
         *,
         forced_language: Optional[str] = None,
         offset_seconds: float = 0.0,
+        initial_prompt: Optional[str] = None,
+        quality_preset: str = "realtime",
     ) -> list[ASRSegment]:
         ...

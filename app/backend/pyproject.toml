@@ -13,9 +13,11 @@ dependencies = [
   "pydantic>=2.7",
   "websockets>=12",
   "faster-whisper>=1.0",
+  "silero-vad>=6.2",
   "sounddevice>=0.5",
   "soundfile>=0.12",
   "numpy>=1.26",
+  "scipy>=1.11",
 ]
 
 [project.optional-dependencies]

@@ -31,6 +31,8 @@ class TranscriptSegment(BaseModel):
     speaker_id: Optional[str] = None
     confidence: float = Field(ge=0.0, le=1.0)
     translations: dict[LanguageCode, str] = Field(default_factory=dict)
+    created_at: datetime
+    emitted_at_elapsed_seconds: Optional[float] = None
 
 
 class SummarySnapshot(BaseModel):
@@ -68,6 +70,28 @@ class Note(BaseModel):
 class SessionStatePayload(BaseModel):
     state: SessionState
     meeting_id: str
+    elapsed_seconds: float = 0.0
+    source: str = "mic"
+    live_translation_language: Optional[LanguageCode] = None
+    retry_windows_total: int = 0
+    retry_windows_improved: int = 0
+    retry_windows_unchanged: int = 0
+    retry_windows_diverged: int = 0
+    last_backpressure_elapsed_seconds: Optional[float] = None
+    mixed_microphone_gain: Optional[float] = None
+    mixed_system_gain: Optional[float] = None
+    mixed_effective_microphone_gain: Optional[float] = None
+    mixed_auto_balance_enabled: Optional[bool] = None
+
+
+class TranscriptPreviewPayload(BaseModel):
+    segment: Optional[TranscriptSegment] = None
+
+
+class TranscriptTranslationPayload(BaseModel):
+    segment_id: str
+    language: LanguageCode
+    text: str
 
 
 class ErrorPayload(BaseModel):

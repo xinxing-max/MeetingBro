@@ -81,7 +81,14 @@ class EnergyDiarizer(Diarizer):
         # Compute per-frame RMS energy.
         frames = samples[: n_frames * frame_len].reshape(n_frames, frame_len)
         rms = np.sqrt(np.mean(frames ** 2, axis=1))
-        is_speech = rms > self._silence_rms
+
+        # Adaptive threshold: use P10 of frame RMS as noise floor estimate so
+        # the diarizer works across both high-level loopback and low-level far-field
+        # mic scenarios.  The constructor parameter acts as a lower bound.
+        noise_floor = float(np.percentile(rms, 10))
+        adaptive_threshold = max(self._silence_rms, noise_floor * 2.5)
+
+        is_speech = rms > adaptive_threshold
 
         # Find contiguous speech regions separated by silence gaps.
         regions = self._find_speech_regions(is_speech, frame_len, sample_rate)

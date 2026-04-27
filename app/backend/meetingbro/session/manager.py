@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -10,7 +12,10 @@ from typing import AsyncIterator, Optional
 import numpy as np
 
 from ..asr.base import ASRAdapter
-from ..audio.capture import AudioSource
+from ..audio.capture import AudioChunk, AudioSource
+from ..audio.mixed import MixedAudioSource
+from ..audio.enhancement import AdaptiveNoiseReducer
+from ..audio.vad import PreVadSegmenter
 from ..diarization.base import Diarizer
 from ..schemas import (
     ErrorPayload,
@@ -20,6 +25,8 @@ from ..schemas import (
     Speaker,
     SummarySnapshot,
     SummaryType,
+    TranscriptPreviewPayload,
+    TranscriptTranslationPayload,
     TranscriptSegment,
 )
 from ..storage.db import Storage
@@ -36,9 +43,11 @@ class SessionConfig:
     summarizer: Summarizer
     translator: Translator
     storage: Storage
+    audio_source_name: str = "mic"
     diarizer: Optional[Diarizer] = None
     forced_language: Optional[str] = None  # None => auto-detect
     summary_language: LanguageCode = "en"
+    live_translation_language: Optional[LanguageCode] = None
     rolling_window_seconds: float = 180.0  # last ~3 minutes for rolling summary input
     rolling_interval_seconds: float = 60.0  # cadence target for rolling refresh
     memory_interval_seconds: float = 120.0  # cadence target for compressed meeting memory refresh
@@ -47,7 +56,33 @@ class SessionConfig:
     min_segments_for_rolling: int = 1
     min_segments_for_memory: int = 3
     min_segments_for_cumulative: int = 3
-    asr_accumulation_seconds: float = 2.5  # accumulate audio before running ASR
+    asr_accumulation_seconds: float = 2.5  # prefer fuller sentence context over low latency
+    silence_rms_threshold: float = 0.002  # chunks below this RMS are skipped (~-54 dBFS); low enough to pass quiet loopback / soft speech
+    # Overlap tail prepended to next ASR window. DEFAULT 0.0 (disabled) — Whisper's
+    # internal VAD padding (~400 ms speech_pad_ms) handles boundary words on its own,
+    # and any non-zero overlap interacts badly with that padding: VAD pads segment
+    # starts backwards into the overlap zone and the filter then drops legitimate
+    # speech. Set this >0 only if you have measured a specific boundary-truncation
+    # problem the VAD padding does not cover.
+    asr_overlap_seconds: float = 0.0
+    # Optional static vocabulary hint fed to Whisper as initial_prompt. Use this for
+    # proper nouns, names, jargon — NEVER pass running transcript here, that re-creates
+    # the conditioning loop hallucination this codebase explicitly defends against.
+    vocabulary_hint: Optional[str] = None
+    suspicious_segment_no_speech_prob: float = 0.6
+    suspicious_segment_avg_logprob: float = -0.9
+    suspicious_segment_compression_ratio: float = 2.1
+    denoise_enabled: bool = False
+    denoise_strength: float = 1.1
+    denoise_noise_update_rms_threshold: float = 0.02
+    pre_vad_enabled: bool = True
+    pre_vad_trailing_silence_seconds: float = 0.45
+    pre_vad_max_segment_seconds: float = 12.0
+    # Executor sizing is not a user-facing tuning surface. Defaults are chosen
+    # automatically in main.py and may be overridden only via hidden env vars.
+    asr_executor_workers: int = 1
+    summary_executor_workers: int = 1
+    translation_executor_workers: int = 1
 
 
 @dataclass
@@ -67,8 +102,25 @@ class _State:
     latest_cumulative_text: Optional[str] = None
     last_memory_segment_index: int = 0
     memory_in_flight: bool = False
+    rolling_in_flight: bool = False
+    cumulative_in_flight: bool = False
     elapsed_seconds: float = 0.0
     speakers: dict[str, Speaker] = field(default_factory=dict)  # label -> Speaker
+    # Repetition guard: count consecutive emissions with identical text so we can
+    # detect Whisper conditioning-loop hallucinations and reset state.
+    last_emitted_text: str = ""
+    repetition_streak: int = 0
+    # Language vote stickiness (active only when forced_language is None / auto mode).
+    language_votes: dict[str, int] = field(default_factory=dict)
+    locked_language: Optional[str] = None
+    language_dissent_streak: int = 0
+    pending_segments: list[TranscriptSegment] = field(default_factory=list)
+    last_progress_emit_second: int = -1
+    retry_windows_total: int = 0
+    retry_windows_improved: int = 0
+    retry_windows_unchanged: int = 0
+    retry_windows_diverged: int = 0
+    last_backpressure_elapsed_seconds: Optional[float] = None
 
 
 class SessionManager:
@@ -82,16 +134,108 @@ class SessionManager:
 
     def __init__(self, config: SessionConfig) -> None:
         self._cfg = config
-        self._event_queue: asyncio.Queue[SessionEvent] = asyncio.Queue()
+        self._event_queue: asyncio.Queue[SessionEvent] = asyncio.Queue(maxsize=1024)
         self._state = _State(meeting_id=str(uuid.uuid4()))
         self._stopped = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
         self._summary_tasks: set[asyncio.Task[None]] = set()
+        self._translation_tasks: set[asyncio.Task[None]] = set()
+        self._translation_in_flight: set[tuple[str, str]] = set()
         self._pending_speaker_updates: list[Speaker] = []
+        self._queue_drop_count: int = 0
+        self._audio_drop_total: int = 0
+        self._audio_source_generation: int = 0
+        # Keep ASR isolated from summarization so periodic summary refreshes do
+        # not steal the default executor workers used by the realtime path.
+        self._asr_executor = ThreadPoolExecutor(
+            max_workers=max(1, self._cfg.asr_executor_workers),
+            thread_name_prefix="meetingbro-asr",
+        )
+        self._summary_executor = ThreadPoolExecutor(
+            max_workers=max(1, self._cfg.summary_executor_workers),
+            thread_name_prefix="meetingbro-summary",
+        )
+        self._translation_executor = ThreadPoolExecutor(
+            max_workers=max(1, self._cfg.translation_executor_workers),
+            thread_name_prefix="meetingbro-translation",
+        )
 
     @property
     def meeting_id(self) -> str:
         return self._state.meeting_id
+
+    def _session_state_payload(self, *, state: str) -> SessionStatePayload:
+        mixed_microphone_gain = None
+        mixed_system_gain = None
+        mixed_effective_microphone_gain = None
+        mixed_auto_balance_enabled = None
+        if isinstance(self._cfg.audio_source, MixedAudioSource):
+            mixed_microphone_gain = self._cfg.audio_source.microphone_gain
+            mixed_system_gain = self._cfg.audio_source.system_gain
+            mixed_effective_microphone_gain = self._cfg.audio_source.effective_microphone_gain
+            mixed_auto_balance_enabled = self._cfg.audio_source.auto_balance_enabled
+        return SessionStatePayload(
+            state=state,
+            meeting_id=self._state.meeting_id,
+            elapsed_seconds=self._state.elapsed_seconds,
+            source=self._cfg.audio_source_name,
+            live_translation_language=self._cfg.live_translation_language,
+            retry_windows_total=self._state.retry_windows_total,
+            retry_windows_improved=self._state.retry_windows_improved,
+            retry_windows_unchanged=self._state.retry_windows_unchanged,
+            retry_windows_diverged=self._state.retry_windows_diverged,
+            last_backpressure_elapsed_seconds=self._state.last_backpressure_elapsed_seconds,
+            mixed_microphone_gain=mixed_microphone_gain,
+            mixed_system_gain=mixed_system_gain,
+            mixed_effective_microphone_gain=mixed_effective_microphone_gain,
+            mixed_auto_balance_enabled=mixed_auto_balance_enabled,
+        )
+
+    def update_runtime_settings(
+        self,
+        *,
+        forced_language: Optional[str],
+        summary_language: Optional[LanguageCode] = None,
+        live_translation_language: Optional[LanguageCode] = None,
+    ) -> None:
+        forced_changed = forced_language != self._cfg.forced_language
+        if forced_changed:
+            self._cfg.forced_language = forced_language
+            self._state.locked_language = None
+            self._state.language_votes.clear()
+            self._state.language_dissent_streak = 0
+            logger.info("updated forced_language=%s for meeting_id=%s", forced_language or "auto", self._state.meeting_id)
+
+        if summary_language is not None and summary_language != self._cfg.summary_language:
+            self._cfg.summary_language = summary_language
+            self._cfg.storage.update_meeting_summary_language(
+                self._state.meeting_id,
+                preferred_summary_language=summary_language,
+            )
+            logger.info("updated summary_language=%s for meeting_id=%s", summary_language, self._state.meeting_id)
+
+        if live_translation_language != self._cfg.live_translation_language:
+            self._cfg.live_translation_language = live_translation_language
+            logger.info(
+                "updated live_translation_language=%s for meeting_id=%s",
+                live_translation_language or "off",
+                self._state.meeting_id,
+            )
+            if live_translation_language is not None:
+                self._backfill_live_translations()
+            asyncio.create_task(self._emit("session_state", self._session_state_payload(state="running")))
+
+    def update_audio_source(self, audio_source: AudioSource, *, source_name: str) -> None:
+        previous_source = self._cfg.audio_source
+        self._cfg.audio_source = audio_source
+        self._cfg.audio_source_name = source_name
+        self._audio_source_generation += 1
+        self._state.pending_segments.clear()
+        self._state.last_emitted_text = ""
+        self._state.repetition_streak = 0
+        logger.info("updated audio source=%s for meeting_id=%s", source_name, self._state.meeting_id)
+        asyncio.create_task(self._aclose_specific_source(previous_source))
+        asyncio.create_task(self._emit("session_state", self._session_state_payload(state="running")))
 
     async def events(self) -> AsyncIterator[SessionEvent]:
         while not (self._stopped.is_set() and self._event_queue.empty()):
@@ -101,13 +245,35 @@ class SessionManager:
                 continue
             yield ev
 
+    # Event types that must never be dropped even when the queue is full.
+    _CRITICAL_EVENT_TYPES = frozenset({
+        "summary_snapshot", "error", "session_state", "speaker_update",
+    })
+
     async def _emit(self, event_type: str, payload_model) -> None:
         payload = (
             payload_model.model_dump(mode="json")
             if hasattr(payload_model, "model_dump")
             else dict(payload_model)
         )
-        await self._event_queue.put(SessionEvent(type=event_type, payload=payload))
+        event = SessionEvent(type=event_type, payload=payload)
+        if self._event_queue.full() and event_type not in self._CRITICAL_EVENT_TYPES:
+            # Drop low-priority events (e.g. transcript_segment) to prevent OOM.
+            self._queue_drop_count += 1
+            logger.debug("event queue full — dropping %s (total drops: %d)", event_type, self._queue_drop_count)
+            if self._queue_drop_count % 50 == 0:
+                drop_notice = ErrorPayload(
+                    code="event_queue_drop",
+                    message=f"{self._queue_drop_count} events dropped (queue full); consumer may be too slow",
+                )
+                try:
+                    self._event_queue.put_nowait(
+                        SessionEvent(type="error", payload=drop_notice.model_dump(mode="json"))
+                    )
+                except asyncio.QueueFull:
+                    pass  # critical slot also full; silent skip
+            return
+        await self._event_queue.put(event)
 
     def save_note(self, content: str, source_type: Optional[str] = None, source_id: Optional[str] = None) -> Note:
         note = Note(
@@ -128,20 +294,23 @@ class SessionManager:
         )
         await self._emit(
             "session_state",
-            SessionStatePayload(state="running", meeting_id=self._state.meeting_id),
+            self._session_state_payload(state="running"),
         )
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
         self._stopped.set()
-        try:
-            await self._cfg.audio_source.aclose()
-        except Exception:
-            logger.exception("audio_source.aclose failed")
+        # Fire aclose() without blocking — for mic/loopback it just sets a threading.Event,
+        # so it returns almost instantly.  We don't await here so that if it ever blocks
+        # the task timeout below still fires at 15 s.
+        asyncio.create_task(self._aclose_source())
         if self._task is not None:
             try:
-                await asyncio.wait_for(self._task, timeout=5.0)
+                await asyncio.wait_for(self._task, timeout=15.0)
             except asyncio.TimeoutError:
+                logger.warning(
+                    "session task did not finish within 15 s (likely blocked in ASR executor) — cancelling"
+                )
                 self._task.cancel()
         # Wait for any pending summary background tasks.
         if self._summary_tasks:
@@ -150,24 +319,59 @@ class SessionManager:
                 t.cancel()
             self._summary_tasks.clear()
         self._cfg.storage.end_meeting(self._state.meeting_id)
+        self._shutdown_executors()
         await self._emit(
             "session_state",
-            SessionStatePayload(state="ended", meeting_id=self._state.meeting_id),
+            self._session_state_payload(state="ended"),
         )
+
+    async def _aclose_source(self) -> None:
+        try:
+            await self._cfg.audio_source.aclose()
+        except Exception:
+            logger.exception("audio_source.aclose failed")
+
+    async def _aclose_specific_source(self, source: AudioSource) -> None:
+        try:
+            await source.aclose()
+        except Exception:
+            logger.exception("audio_source.aclose failed during source switch")
+
+    def _shutdown_executors(self) -> None:
+        self._asr_executor.shutdown(wait=False, cancel_futures=True)
+        self._summary_executor.shutdown(wait=False, cancel_futures=True)
+        self._translation_executor.shutdown(wait=False, cancel_futures=True)
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
-        # Accumulation buffer: collect small audio chunks until we have enough
-        # for a quality ASR pass, reducing latency vs the old 3s monolithic chunks.
-        accum_samples: list[np.ndarray] = []
-        accum_duration: float = 0.0
-        accum_start_time: float = 0.0
-        threshold = self._cfg.asr_accumulation_seconds
+        while not self._stopped.is_set():
+            source = self._cfg.audio_source
+            source_generation = self._audio_source_generation
+            # Accumulation buffer: collect small audio chunks until we have enough
+            # for a quality ASR pass, reducing latency vs the old 3s monolithic chunks.
+            accum_samples: list[np.ndarray] = []
+            accum_duration: float = 0.0
+            accum_start_time: float = 0.0
+            threshold = self._cfg.asr_accumulation_seconds
+            # Overlap tail: last N samples from the previous ASR window, prepended to
+            # the next window so words at chunk boundaries are not truncated.
+            overlap_buf: np.ndarray = np.zeros(0, dtype=np.float32)
+            pre_vad = PreVadSegmenter(
+                sample_rate=source.sample_rate,
+                enabled=self._cfg.pre_vad_enabled,
+                trailing_silence_seconds=self._cfg.pre_vad_trailing_silence_seconds,
+                max_segment_seconds=self._cfg.pre_vad_max_segment_seconds,
+            )
+            noise_reducer = AdaptiveNoiseReducer(
+                sample_rate=source.sample_rate,
+                enabled=self._cfg.denoise_enabled,
+                strength=self._cfg.denoise_strength,
+                noise_update_rms_threshold=self._cfg.denoise_noise_update_rms_threshold,
+            )
+            source_switched = False
 
-        try:
-            async for chunk in self._cfg.audio_source.stream():
-                if self._stopped.is_set():
-                    break
+            async def consume_asr_chunk(chunk: AudioChunk) -> None:
+                nonlocal accum_duration, accum_start_time, overlap_buf, accum_samples
 
                 if not accum_samples:
                     accum_start_time = chunk.start_time
@@ -175,8 +379,15 @@ class SessionManager:
                 accum_samples.append(chunk.samples)
                 accum_duration += len(chunk.samples) / chunk.sample_rate
 
+                # Normal cadence: keep accumulating until we reach the threshold.
                 if accum_duration < threshold:
-                    continue
+                    return
+                hard_cap_seconds = self._asr_accumulation_hard_cap_seconds()
+                self._log_accumulation_flush_reason(
+                    accum_duration,
+                    threshold=threshold,
+                    hard_cap_seconds=hard_cap_seconds,
+                )
 
                 # Flush the accumulated buffer through ASR.
                 merged = np.concatenate(accum_samples)
@@ -185,17 +396,50 @@ class SessionManager:
                 accum_samples.clear()
                 accum_duration = 0.0
 
-                segments = await loop.run_in_executor(
-                    None,
-                    lambda m=merged, sr=sample_rate: self._cfg.asr.transcribe(
-                        m,
-                        sr,
-                        forced_language=self._cfg.forced_language,
-                        offset_seconds=0.0,
-                    ),
+                # Skip near-silent chunks to avoid Whisper hallucinations.
+                rms = float(np.sqrt(np.mean(merged ** 2)))
+                if rms < self._cfg.silence_rms_threshold:
+                    logger.debug("chunk silent rms=%.5f, skipping ASR", rms)
+                    self._state.elapsed_seconds = max(
+                        self._state.elapsed_seconds,
+                        buf_start + len(merged) / sample_rate,
+                    )
+                    await self._emit_session_progress_if_needed()
+                    overlap_buf = np.zeros(0, dtype=np.float32)
+                    return
+    
+                # Prepend overlap tail from the previous window to recover words
+                # that would otherwise be cut at the chunk boundary.
+                overlap_frames = int(self._cfg.asr_overlap_seconds * sample_rate)
+                overlap_duration = len(overlap_buf) / sample_rate
+                extended = np.concatenate([overlap_buf, merged]) if len(overlap_buf) > 0 else merged
+                asr_buf_start = buf_start - overlap_duration
+    
+                prompt = self._cfg.vocabulary_hint or None
+                effective_lang = self._cfg.forced_language or self._state.locked_language
+                try:
+                    segments = await self._transcribe_window(
+                        loop,
+                        extended,
+                        sample_rate,
+                        prompt=prompt,
+                        forced_language=effective_lang,
+                    )
+                except Exception as exc:
+                    logger.warning("ASR failed, skipping chunk: %s", exc)
+                    await self._emit("error", ErrorPayload(code="asr_error", message=str(exc)))
+                    overlap_buf = (
+                        merged[-overlap_frames:].copy() if overlap_frames > 0 and len(merged) >= overlap_frames
+                        else (merged.copy() if overlap_frames > 0 else np.zeros(0, dtype=np.float32))
+                    )
+                    return
+    
+                overlap_buf = (
+                    merged[-overlap_frames:].copy()
+                    if overlap_frames > 0 and len(merged) >= overlap_frames
+                    else (merged.copy() if overlap_frames > 0 else np.zeros(0, dtype=np.float32))
                 )
-
-                # Run diarization in parallel with segment processing.
+    
                 dia_segments = None
                 if self._cfg.diarizer is not None:
                     dia_segments = await loop.run_in_executor(
@@ -204,19 +448,50 @@ class SessionManager:
                             m, sr, offset_seconds=bs,
                         ),
                     )
-
+    
+                repetition_tripped = False
+                candidate_segments: list[TranscriptSegment] = []
                 for asr_seg in segments:
+                    if asr_seg.start_time < overlap_duration:
+                        continue
+                    if self._classify_asr_segment(asr_seg) != "keep":
+                        continue
+    
+                    norm_text = asr_seg.text.strip()
+                    if norm_text and norm_text == self._state.last_emitted_text:
+                        self._state.repetition_streak += 1
+                        if self._state.repetition_streak >= 2:
+                            logger.warning(
+                                "ASR repetition detected (%r ×%d) — dropping and resetting state",
+                                norm_text, self._state.repetition_streak + 1,
+                            )
+                            await self._emit(
+                                "error",
+                                ErrorPayload(
+                                    code="asr_repetition",
+                                    message=f"dropped repeated segment: {norm_text!r}",
+                                ),
+                            )
+                            repetition_tripped = True
+                            continue
+                    else:
+                        self._state.repetition_streak = 0
+    
                     seg = TranscriptSegment(
                         id=str(uuid.uuid4()),
                         meeting_id=self._state.meeting_id,
-                        start_time=buf_start + asr_seg.start_time,
-                        end_time=buf_start + asr_seg.end_time,
+                        start_time=asr_buf_start + asr_seg.start_time,
+                        end_time=asr_buf_start + asr_seg.end_time,
                         text=asr_seg.text,
                         original_language=asr_seg.language,
                         confidence=asr_seg.confidence,
+                        created_at=datetime.now(tz=timezone.utc),
+                        emitted_at_elapsed_seconds=max(
+                            self._state.elapsed_seconds,
+                            asr_buf_start + asr_seg.end_time,
+                        ),
                     )
-
-                    # Assign speaker from diarization by best time overlap.
+    
                     if dia_segments:
                         speaker_label = self._match_speaker(
                             seg.start_time, seg.end_time, dia_segments,
@@ -224,98 +499,541 @@ class SessionManager:
                         if speaker_label:
                             speaker = self._ensure_speaker(speaker_label)
                             seg.speaker_id = speaker.id
-                    if (
-                        seg.original_language != "unknown"
-                        and self._cfg.summary_language != seg.original_language
-                    ):
-                        seg.translations[self._cfg.summary_language] = (
-                            self._cfg.translator.translate(
-                                seg.text,
-                                source_language=seg.original_language,
-                                target_language=self._cfg.summary_language,
+                    candidate_segments.append(seg)
+    
+                if candidate_segments and self._state.pending_segments:
+                    await self._drain_non_mergeable_pending_segments(candidate_segments[0])
+    
+                if candidate_segments and self._state.pending_segments:
+                    candidate_segments[0] = self._consume_pending_segment(candidate_segments[0])
+    
+                tail_segment = None
+                if candidate_segments and not self._is_sentence_complete(candidate_segments[-1].text):
+                    tail_segment = candidate_segments.pop()
+    
+                if candidate_segments and tail_segment is None:
+                    await self._emit_transcript_preview(candidate_segments[-1])
+    
+                for seg in candidate_segments:
+                    await self._persist_and_emit_segment(seg)
+    
+                if tail_segment is not None:
+                    await self._queue_pending_segment(tail_segment)
+    
+                if repetition_tripped:
+                    overlap_buf = np.zeros(0, dtype=np.float32)
+    
+                if self._cfg.forced_language is None and segments:
+                    batch_rep = next(
+                        (s for s in segments if s.start_time >= overlap_duration and s.language != "unknown"),
+                        None,
+                    )
+                    if batch_rep:
+                        batch_lang = batch_rep.language
+                        batch_conf = batch_rep.confidence
+                        if self._state.locked_language is None:
+                            self._state.language_votes[batch_lang] = (
+                                self._state.language_votes.get(batch_lang, 0) + 1
                             )
-                        )
-                    self._state.segments.append(seg)
-                    self._cfg.storage.insert_segment(seg)
-                    await self._emit("transcript_segment", seg)
-
-                # Emit any new speaker updates.
+                            total_votes = sum(self._state.language_votes.values())
+                            if total_votes >= 5:
+                                dominant = max(self._state.language_votes, key=self._state.language_votes.get)
+                                self._state.locked_language = dominant
+                                logger.info("language locked to %s after %d votes", dominant, total_votes)
+                        else:
+                            if batch_lang != self._state.locked_language and batch_conf > 0.8:
+                                self._state.language_dissent_streak += 1
+                                if self._state.language_dissent_streak >= 3:
+                                    logger.info(
+                                        "language unlocked from %s after 3 strong dissents",
+                                        self._state.locked_language,
+                                    )
+                                    self._state.locked_language = None
+                                    self._state.language_votes.clear()
+                                    self._state.language_dissent_streak = 0
+                            else:
+                                self._state.language_dissent_streak = 0
+    
                 for sp in self._pending_speaker_updates:
                     await self._emit("speaker_update", sp)
                 self._pending_speaker_updates.clear()
-
+    
                 self._state.elapsed_seconds = max(
                     self._state.elapsed_seconds,
                     buf_start + len(merged) / sample_rate,
                 )
-
-                # Fire summary checks as background tasks so they don't block
-                # the audio→ASR→emit pipeline.
+                await self._emit_session_progress_if_needed()
+    
                 self._schedule_summary(self._maybe_emit_rolling())
                 self._schedule_summary(self._maybe_emit_memory())
                 self._schedule_summary(self._maybe_emit_cumulative())
 
-            # Flush remaining accumulated audio.
-            if accum_samples:
-                merged = np.concatenate(accum_samples)
-                sample_rate = self._cfg.audio_source._sample_rate if hasattr(self._cfg.audio_source, '_sample_rate') else 16_000
-                segments = await loop.run_in_executor(
-                    None,
-                    lambda m=merged, sr=sample_rate: self._cfg.asr.transcribe(
-                        m,
-                        sr,
-                        forced_language=self._cfg.forced_language,
-                        offset_seconds=0.0,
-                    ),
-                )
-                for asr_seg in segments:
-                    seg = TranscriptSegment(
-                        id=str(uuid.uuid4()),
-                        meeting_id=self._state.meeting_id,
-                        start_time=accum_start_time + asr_seg.start_time,
-                        end_time=accum_start_time + asr_seg.end_time,
-                        text=asr_seg.text,
-                        original_language=asr_seg.language,
-                        confidence=asr_seg.confidence,
-                    )
-                    if (
-                        seg.original_language != "unknown"
-                        and self._cfg.summary_language != seg.original_language
-                    ):
-                        seg.translations[self._cfg.summary_language] = (
-                            self._cfg.translator.translate(
-                                seg.text,
-                                source_language=seg.original_language,
-                                target_language=self._cfg.summary_language,
+            try:
+                async for raw_chunk in source.stream():
+                    if self._stopped.is_set():
+                        break
+                    if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
+                        source_switched = True
+                        break
+
+                    prepared_chunk = noise_reducer.process(raw_chunk)
+                    for chunk in pre_vad.push(prepared_chunk):
+                        await consume_asr_chunk(chunk)
+
+                    # Drain audio drop counter and emit error every 10 cumulative drops.
+                    drops = source.drain_drops()
+                    if drops > 0:
+                        prev_bucket = self._audio_drop_total // 10
+                        self._audio_drop_total += drops
+                        if self._audio_drop_total // 10 > prev_bucket:
+                            await self._emit(
+                                "error",
+                                ErrorPayload(
+                                    code="audio_drop",
+                                    message=f"audio queue has dropped {self._audio_drop_total} chunks total (source too fast for ASR)",
+                                ),
                             )
+
+                if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
+                    source_switched = True
+
+                if source_switched:
+                    self._state.pending_segments.clear()
+                    await self._emit_transcript_preview(None)
+                    continue
+
+                for chunk in pre_vad.finish():
+                    await consume_asr_chunk(chunk)
+
+                # Flush remaining accumulated audio.
+                if accum_samples:
+                    merged = np.concatenate(accum_samples)
+                    sample_rate = source.sample_rate
+                    overlap_frames = int(self._cfg.asr_overlap_seconds * sample_rate)
+                    overlap_duration = len(overlap_buf) / sample_rate
+                    extended = np.concatenate([overlap_buf, merged]) if len(overlap_buf) > 0 else merged
+                    asr_buf_start = accum_start_time - overlap_duration
+                    prompt = self._cfg.vocabulary_hint or None
+                    effective_lang = self._cfg.forced_language or self._state.locked_language
+                    try:
+                        segments = await self._transcribe_window(
+                            loop,
+                            extended,
+                            sample_rate,
+                            prompt=prompt,
+                            forced_language=effective_lang,
                         )
-                    self._state.segments.append(seg)
-                    self._cfg.storage.insert_segment(seg)
-                    await self._emit("transcript_segment", seg)
-                self._state.elapsed_seconds = max(
-                    self._state.elapsed_seconds,
-                    accum_start_time + len(merged) / sample_rate,
+                    except Exception as exc:
+                        logger.warning("ASR failed on final flush, skipping: %s", exc)
+                        await self._emit("error", ErrorPayload(code="asr_error", message=str(exc)))
+                        segments = []
+                    for asr_seg in segments:
+                        if asr_seg.start_time < overlap_duration:
+                            continue
+                        if self._classify_asr_segment(asr_seg) != "keep":
+                            continue
+                        norm_text = asr_seg.text.strip()
+                        if norm_text and norm_text == self._state.last_emitted_text:
+                            logger.warning(
+                                "ASR repetition detected on final flush (%r) — dropping",
+                                norm_text,
+                            )
+                            await self._emit(
+                                "error",
+                                ErrorPayload(
+                                    code="asr_repetition",
+                                    message=f"dropped repeated segment on final flush: {norm_text!r}",
+                                ),
+                            )
+                            continue
+                        seg = TranscriptSegment(
+                            id=str(uuid.uuid4()),
+                            meeting_id=self._state.meeting_id,
+                            start_time=asr_buf_start + asr_seg.start_time,
+                            end_time=asr_buf_start + asr_seg.end_time,
+                            text=asr_seg.text,
+                            original_language=asr_seg.language,
+                            confidence=asr_seg.confidence,
+                            created_at=datetime.now(tz=timezone.utc),
+                            emitted_at_elapsed_seconds=max(
+                                self._state.elapsed_seconds,
+                                asr_buf_start + asr_seg.end_time,
+                            ),
+                        )
+                        if self._state.pending_segments:
+                            await self._drain_non_mergeable_pending_segments(seg)
+                        seg = self._consume_pending_segment(seg)
+                        await self._persist_and_emit_segment(seg)
+                    self._state.elapsed_seconds = max(
+                        self._state.elapsed_seconds,
+                        accum_start_time + len(merged) / sample_rate,
+                    )
+                    await self._emit_session_progress_if_needed(force=True)
+
+                while self._state.pending_segments:
+                    await self._emit_oldest_pending_segment()
+
+                # Wait for in-flight summary tasks before final summary.
+                if self._summary_tasks:
+                    await asyncio.wait(self._summary_tasks, timeout=15.0)
+                    self._summary_tasks.clear()
+
+                if self._translation_tasks:
+                    await asyncio.wait(self._translation_tasks, timeout=10.0)
+                    self._translation_tasks.clear()
+
+                await self._emit_memory(force=True)
+                await self._emit_final()
+                break
+            except Exception as exc:
+                if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
+                    self._state.pending_segments.clear()
+                    await self._emit_transcript_preview(None)
+                    continue
+                logger.exception("session loop crashed")
+                await self._emit(
+                    "error",
+                    ErrorPayload(code="session_loop", message=str(exc)),
                 )
-
-            # Wait for in-flight summary tasks before final summary.
-            if self._summary_tasks:
-                await asyncio.wait(self._summary_tasks, timeout=15.0)
-                self._summary_tasks.clear()
-
-            await self._emit_memory(force=True)
-            await self._emit_final()
-        except Exception as exc:
-            logger.exception("session loop crashed")
-            await self._emit(
-                "error",
-                ErrorPayload(code="session_loop", message=str(exc)),
-            )
+                break
 
     def _schedule_summary(self, coro) -> None:
         """Run a summary coroutine as a background task."""
         task = asyncio.create_task(coro)
         self._summary_tasks.add(task)
         task.add_done_callback(self._summary_tasks.discard)
+
+    def _schedule_translation(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._translation_tasks.add(task)
+        task.add_done_callback(self._translation_tasks.discard)
+
+    def _backfill_live_translations(self) -> None:
+        if self._cfg.live_translation_language is None:
+            return
+        for seg in self._state.segments[-200:]:
+            self._schedule_translation(self._translate_segment(seg, self._cfg.live_translation_language))
+
+    async def _emit_session_progress_if_needed(self, *, force: bool = False) -> None:
+        current_second = int(self._state.elapsed_seconds)
+        if not force and current_second <= self._state.last_progress_emit_second:
+            return
+        self._state.last_progress_emit_second = current_second
+        await self._emit(
+            "session_state",
+            self._session_state_payload(state="running"),
+        )
+
+    def _asr_accumulation_hard_cap_seconds(self) -> float:
+        hard_cap = 4 * self._cfg.asr_accumulation_seconds
+        if self._cfg.pre_vad_enabled:
+            # Pre-VAD intentionally groups continuous speech into utterance-sized
+            # chunks, so a long uninterrupted turn can legitimately exceed the
+            # realtime accumulation target. Allow one accumulation window of slack
+            # beyond the configured VAD segment target before calling it overflow.
+            hard_cap = max(
+                hard_cap,
+                self._cfg.pre_vad_max_segment_seconds + self._cfg.asr_accumulation_seconds,
+            )
+        return hard_cap
+
+    def _log_accumulation_flush_reason(
+        self,
+        accum_duration: float,
+        *,
+        threshold: float,
+        hard_cap_seconds: float,
+    ) -> None:
+        normal_long_speech_seconds = max(
+            4 * threshold,
+            self._cfg.pre_vad_max_segment_seconds if self._cfg.pre_vad_enabled else 0.0,
+        )
+        if accum_duration > hard_cap_seconds:
+            self._state.last_backpressure_elapsed_seconds = self._state.elapsed_seconds
+            logger.warning(
+                "real_backpressure_or_slow_asr accumulation=%.1fs threshold=%.1fs hard_cap=%.1fs — forcing flush",
+                accum_duration,
+                threshold,
+                hard_cap_seconds,
+            )
+            asyncio.create_task(self._emit(
+                "error",
+                ErrorPayload(
+                    code="asr_buffer_overflow",
+                    message=(
+                        f"audio accumulation buffer exceeded {hard_cap_seconds:.0f}s "
+                        "— likely backpressure or slow ASR"
+                    ),
+                ),
+            ))
+            return
+        if accum_duration > normal_long_speech_seconds:
+            logger.info(
+                "normal_long_speech_flush accumulation=%.1fs threshold=%.1fs hard_cap=%.1fs",
+                accum_duration,
+                threshold,
+                hard_cap_seconds,
+            )
+
+    def _retry_text_signature(self, segments) -> str:
+        parts = [re.sub(r"\s+", " ", seg.text).strip() for seg in segments if seg.text.strip()]
+        return " | ".join(parts).casefold()
+
+    def _retry_quality_score(self, segments) -> int:
+        score_map = {"keep": 2, "retry": 1, "drop": 0}
+        return sum(score_map[self._classify_asr_segment(seg)] for seg in segments)
+
+    def _log_retry_outcome(self, realtime_segments, retry_segments) -> None:
+        realtime_text = self._retry_text_signature(realtime_segments)
+        retry_text = self._retry_text_signature(retry_segments)
+        realtime_score = self._retry_quality_score(realtime_segments)
+        retry_score = self._retry_quality_score(retry_segments)
+        self._state.retry_windows_total += 1
+
+        if realtime_text == retry_text and realtime_score == retry_score:
+            outcome = "unchanged"
+            self._state.retry_windows_unchanged += 1
+        elif retry_score > realtime_score:
+            outcome = "improved"
+            self._state.retry_windows_improved += 1
+        else:
+            outcome = "diverged"
+            self._state.retry_windows_diverged += 1
+
+        logger.info(
+            "retry %s realtime_score=%d retry_score=%d realtime_text=%r retry_text=%r",
+            outcome,
+            realtime_score,
+            retry_score,
+            realtime_text[:160],
+            retry_text[:160],
+        )
+
+    async def _transcribe_window(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        samples: np.ndarray,
+        sample_rate: int,
+        *,
+        prompt: Optional[str],
+        forced_language: Optional[str],
+    ):
+        segments = await loop.run_in_executor(
+            self._asr_executor,
+            lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
+                m,
+                sr,
+                forced_language=fl,
+                offset_seconds=0.0,
+                initial_prompt=p,
+                quality_preset="realtime",
+            ),
+        )
+        if any(self._classify_asr_segment(seg) == "retry" for seg in segments):
+            logger.info("retrying ASR window with higher-quality preset")
+            retry_segments = await loop.run_in_executor(
+                self._asr_executor,
+                lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
+                    m,
+                    sr,
+                    forced_language=fl,
+                    offset_seconds=0.0,
+                    initial_prompt=p,
+                    quality_preset="retry",
+                ),
+            )
+            self._log_retry_outcome(segments, retry_segments)
+            return retry_segments
+        return segments
+
+    def _classify_asr_segment(self, seg) -> str:
+        text = seg.text.strip()
+        if not text:
+            return "drop"
+
+        duration = max(0.0, seg.end_time - seg.start_time)
+        dense_text = re.sub(r"\s+", "", text)
+        signal_count = 0
+
+        if (
+            seg.no_speech_prob is not None
+            and seg.no_speech_prob >= self._cfg.suspicious_segment_no_speech_prob
+        ):
+            signal_count += 1
+        if (
+            seg.avg_logprob is not None
+            and seg.avg_logprob <= self._cfg.suspicious_segment_avg_logprob
+        ):
+            signal_count += 1
+        if (
+            seg.compression_ratio is not None
+            and seg.compression_ratio >= self._cfg.suspicious_segment_compression_ratio
+        ):
+            signal_count += 1
+        if duration <= 0.45 and len(dense_text) >= 8:
+            signal_count += 1
+        if duration > 0.0 and (len(dense_text) / duration) >= 35.0:
+            signal_count += 1
+
+        if signal_count < 2:
+            return "keep"
+
+        decision = "drop" if signal_count >= 3 else "retry"
+
+        logger.info(
+            "%s suspicious ASR segment text=%r duration=%.2f conf=%.2f logprob=%s no_speech=%s compression=%s signals=%d",
+            decision,
+            text,
+            duration,
+            seg.confidence,
+            seg.avg_logprob,
+            seg.no_speech_prob,
+            seg.compression_ratio,
+            signal_count,
+        )
+        return decision
+
+    def _is_suspicious_asr_segment(self, seg) -> bool:
+        return self._classify_asr_segment(seg) == "drop"
+
+    def _is_sentence_complete(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if stripped.endswith((".", "!", "?", ",", ";", ":", "…", "。", "！", "？", "，", "；", "：")):
+            return True
+        if stripped.endswith(("-", "(", "[", "{")):
+            return False
+        tokens = re.findall(r"[A-Za-z']+|[\u4e00-\u9fff]+", stripped)
+        if not tokens:
+            return False
+        last_token = tokens[-1].lower()
+        if last_token in {
+            "and", "or", "but", "so", "if", "when", "because", "that", "which", "who",
+            "with", "for", "of", "to", "in", "on", "at", "from", "the", "a", "an",
+            "is", "are", "was", "were", "be", "been", "being",
+            "的", "了", "和", "或", "但", "所以", "如果", "因为", "就是", "然后", "这", "這",
+            "这个", "這個", "那个", "那個", "让", "讓", "把", "跟", "在", "是", "要",
+        }:
+            return False
+        if any("\u4e00" <= ch <= "\u9fff" for ch in stripped):
+            return len(stripped) >= 10
+        return len(tokens) >= 4
+
+    def _latest_pending_segment(self) -> Optional[TranscriptSegment]:
+        if not self._state.pending_segments:
+            return None
+        return self._state.pending_segments[-1]
+
+    def _can_merge_pending_segment(self, seg: TranscriptSegment) -> bool:
+        pending = self._latest_pending_segment()
+        if pending is None:
+            return False
+        same_language = pending.original_language == seg.original_language
+        close_in_time = (seg.start_time - pending.end_time) <= 2.0
+        return same_language and close_in_time
+
+    def _join_segment_text(self, left: str, right: str, language: str) -> str:
+        left = left.rstrip()
+        right = right.lstrip()
+        if not left:
+            return right
+        if not right:
+            return left
+        if language in {"zh", "unknown"}:
+            return left + right
+        return f"{left} {right}"
+
+    def _consume_pending_segment(self, seg: TranscriptSegment) -> TranscriptSegment:
+        pending = self._latest_pending_segment()
+        if pending is None:
+            return seg
+        if not self._can_merge_pending_segment(seg):
+            return seg
+        self._state.pending_segments.pop()
+        return TranscriptSegment(
+            id=pending.id,
+            meeting_id=pending.meeting_id,
+            start_time=pending.start_time,
+            end_time=seg.end_time,
+            text=self._join_segment_text(pending.text, seg.text, seg.original_language),
+            original_language=seg.original_language,
+            speaker_id=pending.speaker_id or seg.speaker_id,
+            confidence=min(pending.confidence, seg.confidence),
+            translations=dict(pending.translations),
+            created_at=seg.created_at,
+            emitted_at_elapsed_seconds=seg.emitted_at_elapsed_seconds,
+        )
+
+    async def _persist_and_emit_segment(self, seg: TranscriptSegment) -> None:
+        self._state.segments.append(seg)
+        self._cfg.storage.insert_segment(seg)
+        self._state.last_emitted_text = seg.text.strip()
+        await self._emit("transcript_segment", seg)
+        if self._cfg.live_translation_language is not None:
+            self._schedule_translation(self._translate_segment(seg, self._cfg.live_translation_language))
+
+    async def _translate_segment(self, seg: TranscriptSegment, target_language: LanguageCode) -> None:
+        if seg.original_language == target_language:
+            return
+        if seg.translations.get(target_language):
+            return
+        task_key = (seg.id, target_language)
+        if task_key in self._translation_in_flight:
+            return
+        self._translation_in_flight.add(task_key)
+        try:
+            loop = asyncio.get_running_loop()
+            translated = await loop.run_in_executor(
+                self._translation_executor,
+                lambda: self._cfg.translator.translate(
+                    seg.text,
+                    source_language=seg.original_language,
+                    target_language=target_language,
+                ),
+            )
+            translated = translated.strip()
+            if not translated or translated == seg.text:
+                return
+            seg.translations[target_language] = translated
+            self._cfg.storage.update_segment_translations(seg.id, seg.translations)
+            await self._emit(
+                "transcript_translation",
+                TranscriptTranslationPayload(
+                    segment_id=seg.id,
+                    language=target_language,
+                    text=translated,
+                ),
+            )
+        except Exception as exc:
+            logger.warning("live transcript translation failed for %s -> %s: %s", seg.id, target_language, exc)
+        finally:
+            self._translation_in_flight.discard(task_key)
+
+    async def _emit_transcript_preview(self, segment: Optional[TranscriptSegment] = None) -> None:
+        await self._emit(
+            "transcript_preview",
+            TranscriptPreviewPayload(segment=segment if segment is not None else self._latest_pending_segment()),
+        )
+
+    async def _emit_oldest_pending_segment(self) -> None:
+        if not self._state.pending_segments:
+            return
+        oldest = self._state.pending_segments.pop(0)
+        await self._persist_and_emit_segment(oldest)
+        await self._emit_transcript_preview()
+
+    async def _drain_non_mergeable_pending_segments(self, seg: TranscriptSegment) -> None:
+        while len(self._state.pending_segments) > 1:
+            await self._emit_oldest_pending_segment()
+        if self._state.pending_segments and not self._can_merge_pending_segment(seg):
+            await self._emit_oldest_pending_segment()
+
+    async def _queue_pending_segment(self, seg: TranscriptSegment) -> None:
+        while len(self._state.pending_segments) >= 2:
+            await self._emit_oldest_pending_segment()
+        self._state.pending_segments.append(seg)
+        await self._emit_transcript_preview()
 
     def _match_speaker(
         self, seg_start: float, seg_end: float, dia_segments
@@ -383,7 +1101,7 @@ class SessionManager:
         } else "rolling_summary"
         loop = asyncio.get_running_loop()
         content = await loop.run_in_executor(
-            None,
+            self._summary_executor,
             lambda: self._cfg.summarizer.summarize(
                 segments,
                 kind=kind,  # type: ignore[arg-type]
@@ -410,6 +1128,8 @@ class SessionManager:
         return snap
 
     async def _maybe_emit_rolling(self) -> None:
+        if self._state.rolling_in_flight:
+            return
         now = self._state.elapsed_seconds
         due = (now - self._state.last_rolling_at) >= self._cfg.rolling_interval_seconds
         if not due:
@@ -419,14 +1139,18 @@ class SessionManager:
             return
         start = min(s.start_time for s in window_segments)
         end = max(s.end_time for s in window_segments)
-        snap = await self._build_and_emit_snapshot(
-            summary_type="rolling_summary",
-            segments=window_segments,
-            time_start=start,
-            time_end=end,
-        )
-        if snap is not None:
-            self._state.last_rolling_at = now
+        self._state.rolling_in_flight = True
+        try:
+            snap = await self._build_and_emit_snapshot(
+                summary_type="rolling_summary",
+                segments=window_segments,
+                time_start=start,
+                time_end=end,
+            )
+            if snap is not None:
+                self._state.last_rolling_at = now
+        finally:
+            self._state.rolling_in_flight = False
 
     async def _maybe_emit_memory(self) -> None:
         now = self._state.elapsed_seconds
@@ -465,6 +1189,8 @@ class SessionManager:
             self._state.memory_in_flight = False
 
     async def _maybe_emit_cumulative(self) -> None:
+        if self._state.cumulative_in_flight:
+            return
         now = self._state.elapsed_seconds
         due = (now - self._state.last_cumulative_at) >= self._cfg.cumulative_interval_seconds
         if not due:
@@ -474,18 +1200,30 @@ class SessionManager:
             return
         end = max(s.end_time for s in self._state.segments)
         compressed_context = self._state.latest_meeting_memory or self._state.latest_cumulative_text
-        snap = await self._build_and_emit_snapshot(
-            summary_type="cumulative_meeting_summary",
-            segments=context_segments,
-            time_start=0.0,
-            time_end=end,
-            previous_summary=compressed_context,
-        )
-        if snap is not None:
-            self._state.last_cumulative_at = now
-            self._state.latest_cumulative_text = snap.content
+        self._state.cumulative_in_flight = True
+        try:
+            snap = await self._build_and_emit_snapshot(
+                summary_type="cumulative_meeting_summary",
+                segments=context_segments,
+                time_start=0.0,
+                time_end=end,
+                previous_summary=compressed_context,
+            )
+            if snap is not None:
+                self._state.last_cumulative_at = now
+                self._state.latest_cumulative_text = snap.content
+        finally:
+            self._state.cumulative_in_flight = False
 
     async def _emit_final(self) -> None:
+        if self._state.retry_windows_total > 0:
+            logger.info(
+                "retry summary total=%d improved=%d unchanged=%d diverged=%d",
+                self._state.retry_windows_total,
+                self._state.retry_windows_improved,
+                self._state.retry_windows_unchanged,
+                self._state.retry_windows_diverged,
+            )
         if not self._state.segments:
             return
         end = max(s.end_time for s in self._state.segments)

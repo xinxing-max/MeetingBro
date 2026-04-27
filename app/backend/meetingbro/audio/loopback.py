@@ -73,6 +73,18 @@ class SystemAudioLoopbackSource(AudioSource):
         self._speaker_name = speaker_name
         self._native_rate = native_sample_rate
         self._stop = threading.Event()
+        self._drop_lock = threading.Lock()
+        self._drop_count: int = 0
+
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
+    def drain_drops(self) -> int:
+        with self._drop_lock:
+            n = self._drop_count
+            self._drop_count = 0
+        return n
 
     def _resolve_loopback_mic(self, sc):
         if self._speaker_name is not None:
@@ -126,6 +138,8 @@ class SystemAudioLoopbackSource(AudioSource):
                         try:
                             q.put_nowait(mono.copy())
                         except queue.Full:
+                            with self._drop_lock:
+                                self._drop_count += 1
                             logger.warning("loopback queue full — dropping chunk")
             except Exception:
                 logger.exception("loopback reader thread crashed")

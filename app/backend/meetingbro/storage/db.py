@@ -114,6 +114,14 @@ class Storage:
             )
             self._conn.commit()
 
+    def update_meeting_summary_language(self, meeting_id: str, preferred_summary_language: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE meetings SET preferred_summary_language = ? WHERE id = ?",
+                (preferred_summary_language, meeting_id),
+            )
+            self._conn.commit()
+
     def insert_segment(self, seg: TranscriptSegment) -> None:
         with self._lock:
             self._conn.execute(
@@ -132,8 +140,16 @@ class Storage:
                     seg.speaker_id,
                     seg.confidence,
                     json.dumps(dict(seg.translations)),
-                    _iso(_utc_now()),
+                    _iso(seg.created_at),
                 ),
+            )
+            self._conn.commit()
+
+    def update_segment_translations(self, segment_id: str, translations: dict[str, str]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE transcript_segments SET translations = ? WHERE id = ?",
+                (json.dumps(dict(translations)), segment_id),
             )
             self._conn.commit()
 
@@ -141,7 +157,7 @@ class Storage:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, meeting_id, start_time, end_time, text, original_language, speaker_id, confidence, translations
+                SELECT id, meeting_id, start_time, end_time, text, original_language, speaker_id, confidence, translations, created_at
                 FROM transcript_segments WHERE meeting_id = ? ORDER BY start_time ASC
                 """,
                 (meeting_id,),
@@ -157,6 +173,7 @@ class Storage:
                 speaker_id=r[6],
                 confidence=r[7],
                 translations=json.loads(r[8] or "{}"),
+                created_at=datetime.fromisoformat(r[9]),
             )
             for r in rows
         ]

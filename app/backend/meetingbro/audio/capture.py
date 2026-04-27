@@ -40,9 +40,22 @@ class AudioChunk:
 class AudioSource(ABC):
     """Abstract audio source. Implementations stream ``AudioChunk``s."""
 
+    @property
+    @abstractmethod
+    def sample_rate(self) -> int:
+        """Target sample rate of emitted chunks (Hz)."""
+        ...
+
     @abstractmethod
     async def stream(self) -> AsyncIterator[AudioChunk]:
         ...
+
+    def drain_drops(self) -> int:
+        """Return and reset the cumulative drop count (chunks discarded due to full queue).
+
+        Thread-safe.  Default returns 0 (sources without a queue never drop).
+        """
+        return 0
 
     async def aclose(self) -> None:  # pragma: no cover - default no-op
         return None
@@ -53,13 +66,12 @@ def _resample_mono(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndar
         samples = samples.mean(axis=1)
     if src_rate == dst_rate:
         return samples.astype(np.float32, copy=False)
-    ratio = dst_rate / src_rate
-    out_len = int(round(len(samples) * ratio))
-    if out_len <= 0:
+    if len(samples) == 0:
         return np.zeros(0, dtype=np.float32)
-    src_x = np.linspace(0.0, 1.0, num=len(samples), endpoint=False, dtype=np.float64)
-    dst_x = np.linspace(0.0, 1.0, num=out_len, endpoint=False, dtype=np.float64)
-    return np.interp(dst_x, src_x, samples).astype(np.float32)
+    from math import gcd
+    from scipy.signal import resample_poly
+    g = gcd(src_rate, dst_rate)
+    return resample_poly(samples, dst_rate // g, src_rate // g).astype(np.float32)
 
 
 class MicrophoneSource(AudioSource):
@@ -80,6 +92,20 @@ class MicrophoneSource(AudioSource):
         self._chunk_seconds = chunk_seconds
         self._device = device
         self._stop = threading.Event()
+        # Shared queue reference so aclose() can inject a sentinel to unblock q.get().
+        self._q: Optional[queue.Queue] = None
+        self._drop_lock = threading.Lock()
+        self._drop_count: int = 0
+
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
+    def drain_drops(self) -> int:
+        with self._drop_lock:
+            n = self._drop_count
+            self._drop_count = 0
+        return n
 
     async def stream(self) -> AsyncIterator[AudioChunk]:
         try:
@@ -90,7 +116,8 @@ class MicrophoneSource(AudioSource):
             ) from exc
 
         loop = asyncio.get_running_loop()
-        q: queue.Queue[np.ndarray] = queue.Queue(maxsize=32)
+        q: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=32)
+        self._q = q
         chunk_frames = int(self._sample_rate * self._chunk_seconds)
 
         def _callback(indata, frames, time_info, status):  # noqa: ARG001 - sd API
@@ -101,6 +128,8 @@ class MicrophoneSource(AudioSource):
             try:
                 q.put_nowait(mono)
             except queue.Full:
+                with self._drop_lock:
+                    self._drop_count += 1
                 logger.warning("audio queue full — dropping chunk")
 
         stream = sd.InputStream(
@@ -120,15 +149,24 @@ class MicrophoneSource(AudioSource):
         try:
             while not self._stop.is_set():
                 mono = await loop.run_in_executor(None, q.get)
+                if mono is None:  # sentinel injected by aclose()
+                    break
                 yield AudioChunk(samples=mono, sample_rate=self._sample_rate, start_time=t0)
                 t0 += len(mono) / self._sample_rate
         finally:
             stream.stop()
             stream.close()
+            self._q = None
             logger.info("mic capture stopped")
 
     async def aclose(self) -> None:
         self._stop.set()
+        # Unblock any pending q.get() in the stream iterator so it can exit cleanly.
+        if self._q is not None:
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                pass
 
 
 class WavFileSource(AudioSource):
@@ -146,6 +184,10 @@ class WavFileSource(AudioSource):
         self._sample_rate = sample_rate
         self._chunk_seconds = chunk_seconds
         self._realtime = realtime
+
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
 
     async def stream(self) -> AsyncIterator[AudioChunk]:
         import soundfile as sf

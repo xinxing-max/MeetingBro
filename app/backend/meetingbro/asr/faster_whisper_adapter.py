@@ -34,13 +34,15 @@ class FasterWhisperAdapter(ASRAdapter):
     def __init__(
         self,
         *,
-        model_size: str = "tiny",
+        model_size: str = "medium",
         device: str = "cpu",
         compute_type: str = "int8",
+        beam_size: int = 3,
     ) -> None:
         self._model_size = model_size
         self._device = device
         self._compute_type = compute_type
+        self._beam_size = beam_size
         self._model = None  # lazy
 
     def _ensure_model(self):
@@ -65,6 +67,8 @@ class FasterWhisperAdapter(ASRAdapter):
         *,
         forced_language: Optional[str] = None,
         offset_seconds: float = 0.0,
+        initial_prompt: Optional[str] = None,
+        quality_preset: str = "realtime",
     ) -> list[ASRSegment]:
         if samples.size == 0:
             return []
@@ -76,13 +80,37 @@ class FasterWhisperAdapter(ASRAdapter):
             samples = samples.astype(np.float32)
 
         model = self._ensure_model()
-        segments_iter, info = model.transcribe(
-            samples,
+        transcribe_kwargs = dict(
             language=forced_language,
+            initial_prompt=initial_prompt or None,
             vad_filter=True,
-            beam_size=1,
+            vad_parameters=dict(
+                threshold=0.3,
+                min_speech_duration_ms=100,
+                min_silence_duration_ms=300,
+                speech_pad_ms=400,
+            ),
+            temperature=0.0,
+            condition_on_previous_text=False,
+            no_repeat_ngram_size=3,
             word_timestamps=False,
         )
+        if quality_preset == "retry":
+            transcribe_kwargs.update(
+                beam_size=max(self._beam_size, 5),
+                best_of=max(self._beam_size, 5),
+                compression_ratio_threshold=2.8,
+                no_speech_threshold=0.45,
+            )
+        else:
+            transcribe_kwargs.update(
+                beam_size=self._beam_size,
+                best_of=1,
+                compression_ratio_threshold=2.4,
+                no_speech_threshold=0.4,
+            )
+
+        segments_iter, info = model.transcribe(samples, **transcribe_kwargs)
         detected_language = forced_language or info.language
         lang = _normalize_language(detected_language)
 
@@ -91,8 +119,13 @@ class FasterWhisperAdapter(ASRAdapter):
             text = (s.text or "").strip()
             if not text:
                 continue
-            # avg_logprob is log-probability; convert to a rough [0,1] confidence.
-            conf = 1.0 / (1.0 + math.exp(-getattr(s, "avg_logprob", 0.0)))
+            # Whisper avg_logprob is usually negative even for decent segments, so
+            # a plain sigmoid(avg_logprob) collapses most normal speech into the
+            # low-confidence bucket. Re-center and steepen it to get a more useful
+            # rough UI confidence signal.
+            avg_logprob = getattr(s, "avg_logprob", None)
+            normalized_logprob = float(avg_logprob) if avg_logprob is not None else -0.7
+            conf = 1.0 / (1.0 + math.exp(-3.5 * (normalized_logprob + 0.7)))
             out.append(
                 ASRSegment(
                     start_time=offset_seconds + float(s.start),
@@ -100,6 +133,17 @@ class FasterWhisperAdapter(ASRAdapter):
                     text=text,
                     language=lang,
                     confidence=max(0.0, min(1.0, conf)),
+                    avg_logprob=float(avg_logprob) if avg_logprob is not None else None,
+                    no_speech_prob=(
+                        float(getattr(s, "no_speech_prob"))
+                        if getattr(s, "no_speech_prob", None) is not None
+                        else None
+                    ),
+                    compression_ratio=(
+                        float(getattr(s, "compression_ratio"))
+                        if getattr(s, "compression_ratio", None) is not None
+                        else None
+                    ),
                 )
             )
         return out

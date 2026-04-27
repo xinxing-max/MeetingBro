@@ -7,10 +7,8 @@ Build a platform-agnostic local meeting assistant that supports:
 - online meeting mode via system audio
 - offline meeting mode via microphone
 - real-time transcription
-- speaker diarization
 - **latest rolling summary** (live, last 3–5 minutes)
 - **current meeting summary** (live, cumulative from session start)
-- speaker summaries
 - time-window summaries
 - full transcript export
 - Chinese / English / German support
@@ -94,16 +92,11 @@ Render the **Live Transcript** panel on the session screen with auto-scroll and 
 
 ---
 
-## Phase 3 - Diarization
+## Future TODO - Optional Speaker Separation
 
-### Task 3.1
-Integrate diarization pipeline (default: pyannote) behind a speaker service interface.
-
-### Task 3.2
-Assign stable speaker IDs across segments and persist them.
-
-### Task 3.3
-Render speaker labels in the transcript and in a **Speakers** section of the session screen.
+- Leave speaker separation out of the active MVP until transcript quality is stable.
+- Revisit per-speaker labelling later if we have a diarization approach that is measurably reliable on MeetingBro's target audio.
+- When revisiting, keep it optional and behind a feature flag rather than enabled by default.
 
 ---
 
@@ -169,7 +162,7 @@ Persist "save to notes" entries on the `meeting.notes` field so they are include
 Implement time-window summary on user request (last 5 min / last 15 min / custom range).
 
 ### Task 5.2
-Implement speaker summary on user request.
+Keep speaker summary out of the active roadmap for now; revisit only after optional speaker separation is reliable enough to support it.
 
 ### Task 5.3
 Implement **final summary** at session end, producing a `SummarySnapshot` with `summary_type = "final_summary"`, including key points, decisions, action items, and open questions.
@@ -207,7 +200,6 @@ Export the session as Markdown, TXT, and JSON, including:
 - **history of cumulative meeting snapshots**
 - final summary
 - action items
-- speaker summaries
 - saved notes
 
 ### Task 7.2

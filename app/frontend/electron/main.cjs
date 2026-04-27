@@ -1,14 +1,19 @@
-const { app, BrowserWindow } = require("electron");
+const { app, BrowserWindow, screen } = require("electron");
 const path = require("node:path");
 
 const isDev = !app.isPackaged;
 
 function createWindow() {
+  const { width: workWidth, height: workHeight } = screen.getPrimaryDisplay().workAreaSize;
+  const width = Math.min(1680, Math.max(1280, Math.floor(workWidth * 0.92)));
+  const height = Math.min(1000, Math.max(820, Math.floor(workHeight * 0.9)));
+
   const win = new BrowserWindow({
-    width: 1400,
-    height: 900,
-    minWidth: 1100,
-    minHeight: 700,
+    width,
+    height,
+    minWidth: 1280,
+    minHeight: 780,
+    center: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,

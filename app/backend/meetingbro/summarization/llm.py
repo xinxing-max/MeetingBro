@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 _PROMPTS = {
     "meeting_memory": (
         "You maintain a compressed, structured memory of an ongoing meeting in {language}. "
+        "The transcript may mix Chinese, English, and German; account for content in all "
+        "languages and do not ignore non-English text. "
         "Update the previous memory using only the new transcript. Keep it concise and "
         "bounded. Preserve durable facts; remove resolved or redundant details. Output "
         "Markdown with these exact headings: ## Topics, ## Decisions, ## Action Items, "
@@ -22,17 +24,27 @@ _PROMPTS = {
     ),
     "rolling_summary": (
         "You are summarizing the last few minutes of a live meeting transcript. "
-        "Write a concise, factual recap in 2–4 sentences in {language}. "
+        "The transcript may mix Chinese, English, and German; account for content in all "
+        "languages and summarize in {language}. "
+        "Write a concise, factual recap in 2-4 sentences in {language}. "
         "Cover what was just discussed; do not invent content."
     ),
     "cumulative_meeting_summary": (
         "You are maintaining a live cumulative summary of an ongoing meeting. "
-        "Write a compact update in {language} covering topics, decisions, and "
-        "open questions so far. 3–6 sentences."
+        "The transcript may mix Chinese, English, and German; account for content in all "
+        "languages and summarize in {language}. "
+        "Use the compressed meeting memory as the durable context and the recent "
+        "transcript as fresh evidence. Write a compact update in {language} covering "
+        "topics, decisions, action items, and open questions so far. 3-6 sentences. "
+        "Do not invent content."
     ),
     "final_summary": (
-        "You are writing the final recap of a meeting transcript. In {language}, "
-        "produce: key points, decisions, action items, open questions. Be faithful to the transcript."
+        "You are writing the final recap of a meeting. Use the compressed meeting "
+        "memory as the durable context and the recent transcript as fresh evidence. "
+        "The transcript may mix Chinese, English, and German; account for content in all "
+        "languages and summarize in {language}. "
+        "In {language}, produce: key points, decisions, action items, open questions. "
+        "Be faithful to the provided context; do not invent content."
     ),
 }
 

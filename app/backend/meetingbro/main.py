@@ -15,15 +15,14 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 
 from .asr.faster_whisper_adapter import FasterWhisperAdapter
-from .audio import AudioSource, MicrophoneSource, SystemAudioLoopbackSource, WavFileSource
-from .diarization.energy import EnergyDiarizer
+from .audio import AudioSource, MicrophoneSource, MixedAudioSource, SystemAudioLoopbackSource, WavFileSource
+from .llm.openai_compatible import _load_dotenv_if_present
 from .schemas import (
     CreateNoteRequest,
     ErrorPayload,
     LanguageCode,
     Note,
     SessionStatePayload,
-    Speaker,
     SummarySnapshot,
     TranscriptSegment,
 )
@@ -40,15 +39,89 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "meetingbro.db"
 
 
+def _recommended_asr_executor_workers() -> int:
+    # SessionManager drives at most one ASR call at a time per session, so more
+    # than one ASR worker per session adds thread overhead without throughput gain.
+    return 1
+
+
+def _recommended_summary_executor_workers() -> int:
+    cores = os.cpu_count() or 4
+    if cores >= 12:
+        return 2
+    return 1
+
+
+def _recommended_translation_executor_workers() -> int:
+    return 1
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("invalid %s=%r, using default %.3f", name, value, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("invalid %s=%r, using default %d", name, value, default)
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("invalid %s=%r, using default %s", name, value, default)
+    return default
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_dotenv_if_present()
     storage = Storage(Path(os.environ.get("MEETINGBRO_DB", str(DEFAULT_DB_PATH))))
     asr = FasterWhisperAdapter(
-        model_size=os.environ.get("MEETINGBRO_WHISPER_SIZE", "tiny"),
+        model_size=os.environ.get("MEETINGBRO_WHISPER_SIZE", "medium"),
+        beam_size=_env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 3),
     )
     app.state.storage = storage
     app.state.asr = asr
-    logger.info("MeetingBro backend starting db=%s", storage._db_path)
+    logger.info(
+        "MeetingBro backend starting db=%s whisper_size=%s beam=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f denoise=%s pre_vad=%s suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d",
+        storage._db_path,
+        os.environ.get("MEETINGBRO_WHISPER_SIZE", "medium"),
+        _env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 3),
+        _env_float("MEETINGBRO_CHUNK_SECONDS", 2.5),
+        _env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 2.5),
+        _env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.002),
+        _env_bool("MEETINGBRO_DENOISE_ENABLED", False),
+        _env_bool("MEETINGBRO_PRE_VAD_ENABLED", True),
+        _env_float("MEETINGBRO_SUSPICIOUS_SEGMENT_NO_SPEECH_PROB", 0.6),
+        _env_float("MEETINGBRO_SUSPICIOUS_SEGMENT_AVG_LOGPROB", -0.9),
+        _env_float("MEETINGBRO_SUSPICIOUS_SEGMENT_COMPRESSION_RATIO", 2.1),
+        _env_float("MEETINGBRO_MIXED_MIC_GAIN", 1.2),
+        _env_float("MEETINGBRO_MIXED_SYSTEM_GAIN", 1.0),
+        _env_bool("MEETINGBRO_MIXED_AUTO_BALANCE_ENABLED", True),
+        _env_float("MEETINGBRO_MIXED_MAX_MIC_BOOST", 1.8),
+        _env_int("MEETINGBRO_ASR_EXECUTOR_WORKERS", _recommended_asr_executor_workers()),
+        _env_int("MEETINGBRO_SUMMARY_EXECUTOR_WORKERS", _recommended_summary_executor_workers()),
+        _env_int("MEETINGBRO_TRANSLATION_EXECUTOR_WORKERS", _recommended_translation_executor_workers()),
+    )
     try:
         yield
     finally:
@@ -92,12 +165,6 @@ async def list_notes(meeting_id: str) -> list[Note]:
     return storage.list_notes(meeting_id)
 
 
-@app.get("/meetings/{meeting_id}/speakers", response_model=list[Speaker])
-async def list_speakers(meeting_id: str) -> list[Speaker]:
-    storage: Storage = app.state.storage
-    return storage.list_speakers(meeting_id)
-
-
 @app.get("/meetings/{meeting_id}/transcript", response_model=list[TranscriptSegment])
 async def list_transcript(meeting_id: str) -> list[TranscriptSegment]:
     storage: Storage = app.state.storage
@@ -119,17 +186,35 @@ def _build_audio_source(source: str) -> AudioSource:
     - "mic" or empty: microphone capture (offline / in-person mode).
     - "loopback" / "system": WASAPI system-audio loopback (Windows-only,
       online meeting mode — Teams/Zoom/BBB audio).
+    - "mixed": microphone + system loopback mixed together.
     - "file:<path>": replay a WAV file for the E2E vertical-slice test.
     """
+    chunk_seconds = _env_float("MEETINGBRO_CHUNK_SECONDS", 2.5)
     if not source or source == "mic":
-        return MicrophoneSource(sample_rate=16_000, chunk_seconds=1.5)
+        return MicrophoneSource(sample_rate=16_000, chunk_seconds=chunk_seconds)
     if source in ("loopback", "system"):
-        return SystemAudioLoopbackSource(sample_rate=16_000, chunk_seconds=1.5)
+        return SystemAudioLoopbackSource(sample_rate=16_000, chunk_seconds=chunk_seconds)
+    if source == "mixed":
+        return MixedAudioSource(
+            sample_rate=16_000,
+            chunk_seconds=chunk_seconds,
+            microphone_gain=_env_float("MEETINGBRO_MIXED_MIC_GAIN", 1.2),
+            system_gain=_env_float("MEETINGBRO_MIXED_SYSTEM_GAIN", 1.0),
+            auto_balance_enabled=_env_bool("MEETINGBRO_MIXED_AUTO_BALANCE_ENABLED", True),
+            max_microphone_boost=_env_float("MEETINGBRO_MIXED_MAX_MIC_BOOST", 1.8),
+            microphone_activity_floor=_env_float("MEETINGBRO_MIXED_MIC_ACTIVITY_FLOOR", 0.008),
+            balance_smoothing=_env_float("MEETINGBRO_MIXED_BALANCE_SMOOTHING", 0.35),
+        )
     if source.startswith("file:"):
         path = Path(source[len("file:") :]).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError(path)
-        return WavFileSource(path, sample_rate=16_000, chunk_seconds=5.0, realtime=False)
+        return WavFileSource(
+            path,
+            sample_rate=16_000,
+            chunk_seconds=_env_float("MEETINGBRO_FILE_CHUNK_SECONDS", 5.0),
+            realtime=False,
+        )
     raise ValueError(f"unsupported audio source: {source}")
 
 
@@ -165,13 +250,51 @@ async def session_ws(
 
     config = SessionConfig(
         audio_source=audio_source,
+        audio_source_name=source,
         asr=app.state.asr,
         summarizer=LLMSummarizer(),
         translator=LLMTranslator(),
         storage=app.state.storage,
-        diarizer=EnergyDiarizer(),
         forced_language=forced_language,
         summary_language=summary_lang,
+        live_translation_language=None,
+        asr_accumulation_seconds=_env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 2.5),
+        silence_rms_threshold=_env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.002),
+        asr_overlap_seconds=_env_float("MEETINGBRO_ASR_OVERLAP_SECONDS", 0.0),
+        vocabulary_hint=os.environ.get("MEETINGBRO_VOCABULARY_HINT") or None,
+        suspicious_segment_no_speech_prob=_env_float(
+            "MEETINGBRO_SUSPICIOUS_SEGMENT_NO_SPEECH_PROB",
+            0.6,
+        ),
+        suspicious_segment_avg_logprob=_env_float(
+            "MEETINGBRO_SUSPICIOUS_SEGMENT_AVG_LOGPROB",
+            -0.9,
+        ),
+        suspicious_segment_compression_ratio=_env_float(
+            "MEETINGBRO_SUSPICIOUS_SEGMENT_COMPRESSION_RATIO",
+            2.1,
+        ),
+        denoise_enabled=_env_bool("MEETINGBRO_DENOISE_ENABLED", False),
+        denoise_strength=_env_float("MEETINGBRO_DENOISE_STRENGTH", 1.1),
+        denoise_noise_update_rms_threshold=_env_float(
+            "MEETINGBRO_DENOISE_NOISE_UPDATE_RMS_THRESHOLD",
+            0.02,
+        ),
+        pre_vad_enabled=_env_bool("MEETINGBRO_PRE_VAD_ENABLED", True),
+        pre_vad_trailing_silence_seconds=_env_float("MEETINGBRO_PRE_VAD_TRAILING_SILENCE_SECONDS", 0.45),
+        pre_vad_max_segment_seconds=_env_float("MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS", 12.0),
+        asr_executor_workers=_env_int(
+            "MEETINGBRO_ASR_EXECUTOR_WORKERS",
+            _recommended_asr_executor_workers(),
+        ),
+        summary_executor_workers=_env_int(
+            "MEETINGBRO_SUMMARY_EXECUTOR_WORKERS",
+            _recommended_summary_executor_workers(),
+        ),
+        translation_executor_workers=_env_int(
+            "MEETINGBRO_TRANSLATION_EXECUTOR_WORKERS",
+            _recommended_translation_executor_workers(),
+        ),
     )
     manager = SessionManager(config)
     await manager.start()
@@ -200,6 +323,45 @@ async def session_ws(
                             {"type": "note_saved", "payload": note.model_dump(mode="json")}
                         )
                     )
+            elif data.get("type") == "update_settings":
+                payload = data.get("payload") or {}
+                next_summary_language = payload.get("summary_language")
+                summary_lang = (
+                    next_summary_language
+                    if next_summary_language in ("zh", "en", "de")
+                    else None
+                )
+                forced_language = payload.get("forced_language")
+                if forced_language == "auto":
+                    forced_language = None
+                elif forced_language not in (None, "zh", "en", "de"):
+                    forced_language = manager._cfg.forced_language
+                live_translation_language = payload.get("subtitle_language")
+                if live_translation_language == "off":
+                    live_translation_language = None
+                elif live_translation_language not in (None, "zh", "en", "de"):
+                    live_translation_language = manager._cfg.live_translation_language
+                next_source = payload.get("source")
+                if next_source and next_source != source:
+                    try:
+                        next_audio_source = _build_audio_source(next_source)
+                    except Exception as exc:
+                        await ws.send_text(
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "payload": ErrorPayload(code="bad_source", message=str(exc)).model_dump(),
+                                }
+                            )
+                        )
+                    else:
+                        manager.update_audio_source(next_audio_source, source_name=next_source)
+                        source = next_source
+                manager.update_runtime_settings(
+                    forced_language=forced_language,
+                    summary_language=summary_lang,
+                    live_translation_language=live_translation_language,
+                )
             elif data.get("type") == "stop":
                 break
     except WebSocketDisconnect:
