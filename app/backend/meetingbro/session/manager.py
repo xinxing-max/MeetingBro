@@ -41,8 +41,10 @@ class SessionConfig:
     summary_language: LanguageCode = "en"
     rolling_window_seconds: float = 180.0  # last ~3 minutes for rolling summary input
     rolling_interval_seconds: float = 60.0  # cadence target for rolling refresh
+    memory_interval_seconds: float = 120.0  # cadence target for compressed meeting memory refresh
     cumulative_interval_seconds: float = 180.0  # cadence target for cumulative refresh
     min_segments_for_rolling: int = 1
+    min_segments_for_memory: int = 3
     min_segments_for_cumulative: int = 3
     asr_accumulation_seconds: float = 2.5  # accumulate audio before running ASR
 
@@ -58,8 +60,12 @@ class _State:
     meeting_id: str
     segments: list[TranscriptSegment] = field(default_factory=list)
     last_rolling_at: float = 0.0
+    last_memory_at: float = 0.0
     last_cumulative_at: float = 0.0
+    latest_meeting_memory: Optional[str] = None
     latest_cumulative_text: Optional[str] = None
+    last_memory_segment_index: int = 0
+    memory_in_flight: bool = False
     elapsed_seconds: float = 0.0
     speakers: dict[str, Speaker] = field(default_factory=dict)  # label -> Speaker
 
@@ -245,6 +251,7 @@ class SessionManager:
                 # Fire summary checks as background tasks so they don't block
                 # the audio→ASR→emit pipeline.
                 self._schedule_summary(self._maybe_emit_rolling())
+                self._schedule_summary(self._maybe_emit_memory())
                 self._schedule_summary(self._maybe_emit_cumulative())
 
             # Flush remaining accumulated audio.
@@ -294,6 +301,7 @@ class SessionManager:
                 await asyncio.wait(self._summary_tasks, timeout=15.0)
                 self._summary_tasks.clear()
 
+            await self._emit_memory(force=True)
             await self._emit_final()
         except Exception as exc:
             logger.exception("session loop crashed")
@@ -354,6 +362,7 @@ class SessionManager:
         if not segments:
             return None
         kind = summary_type if summary_type in {
+            "meeting_memory",
             "rolling_summary",
             "cumulative_meeting_summary",
             "final_summary",
@@ -404,6 +413,42 @@ class SessionManager:
         )
         if snap is not None:
             self._state.last_rolling_at = now
+
+    async def _maybe_emit_memory(self) -> None:
+        now = self._state.elapsed_seconds
+        due = (now - self._state.last_memory_at) >= self._cfg.memory_interval_seconds
+        if not due:
+            return
+        await self._emit_memory(force=False)
+
+    async def _emit_memory(self, *, force: bool) -> Optional[SummarySnapshot]:
+        if self._state.memory_in_flight:
+            return None
+        new_segments = self._state.segments[self._state.last_memory_segment_index :]
+        if len(new_segments) < self._cfg.min_segments_for_memory and not force:
+            return None
+        if not new_segments:
+            return None
+
+        self._state.memory_in_flight = True
+        end_index = len(self._state.segments)
+        start = min(s.start_time for s in new_segments)
+        end = max(s.end_time for s in new_segments)
+        try:
+            snap = await self._build_and_emit_snapshot(
+                summary_type="meeting_memory",
+                segments=list(new_segments),
+                time_start=start,
+                time_end=end,
+                previous_summary=self._state.latest_meeting_memory,
+            )
+            if snap is not None:
+                self._state.latest_meeting_memory = snap.content
+                self._state.last_memory_segment_index = end_index
+                self._state.last_memory_at = self._state.elapsed_seconds
+            return snap
+        finally:
+            self._state.memory_in_flight = False
 
     async def _maybe_emit_cumulative(self) -> None:
         now = self._state.elapsed_seconds

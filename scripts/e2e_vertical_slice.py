@@ -99,8 +99,10 @@ async def main() -> int:
                 summary_language="en",
                 rolling_window_seconds=30.0,
                 rolling_interval_seconds=2.0,
+                memory_interval_seconds=5.0,
                 cumulative_interval_seconds=5.0,
                 min_segments_for_rolling=1,
+                min_segments_for_memory=1,
                 min_segments_for_cumulative=1,
             )
             manager = SessionManager(config)
@@ -152,7 +154,7 @@ async def main() -> int:
 
             print()
             print("summary snapshot types:", {k: len(v) for k, v in by_type.items()})
-            for kind in ("rolling_summary", "cumulative_meeting_summary", "final_summary"):
+            for kind in ("meeting_memory", "rolling_summary", "cumulative_meeting_summary", "final_summary"):
                 if kind in by_type:
                     latest = by_type[kind][-1]
                     print(
@@ -183,7 +185,7 @@ async def main() -> int:
 
             ok = (
                 len(segs) >= 1
-                and {"rolling_summary", "cumulative_meeting_summary"} & set(by_type)
+                and {"meeting_memory", "rolling_summary", "cumulative_meeting_summary"} <= set(by_type)
                 and len(db_segs) == len(segs)
                 and len(db_snaps) >= 1
                 and len(db_notes) == 1

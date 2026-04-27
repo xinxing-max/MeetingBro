@@ -6,6 +6,7 @@ from typing import Literal, Sequence
 from ..schemas import LanguageCode, TranscriptSegment
 
 SummaryKind = Literal[
+    "meeting_memory",
     "rolling_summary",
     "cumulative_meeting_summary",
     "final_summary",

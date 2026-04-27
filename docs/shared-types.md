@@ -13,6 +13,7 @@ A `SummarySnapshot` is tagged with one of:
 
 | `summary_type`               | Scope                                                  | Cadence                                |
 |------------------------------|--------------------------------------------------------|----------------------------------------|
+| `meeting_memory`             | Compressed structured state for long meetings          | Incremental, bounded context           |
 | `rolling_summary`            | Most recent 3–5 minutes of transcript                  | Continuous, ~60–90 s                   |
 | `cumulative_meeting_summary` | From session start to `time_end`                       | Periodic, ~3–5 min                     |
 | `time_window_summary`        | User-selected range                                    | On demand                              |
@@ -41,7 +42,8 @@ A `SummarySnapshot` is tagged with one of:
 {
   id: string
   meeting_id: string
-  summary_type: "rolling_summary"
+  summary_type: "meeting_memory"
+               | "rolling_summary"
                | "cumulative_meeting_summary"
                | "time_window_summary"
                | "speaker_summary"

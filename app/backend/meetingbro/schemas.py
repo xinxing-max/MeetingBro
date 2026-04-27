@@ -10,6 +10,7 @@ LanguageCode = Literal["zh", "en", "de"]
 OriginalLanguage = Literal["zh", "en", "de", "unknown"]
 
 SummaryType = Literal[
+    "meeting_memory",
     "rolling_summary",
     "cumulative_meeting_summary",
     "time_window_summary",

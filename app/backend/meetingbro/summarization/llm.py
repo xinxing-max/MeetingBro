@@ -13,6 +13,13 @@ logger = logging.getLogger(__name__)
 
 
 _PROMPTS = {
+    "meeting_memory": (
+        "You maintain a compressed, structured memory of an ongoing meeting in {language}. "
+        "Update the previous memory using only the new transcript. Keep it concise and "
+        "bounded. Preserve durable facts; remove resolved or redundant details. Output "
+        "Markdown with these exact headings: ## Topics, ## Decisions, ## Action Items, "
+        "## Open Questions, ## Important Facts. Do not invent content."
+    ),
     "rolling_summary": (
         "You are summarizing the last few minutes of a live meeting transcript. "
         "Write a concise, factual recap in 2–4 sentences in {language}. "
@@ -101,9 +108,17 @@ class LLMSummarizer(Summarizer):
         system_prompt = _PROMPTS[kind].format(language=_LANG_NAMES.get(language, language))
         user_content = transcript_text
         if previous_summary:
-            user_content = (
-                f"Previous summary:\n{previous_summary}\n\nNew transcript since then:\n{transcript_text}"
+            previous_label = (
+                "Previous meeting memory"
+                if kind == "meeting_memory"
+                else "Previous summary"
             )
+            new_label = (
+                "New transcript to fold into memory"
+                if kind == "meeting_memory"
+                else "New transcript since then"
+            )
+            user_content = f"{previous_label}:\n{previous_summary}\n\n{new_label}:\n{transcript_text}"
 
         try:
             if provider == "openai_compatible":
@@ -111,14 +126,14 @@ class LLMSummarizer(Summarizer):
                 return self._compatible_client.chat(
                     system=system_prompt,
                     user=user_content,
-                    max_tokens=600,
+                    max_tokens=900 if kind == "meeting_memory" else 600,
                     temperature=0.2,
                 )
             elif provider == "anthropic":
                 assert self._anthropic_client is not None
                 msg = self._anthropic_client.messages.create(
                     model="claude-haiku-4-5-20251001",
-                    max_tokens=600,
+                    max_tokens=900 if kind == "meeting_memory" else 600,
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_content}],
                 )

@@ -114,6 +114,9 @@ class HeuristicSummarizer(Summarizer):
         if kind == "rolling_summary":
             max_s = self._rolling
             label = "Recent discussion"
+        elif kind == "meeting_memory":
+            max_s = self._cumulative
+            label = "## Topics"
         elif kind == "cumulative_meeting_summary":
             max_s = self._cumulative
             label = "Meeting so far"
@@ -135,9 +138,21 @@ class HeuristicSummarizer(Summarizer):
         keywords = _keywords(transcript_text, heur_lang, k=6)
         keyword_line = ", ".join(keywords) if keywords else ""
 
-        parts = [f"{label}: {body}" if body else label]
+        if kind == "meeting_memory":
+            parts = [
+                f"## Topics\n- {body}" if body else "## Topics",
+                "## Decisions",
+                "## Action Items",
+                "## Open Questions",
+                "## Important Facts",
+            ]
+        else:
+            parts = [f"{label}: {body}" if body else label]
         if keyword_line:
-            parts.append(f"Key terms: {keyword_line}")
+            if kind == "meeting_memory":
+                parts.append(f"- Key terms: {keyword_line}")
+            else:
+                parts.append(f"Key terms: {keyword_line}")
         if kind == "cumulative_meeting_summary" and previous_summary:
             parts.append(f"(Prior view: {previous_summary[:240]})")
         return "\n".join(parts)
