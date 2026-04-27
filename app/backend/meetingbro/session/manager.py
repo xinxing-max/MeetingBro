@@ -43,6 +43,7 @@ class SessionConfig:
     rolling_interval_seconds: float = 60.0  # cadence target for rolling refresh
     memory_interval_seconds: float = 120.0  # cadence target for compressed meeting memory refresh
     cumulative_interval_seconds: float = 180.0  # cadence target for cumulative refresh
+    summary_tail_seconds: float = 120.0  # recent raw transcript kept beside compressed memory
     min_segments_for_rolling: int = 1
     min_segments_for_memory: int = 3
     min_segments_for_cumulative: int = 3
@@ -350,6 +351,19 @@ class SessionManager:
         cutoff = max(0.0, self._state.elapsed_seconds - window_seconds)
         return [s for s in self._state.segments if s.end_time >= cutoff]
 
+    def _summary_context_segments(self) -> list[TranscriptSegment]:
+        """Recent raw transcript kept beside the compressed meeting memory.
+
+        Long meetings should not send the full transcript to the LLM for every
+        cumulative/final summary. The compressed memory carries durable state;
+        this tail preserves fresh wording and unsummarized details.
+        """
+
+        tail = self._segments_in_window(self._cfg.summary_tail_seconds)
+        if tail:
+            return tail
+        return list(self._state.segments[-10:])
+
     async def _build_and_emit_snapshot(
         self,
         *,
@@ -455,16 +469,17 @@ class SessionManager:
         due = (now - self._state.last_cumulative_at) >= self._cfg.cumulative_interval_seconds
         if not due:
             return
-        all_segments = list(self._state.segments)
-        if len(all_segments) < self._cfg.min_segments_for_cumulative:
+        context_segments = self._summary_context_segments()
+        if len(context_segments) < self._cfg.min_segments_for_cumulative:
             return
-        end = max(s.end_time for s in all_segments)
+        end = max(s.end_time for s in self._state.segments)
+        compressed_context = self._state.latest_meeting_memory or self._state.latest_cumulative_text
         snap = await self._build_and_emit_snapshot(
             summary_type="cumulative_meeting_summary",
-            segments=all_segments,
+            segments=context_segments,
             time_start=0.0,
             time_end=end,
-            previous_summary=self._state.latest_cumulative_text,
+            previous_summary=compressed_context,
         )
         if snap is not None:
             self._state.last_cumulative_at = now
@@ -474,10 +489,11 @@ class SessionManager:
         if not self._state.segments:
             return
         end = max(s.end_time for s in self._state.segments)
+        compressed_context = self._state.latest_meeting_memory or self._state.latest_cumulative_text
         await self._build_and_emit_snapshot(
             summary_type="final_summary",
-            segments=list(self._state.segments),
+            segments=self._summary_context_segments(),
             time_start=0.0,
             time_end=end,
-            previous_summary=self._state.latest_cumulative_text,
+            previous_summary=compressed_context,
         )

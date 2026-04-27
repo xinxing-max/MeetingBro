@@ -111,12 +111,12 @@ class LLMSummarizer(Summarizer):
             previous_label = (
                 "Previous meeting memory"
                 if kind == "meeting_memory"
-                else "Previous summary"
+                else "Compressed meeting memory / prior summary"
             )
             new_label = (
                 "New transcript to fold into memory"
                 if kind == "meeting_memory"
-                else "New transcript since then"
+                else "Recent transcript tail"
             )
             user_content = f"{previous_label}:\n{previous_summary}\n\n{new_label}:\n{transcript_text}"
 

@@ -153,6 +153,6 @@ class HeuristicSummarizer(Summarizer):
                 parts.append(f"- Key terms: {keyword_line}")
             else:
                 parts.append(f"Key terms: {keyword_line}")
-        if kind == "cumulative_meeting_summary" and previous_summary:
-            parts.append(f"(Prior view: {previous_summary[:240]})")
+        if kind in {"cumulative_meeting_summary", "final_summary"} and previous_summary:
+            parts.append(f"(Compressed meeting memory: {previous_summary[:240]})")
         return "\n".join(parts)
