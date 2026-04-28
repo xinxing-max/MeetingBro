@@ -36,6 +36,8 @@ export interface ExportMeetingInput {
   subtitle_language?: string;
   export_root?: string;
   export_dir?: string;
+  bilingual?: boolean;
+  target_language?: "zh" | "en" | "de";
 }
 
 export interface SessionOptions {
@@ -369,7 +371,15 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
         return null;
       }
       const base = window.meetingbro?.backendHttp ?? "http://127.0.0.1:8765";
-      const response = await fetch(`${base}/meetings/${meetingId}/export`, {
+      const params = new URLSearchParams();
+      if (input.bilingual) {
+        params.set("bilingual", "true");
+      }
+      if (input.target_language) {
+        params.set("target_language", input.target_language);
+      }
+      const url = `${base}/meetings/${meetingId}/export${params.size ? `?${params.toString()}` : ""}`;
+      const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(input),

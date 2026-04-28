@@ -296,6 +296,7 @@ export default function App() {
   const [lastExport, setLastExport] = useState<ExportMeetingResponse | null>(null);
   const [exportRoot, setExportRoot] = useState<string>("");
   const [exporting, setExporting] = useState(false);
+  const [bilingualExport, setBilingualExport] = useState(false);
   const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, stopSession } =
     useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage, runtimeProfile });
 
@@ -624,6 +625,8 @@ export default function App() {
         summary_language: summaryLanguage,
         subtitle_language: subtitleLanguage,
         export_dir: exportRoot.trim() || undefined,
+        bilingual: bilingualExport,
+        target_language: bilingualExport ? ((summaryLanguage === "zh" || summaryLanguage === "en" || summaryLanguage === "de") ? summaryLanguage : undefined) : undefined,
       });
       if (result) {
         setLastExport(result);
@@ -1030,6 +1033,14 @@ export default function App() {
                     </button>
                   )}
                 </div>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 8, marginTop: 10, fontSize: 12 }}>
+                  <input
+                    type="checkbox"
+                    checked={bilingualExport}
+                    onChange={(e) => setBilingualExport(e.target.checked)}
+                  />
+                  Bilingual transcript (original + translation)
+                </label>
                 {lastExport && (
                   <p className="export-path">
                     Latest export: <code>{lastExport.export_dir}</code>
