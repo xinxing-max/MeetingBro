@@ -268,6 +268,8 @@ async def list_summaries(
 @app.post("/meetings/{meeting_id}/export", response_model=ExportMeetingResponse)
 async def export_meeting_endpoint(
     meeting_id: str,
+    bilingual: bool = Query(False),
+    target_language: Optional[LanguageCode] = Query(None),
     req: ExportMeetingRequest | None = None,
 ) -> ExportMeetingResponse:
     storage: Storage = app.state.storage
@@ -282,9 +284,13 @@ async def export_meeting_endpoint(
             export_root=export_root,
             export_dir=Path(requested_export_dir) if requested_export_dir else None,
             client_metadata=req_data,
+            bilingual=bilingual,
+            target_language=target_language,
         )
     except KeyError:
         raise HTTPException(status_code=404, detail="meeting not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"export failed: {exc}")
 

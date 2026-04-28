@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from .schemas import ExportMeetingResponse, Note, SummarySnapshot, TranscriptSegment
+from .schemas import ExportMeetingResponse, LanguageCode, Note, SummarySnapshot, TranscriptSegment
 from .storage.db import Storage
 
 
@@ -57,13 +57,31 @@ def _speaker_label(seg: TranscriptSegment) -> str:
     return seg.speaker_id or "Speaker"
 
 
+def _escape_table_cell(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _resolve_target_language(meeting: dict[str, str | None], target_language: Optional[LanguageCode]) -> LanguageCode:
+    resolved = target_language or meeting.get("preferred_summary_language")
+    if resolved not in ("zh", "en", "de"):
+        raise ValueError("target language is required for bilingual transcript export")
+    return resolved
+
+
 def _write_transcript(
     path: Path,
     *,
     meeting: dict[str, str | None],
     segments: list[TranscriptSegment],
     client_metadata: dict[str, Any],
+    bilingual: bool = False,
+    target_language: Optional[LanguageCode] = None,
 ) -> None:
+    transcript_heading = "## Transcript"
+    resolved_language: Optional[LanguageCode] = None
+    if bilingual:
+        resolved_language = _resolve_target_language(meeting, target_language)
+        transcript_heading = f"## Transcript (bilingual: original / {resolved_language})"
     lines: list[str] = [
         "# Live Transcript",
         "",
@@ -75,11 +93,26 @@ def _write_transcript(
         lines.append(f"- Source: `{client_metadata['source']}`")
     if client_metadata.get("runtime_profile"):
         lines.append(f"- Runtime mode: `{client_metadata['runtime_profile']}`")
-    lines.extend(["", "## Transcript", ""])
+    lines.extend(["", transcript_heading, ""])
 
     if not segments:
         lines.append("_No transcript segments saved._")
+    elif bilingual:
+        lines.extend(
+            [
+                f"| Time | Speaker | Original | {resolved_language.upper()} |",
+                "| --- | --- | --- | --- |",
+            ]
+        )
+        for seg in segments:
+            translation = seg.text if seg.original_language == resolved_language else (seg.translations.get(resolved_language) or "").strip()
+            time_range = f"{_format_seconds(seg.start_time)}–{_format_seconds(seg.end_time)}"
+            lines.append(
+                f"| {time_range} | {_escape_table_cell(_speaker_label(seg))} | {_escape_table_cell(seg.text)} | {_escape_table_cell(translation) or '—'} |"
+            )
     for seg in segments:
+        if bilingual:
+            continue
         time_range = f"{_format_seconds(seg.start_time)}–{_format_seconds(seg.end_time)}"
         lines.append(f"### [{time_range}] {_speaker_label(seg)} ({seg.original_language})")
         lines.append(seg.text.strip())
@@ -203,6 +236,8 @@ def export_meeting(
     export_root: Path,
     export_dir: Optional[Path] = None,
     client_metadata: Optional[dict[str, Any]] = None,
+    bilingual: bool = False,
+    target_language: Optional[LanguageCode] = None,
 ) -> ExportMeetingResponse:
     meeting = storage.get_meeting(meeting_id)
     if meeting is None:
@@ -229,6 +264,8 @@ def export_meeting(
         meeting=meeting,
         segments=segments,
         client_metadata=client_metadata,
+        bilingual=bilingual,
+        target_language=target_language,
     )
     _write_summary(summary_path, meeting=meeting, snapshots=snapshots, notes=notes)
 
