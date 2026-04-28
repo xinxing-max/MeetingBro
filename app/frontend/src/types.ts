@@ -6,7 +6,9 @@ export type SummaryType =
   | "cumulative_meeting_summary"
   | "time_window_summary"
   | "speaker_summary"
-  | "final_summary";
+  | "final_summary"
+  | "chapter_list"
+  | "action_item_list";
 
 export interface TranscriptSegment {
   id: string;
@@ -17,6 +19,7 @@ export interface TranscriptSegment {
   original_language: LanguageCode | "unknown";
   speaker_id: string | null;
   confidence: number;
+  quality?: "ok" | "uncertain" | "low";
   translations: Partial<Record<LanguageCode, string>>;
   created_at: string;
   emitted_at_elapsed_seconds?: number | null;
@@ -43,6 +46,12 @@ export interface Note {
   source_type: string | null;
   source_id: string | null;
   created_at: string;
+}
+
+export interface ExportMeetingResponse {
+  meeting_id: string;
+  export_dir: string;
+  files: string[];
 }
 
 export type SessionState = "starting" | "running" | "paused" | "ended";

@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { SummarySnapshot } from "./types";
+import type { ExportMeetingResponse, SummarySnapshot } from "./types";
 import { useSessionSocket } from "./session/useSessionSocket";
+
+const VOCABULARY_STORAGE_KEY = "meetingbro.vocabulary";
 
 function formatRange(start: number, end: number): string {
   const fmt = (s: number) => {
@@ -36,6 +38,15 @@ function getDelayTone(seconds: number | null): "ok" | "warn" | "danger" | "unkno
   if (seconds < 1.2) return "ok";
   if (seconds < 2.8) return "warn";
   return "danger";
+}
+
+type AdviceSeverity = "ok" | "warn" | "danger";
+
+interface SystemAdvice {
+  severity: AdviceSeverity;
+  title: string;
+  detail: string;
+  action?: string;
 }
 
 function getConfidenceTone(confidence: number): "stable" | "soft" | "uncertain" {
@@ -125,6 +136,30 @@ function formatRuntimeProfileLabel(profile: string | null | undefined): string {
       return "Balanced";
     default:
       return profile ?? "Balanced";
+  }
+}
+
+function defaultExportFolderName(): string {
+  const now = new Date();
+  const pad = (value: number, width = 2) => value.toString().padStart(width, "0");
+  const timestamp = [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate()),
+  ].join("-") + "_" + [
+    pad(now.getHours()),
+    pad(now.getMinutes()),
+    pad(now.getSeconds()),
+  ].join("-") + `-${pad(now.getMilliseconds(), 3)}`;
+  return `${timestamp}_meetingbro`;
+}
+
+function parseSnapshotList(content: string): Array<Record<string, unknown>> {
+  try {
+    const value = JSON.parse(content);
+    return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => !!item && typeof item === "object") : [];
+  } catch {
+    return [];
   }
 }
 
@@ -256,14 +291,26 @@ export default function App() {
   const [summaryLanguage, setSummaryLanguage] = useState("en");
   const [subtitleLanguage, setSubtitleLanguage] = useState("off");
   const [runtimeProfile, setRuntimeProfile] = useState("balanced");
+  const [vocabulary, setVocabulary] = useState("");
   const [sessionEnabled, setSessionEnabled] = useState(false);
-  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, latestByType, historyByType, notes, lastError, saveNote, stopSession } =
+  const [lastExport, setLastExport] = useState<ExportMeetingResponse | null>(null);
+  const [exportRoot, setExportRoot] = useState<string>("");
+  const [exporting, setExporting] = useState(false);
+  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, latestByType, historyByType, notes, lastError, saveNote, applyVocabulary, exportMeeting, stopSession } =
     useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage, runtimeProfile });
 
   const rolling = latestByType.rolling_summary;
   const cumulative = latestByType.cumulative_meeting_summary;
+  const chapterSnapshot = latestByType.chapter_list;
+  const actionItemSnapshot = latestByType.action_item_list;
+
+  useEffect(() => {
+    setVocabulary(window.localStorage.getItem(VOCABULARY_STORAGE_KEY) ?? "");
+  }, []);
 
   const visibleSegments = useMemo(() => segments.slice(-200), [segments]);
+  const chapters = useMemo(() => chapterSnapshot ? parseSnapshotList(chapterSnapshot.content) : [], [chapterSnapshot]);
+  const actionItems = useMemo(() => actionItemSnapshot ? parseSnapshotList(actionItemSnapshot.content) : [], [actionItemSnapshot]);
   const latestSegment = segments.at(-1);
   const latestVisualSegment = previewSegment ?? latestSegment;
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -366,6 +413,15 @@ export default function App() {
       return revision + text.length + index + 1;
     }, 0);
   }, [activeSubtitleLanguage, visibleSegments]);
+  const recentSpeechLanguages = useMemo(() => {
+    const languages = new Set<string>();
+    for (const segment of visibleSegments.slice(-24)) {
+      if (segment.original_language !== "unknown") {
+        languages.add(segment.original_language);
+      }
+    }
+    return languages;
+  }, [visibleSegments]);
   const latestSubtitleText = activeSubtitleLanguage && latestSegment
     ? latestSegment.translations[activeSubtitleLanguage]
     : null;
@@ -387,6 +443,125 @@ export default function App() {
         : latestSubtitleText && latestSubtitleText.trim()
           ? `latest subtitle ready in ${formatLanguageLabel(activeSubtitleLanguage)}`
           : `target ${formatLanguageLabel(activeSubtitleLanguage)} · translation pending`;
+
+  const systemAdvice = useMemo<SystemAdvice[]>(() => {
+    if (!sessionEnabled || state !== "running") {
+      return [{
+        severity: "ok",
+        title: "Ready to monitor",
+        detail: "Start a session to receive live stability, accuracy, and latency advice.",
+      }];
+    }
+
+    const advice: SystemAdvice[] = [];
+    const realtimeGap = transcriptLagSeconds ?? 0;
+    const rtf = asrRealtimeFactor ?? 0;
+
+    if (asrSafeguardActive || rtf >= 1.0 || backpressureAgeSeconds != null) {
+      advice.push({
+        severity: asrSafeguardActive || rtf >= 1.2 ? "danger" : "warn",
+        title: "ASR is close to falling behind",
+        detail: asrSafeguardActive
+          ? (sessionStats?.asr_safeguard_reason ?? "The backend activated realtime protection.")
+          : `Last ASR realtime factor is ${formatRtf(asrRealtimeFactor)}.`,
+        action: "Try Robust Meeting mode, use a smaller Whisper model, or temporarily turn subtitles off.",
+      });
+    } else if (realtimeGap >= 4.0 && activeRuntimeProfile !== "low_latency") {
+      advice.push({
+        severity: "warn",
+        title: "Transcript is lagging the audio",
+        detail: `Latest visible transcript is ${formatLagSeconds(realtimeGap)} behind the audio clock.`,
+        action: "Try Low Latency mode if you prefer faster live captions over larger context.",
+      });
+    }
+
+    if (weakRescueAttempts >= 2 || weakRescueBufferSeconds >= 2.0) {
+      advice.push({
+        severity: weakRescueEmitted > 0 ? "warn" : "ok",
+        title: "Quiet speech detected",
+        detail: `Weak voice rescue attempted ${weakRescueAttempts} time(s), emitted ${weakRescueEmitted}.`,
+        action: "Increase speaker volume, move closer to the microphone, or use Robust Meeting mode.",
+      });
+    }
+
+    if (mixedGainTone === "warn" || mixedGainTone === "danger") {
+      advice.push({
+        severity: mixedGainTone,
+        title: "Mixed audio balance may be uneven",
+        detail: mixedGainHint,
+        action: "Adjust microphone/system volume or keep Mixed mode auto-balance enabled.",
+      });
+    }
+
+    if (translationPendingCount >= 4 || translationTrimTotal > 0) {
+      advice.push({
+        severity: translationTrimTotal > 0 ? "warn" : "ok",
+        title: "Subtitle translation is busy",
+        detail: `Pending translations ${translationPendingCount}, trims ${translationTrimTotal}.`,
+        action: "If transcript latency matters more, turn subtitles off during the meeting.",
+      });
+    }
+
+    if (audioDropTotal > 0) {
+      advice.push({
+        severity: audioDropTotal >= 5 ? "danger" : "warn",
+        title: "Audio chunks were dropped",
+        detail: `${audioDropTotal} capture chunk(s) have been dropped.`,
+        action: "Close other audio-heavy apps or switch source mode if drops continue.",
+      });
+    }
+
+    if (
+      speechLanguage === "auto" &&
+      recentSpeechLanguages.size >= 2 &&
+      (languageLockEnabled || activeRuntimeProfile === "single_language")
+    ) {
+      advice.push({
+        severity: "warn",
+        title: "Multiple speech languages detected",
+        detail: `Recent transcript contains ${Array.from(recentSpeechLanguages).join(", ")}.`,
+        action: "Use Multilingual mode so language detection stays unlocked.",
+      });
+    }
+
+    if (advice.length === 0) {
+      advice.push({
+        severity: "ok",
+        title: "Realtime path looks healthy",
+        detail: "No stability, latency, or accuracy warnings are active.",
+        action: activeRuntimeProfile === "balanced"
+          ? "Keep Balanced mode unless you need lower latency or extra robustness."
+          : `Current mode: ${formatRuntimeProfileLabel(activeRuntimeProfile)}.`,
+      });
+    }
+
+    return advice.slice(0, 4);
+  }, [
+    activeRuntimeProfile,
+    asrRealtimeFactor,
+    asrSafeguardActive,
+    audioDropTotal,
+    backpressureAgeSeconds,
+    languageLockEnabled,
+    mixedGainHint,
+    mixedGainTone,
+    recentSpeechLanguages,
+    sessionEnabled,
+    sessionStats?.asr_safeguard_reason,
+    speechLanguage,
+    state,
+    transcriptLagSeconds,
+    translationPendingCount,
+    translationTrimTotal,
+    weakRescueAttempts,
+    weakRescueBufferSeconds,
+    weakRescueEmitted,
+  ]);
+  const systemAdviceTone = systemAdvice.some((item) => item.severity === "danger")
+    ? "danger"
+    : systemAdvice.some((item) => item.severity === "warn")
+      ? "warn"
+      : "ok";
 
   const transcriptBodyRef = useRef<HTMLDivElement>(null);
   const transcriptBottomRef = useRef<HTMLDivElement>(null);
@@ -440,12 +615,49 @@ export default function App() {
     });
   };
 
+  const handleExportMeeting = async () => {
+    setExporting(true);
+    try {
+      const result = await exportMeeting({
+        source: activeSource,
+        runtime_profile: activeRuntimeProfile,
+        summary_language: summaryLanguage,
+        subtitle_language: subtitleLanguage,
+        export_dir: exportRoot.trim() || undefined,
+      });
+      if (result) {
+        setLastExport(result);
+      }
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleChooseExportFolder = async () => {
+    const chooser = window.meetingbro?.selectExportDirectory;
+    if (!chooser) {
+      return;
+    }
+    const selected = await chooser(defaultExportFolderName());
+    if (selected) {
+      setExportRoot(selected);
+    }
+  };
+
   const handleRuntimeProfileChange = (value: string) => {
     setRuntimeProfile(value);
     if (value === "multilingual") {
       setSpeechLanguage("auto");
     }
   };
+
+  const handleSaveVocabulary = () => {
+    window.localStorage.setItem(VOCABULARY_STORAGE_KEY, vocabulary);
+    applyVocabulary(vocabulary);
+  };
+  const vocabularyHint = sessionEnabled
+    ? "Add keywords for better recognition. Save anytime, even during a meeting."
+    : "Add keywords for better recognition. Save anytime before or during a meeting.";
 
   const transcriptEmptyMessage = !sessionEnabled
     ? "session stopped — press Start to begin capture"
@@ -521,6 +733,23 @@ export default function App() {
 
       {lastError && <div className="error">{lastError}</div>}
 
+      <section className="startup-settings" aria-label="Vocabulary glossary settings">
+        <div className="startup-settings-copy">
+          <strong>Keywords</strong>
+          <p className="muted">{vocabularyHint}</p>
+        </div>
+        <div className="startup-settings-controls">
+          <textarea
+            value={vocabulary}
+            onChange={(e) => setVocabulary(e.target.value)}
+            placeholder="Anthropic, MeetingBro, Libin Mao, faster-whisper, pyannote"
+            rows={2}
+            aria-label="Glossary or vocabulary"
+          />
+          <button type="button" className="secondary-action-btn" onClick={handleSaveVocabulary}>Save Keywords</button>
+        </div>
+      </section>
+
       <main className="grid">
         <section className="panel transcript">
           <header>
@@ -553,13 +782,18 @@ export default function App() {
             {visibleSegments.map((s) => {
               const confidenceTone = getConfidenceTone(s.confidence);
               const confidenceLabel = getConfidenceLabel(s.confidence);
+              const qualityStyle = s.quality === "low"
+                ? { opacity: 0.55, fontStyle: "italic" as const }
+                : s.quality === "uncertain"
+                  ? { opacity: 0.7 }
+                  : undefined;
               const subtitleText = activeSubtitleLanguage ? s.translations[activeSubtitleLanguage] : null;
               const showSubtitlePlaceholder =
                 activeSubtitleLanguage != null &&
                 s.original_language !== activeSubtitleLanguage &&
                 !(subtitleText && subtitleText.trim());
               return (
-                <div key={s.id} className={`segment ${confidenceTone !== "stable" ? `segment-${confidenceTone}` : ""}`.trim()}>
+                <div key={s.id} className={`segment ${confidenceTone !== "stable" ? `segment-${confidenceTone}` : ""}`.trim()} style={qualityStyle}>
                   <span className="ts">
                     {formatCreatedAt(s.created_at)}
                     {confidenceLabel && <em className={`confidence-flag confidence-${confidenceTone}`}>{confidenceLabel}</em>}
@@ -634,6 +868,18 @@ export default function App() {
             <div className="range">{elapsedSeconds > 0 ? formatElapsedSeconds(elapsedSeconds) : "—"}</div>
           </header>
           <div className="panel-body diagnostics-body">
+            <div className={`diagnostic-card advice-card advice-${systemAdviceTone}`}>
+              <span className="diagnostic-label">System Advice</span>
+              <div className="advice-list">
+                {systemAdvice.map((item) => (
+                  <div key={`${item.title}-${item.detail}`} className={`advice-item advice-${item.severity}`}>
+                    <strong>{item.title}</strong>
+                    <span>{item.detail}</span>
+                    {item.action && <em>{item.action}</em>}
+                  </div>
+                ))}
+              </div>
+            </div>
             <div className="diagnostic-card">
               <span className="diagnostic-label">Active Source</span>
               <strong className="diagnostic-value">{formatSourceLabel(activeSource)}</strong>
@@ -749,11 +995,84 @@ export default function App() {
           <header>
             <div>
               <h2>Notes / Quick Actions</h2>
-              <p className="subtitle">manual notes + saved snapshots</p>
+              <p className="subtitle">manual notes + saved snapshots + export</p>
             </div>
             <div className="range">{notes.length} saved</div>
           </header>
           <div ref={notesBodyRef} className="panel-body">
+            <div className="export-box">
+              <div>
+                <strong>Export meeting files</strong>
+                <p className="muted">Creates transcript.md, summary.md, and metadata.json in the chosen folder.</p>
+                <div className="export-target-row">
+                  <input
+                    type="text"
+                    value={exportRoot}
+                    onChange={(e) => setExportRoot(e.target.value)}
+                    placeholder="Default: project exports/<timestamp> folder"
+                    aria-label="Export folder"
+                  />
+                  {window.meetingbro?.selectExportDirectory && (
+                    <button type="button" className="secondary-export-btn" onClick={handleChooseExportFolder}>
+                      Browse…
+                    </button>
+                  )}
+                </div>
+                {lastExport && (
+                  <p className="export-path">
+                    Latest export: <code>{lastExport.export_dir}</code>
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                className="primary-export-btn"
+                onClick={handleExportMeeting}
+                disabled={!meetingId || exporting}
+              >
+                {exporting ? "Exporting…" : "Export Meeting"}
+              </button>
+            </div>
+            {chapterSnapshot && (
+              <div>
+                <strong>Chapters</strong>
+                {chapters.length === 0 ? (
+                  <p className="muted">No chapters extracted.</p>
+                ) : (
+                  <ul className="notes-list">
+                    {chapters.map((chapter, index) => (
+                      <li key={`chapter-${index}`}>
+                        <div className="note-meta">
+                          <span>{formatRange(Number(chapter.time_start ?? 0), Number(chapter.time_end ?? 0))}</span>
+                          <span>{String(chapter.title ?? "Untitled chapter")}</span>
+                        </div>
+                        <div>{String(chapter.summary ?? "")}</div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+            {actionItemSnapshot && (
+              <div>
+                <strong>Action Items</strong>
+                {actionItems.length === 0 ? (
+                  <p className="muted">No action items extracted.</p>
+                ) : (
+                  <ul className="notes-list">
+                    {actionItems.map((item, index) => (
+                      <li key={`action-${index}`}>
+                        <div>{String(item.text ?? "")}</div>
+                        <div className="note-meta">
+                          <span>{item.assignee ? `assignee: ${String(item.assignee)}` : "unassigned"}</span>
+                          <span>{item.due ? `due: ${String(item.due)}` : "no due date"}</span>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
             {notes.length === 0 ? (
               <p className="muted">No saved notes yet. Use "Save to notes" on a summary panel.</p>
             ) : (
