@@ -50,6 +50,10 @@ def _recommended_asr_executor_workers() -> int:
     return 1
 
 
+def _recommended_preview_asr_executor_workers() -> int:
+    return 1
+
+
 def _recommended_summary_executor_workers() -> int:
     cores = os.cpu_count() or 4
     if cores >= 12:
@@ -147,6 +151,51 @@ def _chunk_seconds_for_profile(profile_name: str) -> float:
     return _profile_float(profile, "chunk_seconds", "MEETINGBRO_CHUNK_SECONDS", 0.5)
 
 
+def _build_preview_asr() -> FasterWhisperAdapter | None:
+    model_size = os.environ.get("MEETINGBRO_PREVIEW_WHISPER_SIZE", "").strip()
+    if not model_size or model_size.lower() == "shared":
+        return None
+    return FasterWhisperAdapter(
+        model_size=model_size,
+        device=os.environ.get(
+            "MEETINGBRO_PREVIEW_WHISPER_DEVICE",
+            os.environ.get("MEETINGBRO_WHISPER_DEVICE", "cpu"),
+        ),
+        compute_type=os.environ.get(
+            "MEETINGBRO_PREVIEW_WHISPER_COMPUTE_TYPE",
+            os.environ.get("MEETINGBRO_WHISPER_COMPUTE_TYPE", "int8"),
+        ),
+        beam_size=_env_int("MEETINGBRO_PREVIEW_WHISPER_BEAM_SIZE", 1),
+        cpu_threads=_env_int("MEETINGBRO_PREVIEW_WHISPER_CPU_THREADS", 0),
+        num_workers=_env_int("MEETINGBRO_PREVIEW_WHISPER_NUM_WORKERS", 1),
+        vad_threshold=_env_float(
+            "MEETINGBRO_PREVIEW_WHISPER_VAD_THRESHOLD",
+            _env_float("MEETINGBRO_WHISPER_VAD_THRESHOLD", 0.3),
+        ),
+        vad_min_speech_ms=_env_int(
+            "MEETINGBRO_PREVIEW_WHISPER_VAD_MIN_SPEECH_MS",
+            _env_int("MEETINGBRO_WHISPER_VAD_MIN_SPEECH_MS", 100),
+        ),
+        vad_min_silence_ms=_env_int(
+            "MEETINGBRO_PREVIEW_WHISPER_VAD_MIN_SILENCE_MS",
+            _env_int("MEETINGBRO_WHISPER_VAD_MIN_SILENCE_MS", 300),
+        ),
+        vad_speech_pad_ms=_env_int(
+            "MEETINGBRO_PREVIEW_WHISPER_VAD_SPEECH_PAD_MS",
+            _env_int("MEETINGBRO_WHISPER_VAD_SPEECH_PAD_MS", 400),
+        ),
+        multilingual=_env_bool("MEETINGBRO_PREVIEW_WHISPER_MULTILINGUAL", True),
+        language_detection_threshold=_env_float(
+            "MEETINGBRO_PREVIEW_WHISPER_LANGUAGE_DETECTION_THRESHOLD",
+            0.5,
+        ),
+        language_detection_segments=_env_int(
+            "MEETINGBRO_PREVIEW_WHISPER_LANGUAGE_DETECTION_SEGMENTS",
+            1,
+        ),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_dotenv_if_present()
@@ -166,10 +215,12 @@ async def lifespan(app: FastAPI):
         language_detection_threshold=_env_float("MEETINGBRO_WHISPER_LANGUAGE_DETECTION_THRESHOLD", 0.5),
         language_detection_segments=_env_int("MEETINGBRO_WHISPER_LANGUAGE_DETECTION_SEGMENTS", 1),
     )
+    preview_asr = _build_preview_asr()
     app.state.storage = storage
     app.state.asr = asr
+    app.state.preview_asr = preview_asr
     logger.info(
-        "MeetingBro backend starting db=%s whisper_size=%s whisper_device=%s compute=%s beam=%d cpu_threads=%d whisper_workers=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f audio_conditioning=%s denoise=%s pre_vad=%s pre_vad_conditioning=%s pre_vad_threshold=%.2f pre_vad_energy_rms=%.4f pre_vad_max=%.1fs weak_rescue=%s weak_rescue_rms=%.4f..%.4f language_lock=%s asr_retry=%s asr_safeguard=%s safeguard_rtf=%.2f suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d translation_backfill=%d translation_max_pending=%d",
+        "MeetingBro backend starting db=%s whisper_size=%s whisper_device=%s compute=%s beam=%d cpu_threads=%d whisper_workers=%d preview_backend=%s preview_device=%s preview_compute=%s preview_asr_workers=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f audio_conditioning=%s denoise=%s pre_vad=%s pre_vad_conditioning=%s pre_vad_threshold=%.2f pre_vad_energy_rms=%.4f pre_vad_max=%.1fs weak_rescue=%s weak_rescue_rms=%.4f..%.4f language_lock=%s asr_retry=%s asr_safeguard=%s safeguard_rtf=%.2f suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d translation_backfill=%d translation_max_pending=%d",
         storage._db_path,
         os.environ.get("MEETINGBRO_WHISPER_SIZE", "medium"),
         os.environ.get("MEETINGBRO_WHISPER_DEVICE", "cpu"),
@@ -177,6 +228,19 @@ async def lifespan(app: FastAPI):
         _env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 3),
         _env_int("MEETINGBRO_WHISPER_CPU_THREADS", 0),
         _env_int("MEETINGBRO_WHISPER_NUM_WORKERS", 1),
+        os.environ.get("MEETINGBRO_PREVIEW_WHISPER_SIZE", "shared") or "shared",
+        os.environ.get(
+            "MEETINGBRO_PREVIEW_WHISPER_DEVICE",
+            os.environ.get("MEETINGBRO_WHISPER_DEVICE", "cpu"),
+        ),
+        os.environ.get(
+            "MEETINGBRO_PREVIEW_WHISPER_COMPUTE_TYPE",
+            os.environ.get("MEETINGBRO_WHISPER_COMPUTE_TYPE", "int8"),
+        ),
+        _env_int(
+            "MEETINGBRO_PREVIEW_ASR_EXECUTOR_WORKERS",
+            _recommended_preview_asr_executor_workers(),
+        ),
         _env_float("MEETINGBRO_CHUNK_SECONDS", 0.5),
         _env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 1.5),
         _env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.002),
@@ -374,6 +438,7 @@ async def session_ws(
         audio_chunk_seconds=chunk_seconds,
         runtime_profile=profile_name,
         asr=app.state.asr,
+        preview_asr=app.state.preview_asr,
         summarizer=LLMSummarizer(),
         translator=LLMTranslator(),
         storage=app.state.storage,
@@ -447,6 +512,10 @@ async def session_ws(
         asr_executor_workers=_env_int(
             "MEETINGBRO_ASR_EXECUTOR_WORKERS",
             _recommended_asr_executor_workers(),
+        ),
+        preview_asr_executor_workers=_env_int(
+            "MEETINGBRO_PREVIEW_ASR_EXECUTOR_WORKERS",
+            _recommended_preview_asr_executor_workers(),
         ),
         summary_executor_workers=_env_int(
             "MEETINGBRO_SUMMARY_EXECUTOR_WORKERS",

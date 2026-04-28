@@ -45,6 +45,7 @@ class SessionConfig:
     summarizer: Summarizer
     translator: Translator
     storage: Storage
+    preview_asr: Optional[ASRAdapter] = None
     audio_source_name: str = "mic"
     audio_chunk_seconds: float = 0.5
     runtime_profile: str = "balanced"
@@ -134,6 +135,7 @@ class SessionConfig:
     # Executor sizing is not a user-facing tuning surface. Defaults are chosen
     # automatically in main.py and may be overridden only via hidden env vars.
     asr_executor_workers: int = 1
+    preview_asr_executor_workers: int = 1
     summary_executor_workers: int = 1
     translation_executor_workers: int = 1
     filler_filter_enabled: bool = True
@@ -250,6 +252,14 @@ class SessionManager:
             max_workers=max(1, self._cfg.asr_executor_workers),
             thread_name_prefix="meetingbro-asr",
         )
+        self._preview_asr_executor = (
+            ThreadPoolExecutor(
+                max_workers=max(1, self._cfg.preview_asr_executor_workers),
+                thread_name_prefix="meetingbro-preview-asr",
+            )
+            if self._cfg.preview_asr is not None
+            else None
+        )
         self._summary_executor = ThreadPoolExecutor(
             max_workers=max(1, self._cfg.summary_executor_workers),
             thread_name_prefix="meetingbro-summary",
@@ -258,6 +268,7 @@ class SessionManager:
             max_workers=max(1, self._cfg.translation_executor_workers),
             thread_name_prefix="meetingbro-translation",
         )
+        self._preview_asr_disabled = False
 
     @property
     def meeting_id(self) -> str:
@@ -562,8 +573,26 @@ class SessionManager:
 
     def _shutdown_executors(self) -> None:
         self._asr_executor.shutdown(wait=False, cancel_futures=True)
+        if self._preview_asr_executor is not None:
+            self._preview_asr_executor.shutdown(wait=False, cancel_futures=True)
         self._summary_executor.shutdown(wait=False, cancel_futures=True)
         self._translation_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _has_dedicated_preview_asr(self) -> bool:
+        return (
+            self._cfg.preview_asr is not None
+            and self._preview_asr_executor is not None
+            and not self._preview_asr_disabled
+        )
+
+    def _disable_dedicated_preview_asr(self, exc: Exception) -> None:
+        if self._preview_asr_disabled:
+            return
+        self._preview_asr_disabled = True
+        logger.warning(
+            "dedicated preview ASR unavailable, falling back to shared preview path: %s",
+            exc,
+        )
 
     def _reset_watchdog_tracking(self) -> None:
         self._state.first_chunk_wall_time = None
@@ -1377,14 +1406,31 @@ class SessionManager:
                             continue
                         if self._state.pending_segments or self._state.preview_candidate_segment is not None:
                             continue
-                        if self._state.fast_preview_inflight or self._state.asr_inflight_start_wall_time is not None:
+                        if self._state.fast_preview_inflight:
+                            self._state.fast_preview_skipped += 1
+                            continue
+                        if not self._has_dedicated_preview_asr() and self._state.asr_inflight_start_wall_time is not None:
                             self._state.fast_preview_skipped += 1
                             continue
                         if self._state.audio_input_backlog_seconds > self._cfg.fast_preview_max_backlog_seconds:
                             self._state.fast_preview_skipped += 1
                             continue
-                        rtf = self._state.asr_realtime_factor
-                        if rtf is not None and rtf > self._cfg.fast_preview_max_asr_realtime_factor:
+                        if self._asr_safeguard_active():
+                            self._state.fast_preview_skipped += 1
+                            continue
+                        formal_rtf = self._state.asr_realtime_factor
+                        if (
+                            formal_rtf is not None
+                            and formal_rtf > self._cfg.fast_preview_max_asr_realtime_factor
+                        ):
+                            self._state.fast_preview_skipped += 1
+                            continue
+                        preview_rtf = self._state.fast_preview_realtime_factor
+                        if (
+                            self._has_dedicated_preview_asr()
+                            and preview_rtf is not None
+                            and preview_rtf > self._cfg.fast_preview_max_asr_realtime_factor
+                        ):
                             self._state.fast_preview_skipped += 1
                             continue
 
@@ -2022,16 +2068,12 @@ class SessionManager:
         self._state.fast_preview_inflight = True
         start = time.perf_counter()
         try:
-            segments = await loop.run_in_executor(
-                self._asr_executor,
-                lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
-                    m,
-                    sr,
-                    forced_language=fl,
-                    offset_seconds=0.0,
-                    initial_prompt=p,
-                    quality_preset="realtime",
-                ),
+            segments = await self._run_fast_preview_transcribe(
+                loop,
+                samples,
+                sample_rate,
+                prompt=prompt,
+                forced_language=forced_language,
             )
         finally:
             wall = time.perf_counter() - start
@@ -2091,6 +2133,48 @@ class SessionManager:
         )
         self._state.fast_preview_emitted += 1
         return seg
+
+    async def _run_fast_preview_transcribe(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        samples: np.ndarray,
+        sample_rate: int,
+        *,
+        prompt: Optional[str],
+        forced_language: Optional[str],
+    ) -> list[ASRSegment]:
+        executor = self._asr_executor
+        adapter = self._cfg.asr
+        if self._has_dedicated_preview_asr():
+            executor = self._preview_asr_executor or self._asr_executor
+            adapter = self._cfg.preview_asr or self._cfg.asr
+        try:
+            return await loop.run_in_executor(
+                executor,
+                lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language, asr=adapter: asr.transcribe(
+                    m,
+                    sr,
+                    forced_language=fl,
+                    offset_seconds=0.0,
+                    initial_prompt=p,
+                    quality_preset="realtime",
+                ),
+            )
+        except Exception as exc:
+            if adapter is self._cfg.preview_asr and self._cfg.preview_asr is not None:
+                self._disable_dedicated_preview_asr(exc)
+                return await loop.run_in_executor(
+                    self._asr_executor,
+                    lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
+                        m,
+                        sr,
+                        forced_language=fl,
+                        offset_seconds=0.0,
+                        initial_prompt=p,
+                        quality_preset="realtime",
+                    ),
+                )
+            raise
 
     def _classify_asr_segment(self, seg) -> str:
         text = seg.text.strip()

@@ -238,6 +238,13 @@ MEETINGBRO_ASR_SAFEGUARD_COOLDOWN_WINDOWS=5
 # Mixed-language meetings: keep false unless one dominant language should be forced
 MEETINGBRO_LANGUAGE_LOCK_ENABLED=false
 
+# Fast preview subtitles: keep preview ASR separate from formal ASR
+# Recommended on CPU when the formal model is small/medium and realtime matters.
+MEETINGBRO_PREVIEW_WHISPER_SIZE=tiny
+MEETINGBRO_PREVIEW_WHISPER_MULTILINGUAL=true
+MEETINGBRO_PREVIEW_WHISPER_BEAM_SIZE=1
+MEETINGBRO_PREVIEW_ASR_EXECUTOR_WORKERS=1
+
 # Live subtitle translation: keep newest segments responsive
 MEETINGBRO_TRANSLATION_EXECUTOR_WORKERS=2
 MEETINGBRO_LIVE_TRANSLATION_BACKFILL_LIMIT=20
@@ -271,6 +278,24 @@ Important columns:
 - `safe`: ASR safeguard trigger count.
 - `rescue`: weak-voice rescue emitted/attempted count.
 - `kw`: matched/expected keyword count when `--keywords` is provided.
+
+### Preview backend benchmark
+
+Use the preview backend benchmark when changing subtitle latency settings. It
+runs the real `WavFileSource(realtime=True) -> SessionManager` path and compares
+formal-only, shared-preview, and dedicated-preview modes.
+
+```powershell
+python scripts\benchmark_preview_backends.py --scenario all --formal-model-size small --repeat 3 --discard-first --warmup data\sample_en.wav
+python scripts\benchmark_preview_backends.py --scenario all --formal-model-size medium --repeat 3 --discard-first --warmup data\sample_en.wav
+```
+
+Prefer the aggregate median rows. On the current local CPU benchmark,
+`dedicated-tiny` was the best default candidate for `medium`: much lower first
+preview latency than shared preview and fewer queue drops, while formal output
+remains produced by the main ASR lane. Revalidate with German, English, Chinese,
+and mixed-language local audio before treating this as a universal product
+default.
 
 You may also put the same settings in a project-root `.env` file. Both dotenv
 syntax and PowerShell-style syntax are accepted:
