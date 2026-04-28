@@ -103,6 +103,13 @@ class SessionConfig:
     live_translation_backfill_limit: int = 20
     live_translation_max_pending: int = 12
     live_translation_safeguard_max_pending: int = 4
+    watchdog_enabled: bool = True
+    watchdog_tick_seconds: float = 2.0
+    watchdog_no_chunk_warning_seconds: float = 5.0
+    watchdog_no_chunk_error_seconds: float = 15.0
+    watchdog_all_silent_seconds: float = 45.0
+    watchdog_drop_burst_count: int = 50
+    watchdog_drop_burst_window_seconds: float = 30.0
     # Executor sizing is not a user-facing tuning surface. Defaults are chosen
     # automatically in main.py and may be overridden only via hidden env vars.
     asr_executor_workers: int = 1
@@ -156,6 +163,11 @@ class _State:
     weak_rescue_emitted: int = 0
     weak_rescue_buffer_seconds: float = 0.0
     translation_backlog_trim_total: int = 0
+    first_chunk_wall_time: Optional[float] = None
+    last_chunk_wall_time: Optional[float] = None
+    last_voiced_chunk_wall_time: Optional[float] = None
+    watchdog_active_episodes: set[str] = field(default_factory=set)
+    watchdog_drop_history: list[tuple[float, int]] = field(default_factory=list)
 
 
 class SessionManager:
@@ -173,6 +185,7 @@ class SessionManager:
         self._state = _State(meeting_id=str(uuid.uuid4()))
         self._stopped = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
+        self._watchdog_task: Optional[asyncio.Task[None]] = None
         self._summary_tasks: set[asyncio.Task[None]] = set()
         self._translation_tasks: set[asyncio.Task[None]] = set()
         self._translation_task_order: list[asyncio.Task[None]] = []
@@ -280,6 +293,7 @@ class SessionManager:
         self._cfg.audio_source = audio_source
         self._cfg.audio_source_name = source_name
         self._audio_source_generation += 1
+        self._reset_watchdog_tracking()
         self._state.pending_segments.clear()
         self._state.last_emitted_text = ""
         self._state.repetition_streak = 0
@@ -347,6 +361,7 @@ class SessionManager:
             self._session_state_payload(state="running"),
         )
         self._task = asyncio.create_task(self._run())
+        self._watchdog_task = asyncio.create_task(self._audio_watchdog())
 
     async def stop(self) -> None:
         self._stopped.set()
@@ -354,6 +369,12 @@ class SessionManager:
         # so it returns almost instantly.  We don't await here so that if it ever blocks
         # the task timeout below still fires at 15 s.
         asyncio.create_task(self._aclose_source())
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await asyncio.wait_for(self._watchdog_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
         if self._task is not None:
             try:
                 await asyncio.wait_for(self._task, timeout=15.0)
@@ -391,6 +412,162 @@ class SessionManager:
         self._asr_executor.shutdown(wait=False, cancel_futures=True)
         self._summary_executor.shutdown(wait=False, cancel_futures=True)
         self._translation_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _reset_watchdog_tracking(self) -> None:
+        self._state.first_chunk_wall_time = None
+        self._state.last_chunk_wall_time = None
+        self._state.last_voiced_chunk_wall_time = None
+        self._state.watchdog_active_episodes.clear()
+        self._state.watchdog_drop_history.clear()
+
+    async def _emit_watchdog_event(
+        self,
+        *,
+        code: str,
+        message: str,
+        status: str,
+        recovered_code: Optional[str] = None,
+    ) -> None:
+        payload = {
+            "code": code,
+            "message": message,
+            "status": status,
+        }
+        if recovered_code is not None:
+            payload["recovered_code"] = recovered_code
+        await self._emit("error", payload)
+
+    async def _arm_watchdog_episode(self, *, code: str, message: str, status: str) -> None:
+        if code in self._state.watchdog_active_episodes:
+            return
+        self._state.watchdog_active_episodes.add(code)
+        await self._emit_watchdog_event(code=code, message=message, status=status)
+
+    async def _recover_watchdog_episode(self, code: str, message: str) -> None:
+        if code not in self._state.watchdog_active_episodes:
+            return
+        self._state.watchdog_active_episodes.remove(code)
+        await self._emit_watchdog_event(
+            code="audio_recovered",
+            message=message,
+            status="info",
+            recovered_code=code,
+        )
+
+    def _clear_watchdog_episode(self, code: str) -> None:
+        self._state.watchdog_active_episodes.discard(code)
+
+    def _record_audio_drops(self, now: float, drops: int) -> int:
+        if drops > 0:
+            prev_bucket = self._audio_drop_total // 10
+            self._audio_drop_total += drops
+            self._state.watchdog_drop_history.append((now, drops))
+            return prev_bucket
+
+        cutoff = now - self._cfg.watchdog_drop_burst_window_seconds
+        self._state.watchdog_drop_history = [
+            item for item in self._state.watchdog_drop_history if item[0] >= cutoff
+        ]
+        return self._audio_drop_total // 10
+
+    async def _check_audio_health(self) -> None:
+        now = time.monotonic()
+        source = self._cfg.audio_source
+        drops = source.drain_drops()
+        prev_bucket = self._record_audio_drops(now, drops)
+        if drops > 0 and self._audio_drop_total // 10 > prev_bucket:
+            await self._emit(
+                "error",
+                ErrorPayload(
+                    code="audio_drop",
+                    message=f"audio queue has dropped {self._audio_drop_total} chunks total (source too fast for ASR)",
+                ),
+            )
+
+        drop_total = sum(count for _, count in self._state.watchdog_drop_history)
+        if drop_total > self._cfg.watchdog_drop_burst_count:
+            await self._arm_watchdog_episode(
+                code="audio_drops_sustained",
+                status="error",
+                message=(
+                    "audio queue dropped "
+                    f"{drop_total} chunks in the last {self._cfg.watchdog_drop_burst_window_seconds:.0f}s"
+                ),
+            )
+        else:
+            await self._recover_watchdog_episode(
+                "audio_drops_sustained",
+                "audio drop rate returned to normal",
+            )
+
+        last_chunk = self._state.last_chunk_wall_time
+        if last_chunk is not None:
+            no_chunk_seconds = now - last_chunk
+            if no_chunk_seconds >= self._cfg.watchdog_no_chunk_error_seconds:
+                self._clear_watchdog_episode("audio_source_slow")
+                await self._arm_watchdog_episode(
+                    code="audio_source_silent",
+                    status="error",
+                    message=(
+                        "audio source has not produced a chunk for "
+                        f"{no_chunk_seconds:.1f}s"
+                    ),
+                )
+            elif no_chunk_seconds >= self._cfg.watchdog_no_chunk_warning_seconds:
+                await self._recover_watchdog_episode(
+                    "audio_source_silent",
+                    "audio source resumed chunk delivery",
+                )
+                await self._arm_watchdog_episode(
+                    code="audio_source_slow",
+                    status="warning",
+                    message=(
+                        "audio source has not produced a chunk for "
+                        f"{no_chunk_seconds:.1f}s"
+                    ),
+                )
+            else:
+                await self._recover_watchdog_episode(
+                    "audio_source_silent",
+                    "audio source resumed chunk delivery",
+                )
+                await self._recover_watchdog_episode(
+                    "audio_source_slow",
+                    "audio source resumed chunk delivery",
+                )
+
+        voiced_anchor = self._state.last_voiced_chunk_wall_time or self._state.first_chunk_wall_time
+        if voiced_anchor is not None:
+            all_silent_seconds = now - voiced_anchor
+            if all_silent_seconds >= self._cfg.watchdog_all_silent_seconds:
+                await self._arm_watchdog_episode(
+                    code="audio_all_silent",
+                    status="warning",
+                    message=(
+                        "audio source has produced only silent chunks for "
+                        f"{all_silent_seconds:.1f}s"
+                    ),
+                )
+            else:
+                await self._recover_watchdog_episode(
+                    "audio_all_silent",
+                    "audio levels recovered above silence threshold",
+                )
+
+    async def _audio_watchdog(self) -> None:
+        if not self._cfg.watchdog_enabled:
+            return
+        tick = self._cfg.watchdog_tick_seconds
+        try:
+            while not self._stopped.is_set():
+                try:
+                    await asyncio.wait_for(self._stopped.wait(), timeout=tick)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                await self._check_audio_health()
+        except asyncio.CancelledError:
+            raise
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -706,39 +883,42 @@ class SessionManager:
                 self._schedule_summary(self._maybe_emit_cumulative())
 
             try:
-                async for raw_chunk in source.stream():
-                    if self._stopped.is_set():
-                        break
-                    if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
-                        source_switched = True
-                        break
+                try:
+                    async for raw_chunk in source.stream():
+                        if self._stopped.is_set():
+                            break
+                        if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
+                            source_switched = True
+                            break
 
-                    energy_chunk = noise_reducer.process(raw_chunk)
-                    prepared_chunk = pre_vad_conditioner.process(energy_chunk)
-                    vad_chunks = pre_vad.push(prepared_chunk)
-                    if vad_chunks:
-                        clear_weak_rescue_buffer()
-                    else:
-                        await maybe_rescue_weak_speech(
-                            energy_chunk=energy_chunk,
-                            prepared_chunk=prepared_chunk,
-                        )
-                    for chunk in vad_chunks:
-                        await consume_asr_chunk(chunk)
+                        now = time.monotonic()
+                        if self._state.first_chunk_wall_time is None:
+                            self._state.first_chunk_wall_time = now
+                        self._state.last_chunk_wall_time = now
+                        chunk_rms = float(np.sqrt(np.mean(raw_chunk.samples ** 2)))
+                        if chunk_rms >= self._cfg.silence_rms_threshold:
+                            self._state.last_voiced_chunk_wall_time = now
 
-                    # Drain audio drop counter and emit error every 10 cumulative drops.
-                    drops = source.drain_drops()
-                    if drops > 0:
-                        prev_bucket = self._audio_drop_total // 10
-                        self._audio_drop_total += drops
-                        if self._audio_drop_total // 10 > prev_bucket:
-                            await self._emit(
-                                "error",
-                                ErrorPayload(
-                                    code="audio_drop",
-                                    message=f"audio queue has dropped {self._audio_drop_total} chunks total (source too fast for ASR)",
-                                ),
+                        energy_chunk = noise_reducer.process(raw_chunk)
+                        prepared_chunk = pre_vad_conditioner.process(energy_chunk)
+                        vad_chunks = pre_vad.push(prepared_chunk)
+                        if vad_chunks:
+                            clear_weak_rescue_buffer()
+                        else:
+                            await maybe_rescue_weak_speech(
+                                energy_chunk=energy_chunk,
+                                prepared_chunk=prepared_chunk,
                             )
+                        for chunk in vad_chunks:
+                            await consume_asr_chunk(chunk)
+                except Exception as exc:
+                    if not self._stopped.is_set():
+                        logger.exception("audio source stream crashed")
+                        await self._emit_watchdog_event(
+                            code="audio_source_crashed",
+                            message=f"audio source raised: {exc}",
+                            status="error",
+                        )
 
                 if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
                     source_switched = True
