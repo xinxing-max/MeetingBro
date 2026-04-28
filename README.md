@@ -64,15 +64,15 @@ The session UI is built around **two live summary views** that run side by side 
 - always shows the covered time range (for example, `10:32 – 10:36`)
 - lets the user catch up on what was just said without scrolling the transcript
 
-### 2. Current Meeting Summary
-- compact **cumulative** summary of the meeting from its start to now
+### 2. Meeting Board
+- compact **cumulative** meeting-state view from the start of the meeting to now
 - refreshes periodically as the session progresses
-- surfaces emerging topics, decisions, and open questions
-- lets the user see the overall state of the discussion at a glance
+- surfaces the current state through **topics, decisions, action items, and open questions**
+- stays more stable than the rolling recap so users can orient themselves at a glance
 
 ### Why two layers matter
 - **Rolling** answers "what did I just miss?"
-- **Cumulative** answers "where is this meeting overall?"
+- **Meeting Board** answers "where is this meeting overall?"
 - Together they give users both short-term recovery and long-term orientation, without forcing them to read the full transcript.
 
 Both summary panels support:

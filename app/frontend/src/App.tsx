@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { SummarySnapshot } from "./types";
 import { useSessionSocket } from "./session/useSessionSocket";
 
@@ -248,7 +248,6 @@ export default function App() {
   const visibleSegments = useMemo(() => segments.slice(-200), [segments]);
   const latestSegment = segments.at(-1);
   const latestVisualSegment = previewSegment ?? latestSegment;
-  const latestVisibleSegment = visibleSegments.at(-1);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
@@ -333,6 +332,18 @@ export default function App() {
   const activeSubtitleLanguage: "zh" | "en" | "de" | null = subtitleLanguage === "off"
     ? null
     : ((sessionStats?.live_translation_language ?? subtitleLanguage) as "zh" | "en" | "de");
+  const visibleSubtitleRevision = useMemo(() => {
+    if (activeSubtitleLanguage == null) {
+      return 0;
+    }
+    return visibleSegments.reduce((revision, segment, index) => {
+      const text = segment.translations[activeSubtitleLanguage]?.trim();
+      if (!text) {
+        return revision;
+      }
+      return revision + text.length + index + 1;
+    }, 0);
+  }, [activeSubtitleLanguage, visibleSegments]);
   const latestSubtitleText = activeSubtitleLanguage && latestSegment
     ? latestSegment.translations[activeSubtitleLanguage]
     : null;
@@ -378,18 +389,18 @@ export default function App() {
     });
   };
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (transcriptAutoFollowRef.current) {
       scrollTranscriptToBottom("auto");
     }
   }, [
     visibleSegments.length,
+    visibleSubtitleRevision,
     previewSegment?.id,
     previewSegment?.text,
     latestSegment?.id,
     latestSubtitleText,
     activeSubtitleLanguage,
-    latestVisibleSegment?.translations[activeSubtitleLanguage ?? "en"],
   ]);
 
   const notesBodyRef = useRef<HTMLDivElement>(null);
@@ -558,7 +569,7 @@ export default function App() {
 
         <SummaryPanel
           title="Latest Rolling Summary"
-          subtitle="most recent 3–5 minutes"
+          subtitle="quick catch-up from the most recent 3–5 minutes"
           snapshot={rolling}
           history={historyByType.rolling_summary ?? []}
           sessionStartedAt={sessionStartedAt}
@@ -568,8 +579,8 @@ export default function App() {
         />
 
         <SummaryPanel
-          title="Current Meeting Summary"
-          subtitle="cumulative so far"
+          title="Meeting Board"
+          subtitle="stable meeting state: decisions, actions, open questions"
           snapshot={cumulative}
           history={historyByType.cumulative_meeting_summary ?? []}
           sessionStartedAt={sessionStartedAt}

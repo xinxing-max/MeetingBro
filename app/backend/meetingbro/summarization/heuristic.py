@@ -76,6 +76,12 @@ def _keywords(text: str, language: LanguageCode, k: int = 6) -> list[str]:
     return [w for w, _ in counts.most_common(k)]
 
 
+def _bullet_lines(items: list[str], *, fallback: str = "None yet") -> list[str]:
+    if not items:
+        return [f"- {fallback}"]
+    return [f"- {item}" for item in items if item]
+
+
 class HeuristicSummarizer(Summarizer):
     """Transcript-driven extractive summarizer.
 
@@ -146,12 +152,30 @@ class HeuristicSummarizer(Summarizer):
                 "## Open Questions",
                 "## Important Facts",
             ]
+        elif kind == "cumulative_meeting_summary":
+            state_lines = _bullet_lines([body] if body else [])
+            decision_lines = _bullet_lines([])
+            action_lines = _bullet_lines([f"Key terms: {keyword_line}"] if keyword_line else [])
+            open_question_lines = _bullet_lines([])
+            parts = [
+                "## Meeting State",
+                *state_lines,
+                "",
+                "## Decisions",
+                *decision_lines,
+                "",
+                "## Action Items",
+                *action_lines,
+                "",
+                "## Open Questions",
+                *open_question_lines,
+            ]
         else:
             parts = [f"{label}: {body}" if body else label]
         if keyword_line:
             if kind == "meeting_memory":
                 parts.append(f"- Key terms: {keyword_line}")
-            else:
+            elif kind not in {"cumulative_meeting_summary"}:
                 parts.append(f"Key terms: {keyword_line}")
         if kind in {"cumulative_meeting_summary", "final_summary"} and previous_summary:
             parts.append(f"(Compressed meeting memory: {previous_summary[:240]})")

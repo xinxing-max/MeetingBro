@@ -30,13 +30,15 @@ _PROMPTS = {
         "Cover what was just discussed; do not invent content."
     ),
     "cumulative_meeting_summary": (
-        "You are maintaining a live cumulative summary of an ongoing meeting. "
+        "You are maintaining a live meeting board for an ongoing meeting. "
         "The transcript may mix Chinese, English, and German; account for content in all "
         "languages and summarize in {language}. "
         "Use the compressed meeting memory as the durable context and the recent "
-        "transcript as fresh evidence. Write a compact update in {language} covering "
-        "topics, decisions, action items, and open questions so far. 3-6 sentences. "
-        "Do not invent content."
+        "transcript as fresh evidence. Output Markdown with these exact headings: "
+        "## Meeting State, ## Decisions, ## Action Items, ## Open Questions. "
+        "Under each heading, use short bullet points in {language}. Keep it compact, "
+        "stable, and cumulative from the start of the meeting to now. If a section has "
+        "no evidence yet, write '- None yet'. Do not invent content."
     ),
     "final_summary": (
         "You are writing the final recap of a meeting. Use the compressed meeting "

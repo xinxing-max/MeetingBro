@@ -19,6 +19,7 @@ data/*.db-*
 data/meetingbro.db
 data/meetingbro.db-*
 data/voice_test_*.wav
+data/benchmark_profile_*.json
 
 # Exports and local scratch output
 exports/*

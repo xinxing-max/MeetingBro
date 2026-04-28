@@ -160,6 +160,9 @@ class PreVadSegmenter:
         flushed = self._flush_pending()
         return [flushed] if flushed is not None else []
 
+    def set_trailing_silence_seconds(self, value: float) -> None:
+        self._trailing_silence_seconds = max(0.0, float(value))
+
     def _pending_duration_seconds(self) -> float:
         if not self._pending_samples:
             return 0.0

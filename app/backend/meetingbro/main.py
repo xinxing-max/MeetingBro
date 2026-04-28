@@ -121,8 +121,8 @@ async def lifespan(app: FastAPI):
         _env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 3),
         _env_int("MEETINGBRO_WHISPER_CPU_THREADS", 0),
         _env_int("MEETINGBRO_WHISPER_NUM_WORKERS", 1),
-        _env_float("MEETINGBRO_CHUNK_SECONDS", 2.5),
-        _env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 2.5),
+        _env_float("MEETINGBRO_CHUNK_SECONDS", 0.5),
+        _env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 1.5),
         _env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.002),
         _env_bool("MEETINGBRO_AUDIO_CONDITIONING_ENABLED", True),
         _env_bool("MEETINGBRO_DENOISE_ENABLED", False),
@@ -218,7 +218,7 @@ def _build_audio_source(source: str) -> AudioSource:
     - "mixed": microphone + system loopback mixed together.
     - "file:<path>": replay a WAV file for the E2E vertical-slice test.
     """
-    chunk_seconds = _env_float("MEETINGBRO_CHUNK_SECONDS", 2.5)
+    chunk_seconds = _env_float("MEETINGBRO_CHUNK_SECONDS", 0.5)
     if not source or source == "mic":
         return MicrophoneSource(sample_rate=16_000, chunk_seconds=chunk_seconds)
     if source in ("loopback", "system"):
@@ -287,7 +287,7 @@ async def session_ws(
         forced_language=forced_language,
         summary_language=summary_lang,
         live_translation_language=None,
-        asr_accumulation_seconds=_env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 2.5),
+        asr_accumulation_seconds=_env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 1.5),
         silence_rms_threshold=_env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.002),
         asr_overlap_seconds=_env_float("MEETINGBRO_ASR_OVERLAP_SECONDS", 0.0),
         vocabulary_hint=os.environ.get("MEETINGBRO_VOCABULARY_HINT") or None,

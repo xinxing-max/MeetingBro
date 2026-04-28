@@ -58,6 +58,10 @@ class SessionConfig:
     min_segments_for_memory: int = 3
     min_segments_for_cumulative: int = 3
     asr_accumulation_seconds: float = 2.5  # prefer fuller sentence context over low latency
+    asr_early_flush_enabled: bool = True
+    asr_early_flush_min_seconds: float = 0.8
+    silence_commit_min_confidence: float = 0.75
+    silence_commit_min_duration_seconds: float = 0.6
     silence_rms_threshold: float = 0.002  # chunks below this RMS are skipped (~-54 dBFS); low enough to pass quiet loopback / soft speech
     # Overlap tail prepended to next ASR window. DEFAULT 0.0 (disabled) — Whisper's
     # internal VAD padding (~400 ms speech_pad_ms) handles boundary words on its own,
@@ -93,12 +97,18 @@ class SessionConfig:
     pre_vad_threshold: float = 0.38
     pre_vad_energy_rms_threshold: float = 0.005
     pre_vad_trailing_silence_seconds: float = 0.45
+    pre_vad_adaptive_trailing_silence_enabled: bool = True
+    pre_vad_adaptive_fast_trailing_silence_seconds: float = 0.30
+    pre_vad_adaptive_max_realtime_factor: float = 0.5
     pre_vad_max_segment_seconds: float = 8.0
     weak_speech_rescue_enabled: bool = True
     weak_speech_rescue_rms_min: float = 0.0008
     weak_speech_rescue_rms_max: float = 0.02
+    weak_speech_rescue_fast_rms_max: float = 0.01
+    weak_speech_rescue_fast_window_seconds: float = 2.5
     weak_speech_rescue_window_seconds: float = 6.0
     weak_speech_rescue_cooldown_seconds: float = 8.0
+    # Default off: mixed-language meetings should not be forced into one language.
     language_lock_enabled: bool = False
     live_translation_backfill_limit: int = 20
     live_translation_max_pending: int = 12
@@ -163,21 +173,26 @@ class _State:
     weak_rescue_emitted: int = 0
     weak_rescue_buffer_seconds: float = 0.0
     translation_backlog_trim_total: int = 0
+    last_emitted_end_time: Optional[float] = None
     first_chunk_wall_time: Optional[float] = None
     last_chunk_wall_time: Optional[float] = None
     last_voiced_chunk_wall_time: Optional[float] = None
     watchdog_active_episodes: set[str] = field(default_factory=set)
     watchdog_drop_history: list[tuple[float, int]] = field(default_factory=list)
+    preview_candidate_segment: Optional[TranscriptSegment] = None
+    preview_candidate_confirmations: int = 0
 
 
 class SessionManager:
     """Orchestrates one live meeting session.
 
-    Pipeline per audio chunk:
-      audio_source -> ASR -> TranscriptSegment persisted & emitted ->
-      (on cadence) rolling_summary built from last N seconds of segments ->
-      (on cadence) cumulative_meeting_summary built from all segments so far.
-    """
+        Pipeline per audio chunk:
+            audio_source -> ASR -> TranscriptSegment persisted & emitted ->
+            (on cadence) rolling_summary built from last N seconds of segments ->
+            (on cadence) cumulative_meeting_summary built from all segments so far.
+        """
+
+    _PREVIEW_CONFIRMATION_WINDOWS = 2
 
     def __init__(self, config: SessionConfig) -> None:
         self._cfg = config
@@ -190,6 +205,8 @@ class SessionManager:
         self._translation_tasks: set[asyncio.Task[None]] = set()
         self._translation_task_order: list[asyncio.Task[None]] = []
         self._translation_in_flight: set[tuple[str, str]] = set()
+        self._translation_requested_segment_ids: dict[str, str] = {}
+        self._translation_workers_by_language: dict[str, asyncio.Task[None]] = {}
         self._pending_speaker_updates: list[Speaker] = []
         self._queue_drop_count: int = 0
         self._audio_drop_total: int = 0
@@ -294,6 +311,7 @@ class SessionManager:
         self._cfg.audio_source_name = source_name
         self._audio_source_generation += 1
         self._reset_watchdog_tracking()
+        self._clear_preview_candidate()
         self._state.pending_segments.clear()
         self._state.last_emitted_text = ""
         self._state.repetition_streak = 0
@@ -420,6 +438,114 @@ class SessionManager:
         self._state.watchdog_active_episodes.clear()
         self._state.watchdog_drop_history.clear()
 
+    def _clear_preview_candidate(self) -> None:
+        self._state.preview_candidate_segment = None
+        self._state.preview_candidate_confirmations = 0
+
+    def _preview_text_key(self, text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip().lower()
+
+    def _preview_candidate_matches(self, left: TranscriptSegment, right: TranscriptSegment) -> bool:
+        if left.original_language != right.original_language:
+            return False
+        if abs(left.start_time - right.start_time) > 1.0:
+            return False
+        if right.end_time + 0.25 < left.end_time:
+            return False
+        left_key = self._preview_text_key(left.text)
+        right_key = self._preview_text_key(right.text)
+        if not left_key or not right_key:
+            return False
+        return (
+            left_key == right_key
+            or left_key.startswith(right_key)
+            or right_key.startswith(left_key)
+        )
+
+    def _merge_preview_candidate(self, left: TranscriptSegment, right: TranscriptSegment) -> TranscriptSegment:
+        merged_text = right.text if len(self._preview_text_key(right.text)) >= len(self._preview_text_key(left.text)) else left.text
+        return TranscriptSegment(
+            id=left.id,
+            meeting_id=left.meeting_id,
+            start_time=min(left.start_time, right.start_time),
+            end_time=max(left.end_time, right.end_time),
+            text=merged_text,
+            original_language=right.original_language,
+            speaker_id=right.speaker_id or left.speaker_id,
+            confidence=max(left.confidence, right.confidence),
+            translations=dict(left.translations),
+            created_at=right.created_at,
+            emitted_at_elapsed_seconds=right.emitted_at_elapsed_seconds,
+        )
+
+    def _is_redundant_preview_candidate(self, seg: TranscriptSegment) -> bool:
+        if not self._state.last_emitted_text:
+            return False
+        if self._preview_text_key(seg.text) != self._preview_text_key(self._state.last_emitted_text):
+            return False
+        last_end = self._state.last_emitted_end_time
+        if last_end is None:
+            return False
+        return seg.start_time <= last_end + 1.0
+
+    async def _queue_preview_candidate(self, seg: TranscriptSegment) -> None:
+        self._state.preview_candidate_segment = seg
+        self._state.preview_candidate_confirmations = 1
+        await self._emit_transcript_preview(seg)
+
+    async def _flush_preview_candidate(self) -> None:
+        preview = self._state.preview_candidate_segment
+        if preview is None:
+            return
+        self._clear_preview_candidate()
+        await self._persist_and_emit_segment(preview)
+        await self._emit_transcript_preview()
+
+    def _should_commit_on_silence(self, seg: TranscriptSegment) -> bool:
+        duration = max(0.0, seg.end_time - seg.start_time)
+        if seg.confidence < self._cfg.silence_commit_min_confidence:
+            return False
+        if duration < self._cfg.silence_commit_min_duration_seconds:
+            return False
+        return True
+
+    async def _flush_silence_boundary_segments(self) -> None:
+        while self._state.pending_segments:
+            oldest = self._state.pending_segments[0]
+            if not self._should_commit_on_silence(oldest):
+                break
+            await self._emit_oldest_pending_segment()
+
+        preview = self._state.preview_candidate_segment
+        if preview is not None and self._should_commit_on_silence(preview):
+            await self._flush_preview_candidate()
+
+    async def _reconcile_preview_candidate(
+        self,
+        candidate_segments: list[TranscriptSegment],
+    ) -> list[TranscriptSegment]:
+        preview = self._state.preview_candidate_segment
+        if preview is None:
+            return candidate_segments
+        if not candidate_segments:
+            return candidate_segments
+
+        first = candidate_segments[0]
+        if self._preview_candidate_matches(preview, first):
+            merged = self._merge_preview_candidate(preview, first)
+            self._state.preview_candidate_segment = merged
+            self._state.preview_candidate_confirmations += 1
+            if self._state.preview_candidate_confirmations >= self._PREVIEW_CONFIRMATION_WINDOWS:
+                self._clear_preview_candidate()
+                await self._persist_and_emit_segment(merged)
+                await self._emit_transcript_preview()
+            else:
+                await self._emit_transcript_preview(merged)
+            return candidate_segments[1:]
+
+        await self._flush_preview_candidate()
+        return candidate_segments
+
     async def _emit_watchdog_event(
         self,
         *,
@@ -469,6 +595,13 @@ class SessionManager:
             item for item in self._state.watchdog_drop_history if item[0] >= cutoff
         ]
         return self._audio_drop_total // 10
+
+    def _active_transcript_item_count(self) -> int:
+        return (
+            len(self._state.segments)
+            + len(self._state.pending_segments)
+            + (1 if self._state.preview_candidate_segment is not None else 0)
+        )
 
     async def _check_audio_health(self) -> None:
         now = time.monotonic()
@@ -577,6 +710,7 @@ class SessionManager:
             # Accumulation buffer: collect small audio chunks until we have enough
             # for a quality ASR pass, reducing latency vs the old 3s monolithic chunks.
             accum_samples: list[np.ndarray] = []
+            accum_chunk_rms: list[float] = []
             accum_duration: float = 0.0
             accum_start_time: float = 0.0
             threshold = self._cfg.asr_accumulation_seconds
@@ -651,7 +785,15 @@ class SessionManager:
                 weak_rescue_duration += len(prepared_chunk.samples) / prepared_chunk.sample_rate
                 self._state.weak_rescue_buffer_seconds = weak_rescue_duration
 
-                if weak_rescue_duration < self._cfg.weak_speech_rescue_window_seconds:
+                rescue_window_seconds = self._cfg.weak_speech_rescue_window_seconds
+                fast_window_seconds = min(
+                    rescue_window_seconds,
+                    max(0.1, self._cfg.weak_speech_rescue_fast_window_seconds),
+                )
+                if rms <= self._cfg.weak_speech_rescue_fast_rms_max:
+                    rescue_window_seconds = fast_window_seconds
+
+                if weak_rescue_duration < rescue_window_seconds:
                     return
 
                 rescue_end = weak_rescue_start_time + weak_rescue_duration
@@ -665,7 +807,7 @@ class SessionManager:
                     sample_rate=prepared_chunk.sample_rate,
                     start_time=weak_rescue_start_time,
                 )
-                before_count = len(self._state.segments) + len(self._state.pending_segments)
+                before_count = self._active_transcript_item_count()
                 self._state.weak_rescue_attempts += 1
                 logger.info(
                     "weak speech rescue attempt duration=%.2fs rms=%.5f start=%.2f",
@@ -676,26 +818,34 @@ class SessionManager:
                 clear_weak_rescue_buffer()
                 weak_rescue_last_attempt_end = rescue_end
                 await consume_asr_chunk(rescue_chunk)
-                after_count = len(self._state.segments) + len(self._state.pending_segments)
+                after_count = self._active_transcript_item_count()
                 if after_count > before_count:
                     self._state.weak_rescue_emitted += 1
 
             async def consume_asr_chunk(chunk: AudioChunk) -> None:
-                nonlocal accum_duration, accum_start_time, overlap_buf, accum_samples
+                nonlocal accum_duration, accum_start_time, overlap_buf, accum_samples, accum_chunk_rms
 
                 if not accum_samples:
                     accum_start_time = chunk.start_time
 
+                chunk_rms = float(np.sqrt(np.mean(chunk.samples ** 2))) if chunk.samples.size else 0.0
                 accum_samples.append(chunk.samples)
+                accum_chunk_rms.append(chunk_rms)
                 accum_duration += len(chunk.samples) / chunk.sample_rate
 
+                flush_threshold = self._resolve_asr_flush_threshold(
+                    threshold=threshold,
+                    accum_chunk_rms=accum_chunk_rms,
+                    current_chunk_rms=chunk_rms,
+                )
+
                 # Normal cadence: keep accumulating until we reach the threshold.
-                if accum_duration < threshold:
+                if accum_duration < flush_threshold:
                     return
                 hard_cap_seconds = self._asr_accumulation_hard_cap_seconds()
                 self._log_accumulation_flush_reason(
                     accum_duration,
-                    threshold=threshold,
+                    threshold=flush_threshold,
                     hard_cap_seconds=hard_cap_seconds,
                 )
 
@@ -704,17 +854,24 @@ class SessionManager:
                 buf_start = accum_start_time
                 sample_rate = chunk.sample_rate
                 accum_samples.clear()
+                accum_chunk_rms.clear()
                 accum_duration = 0.0
 
                 # Skip near-silent chunks to avoid Whisper hallucinations.
                 rms = float(np.sqrt(np.mean(merged ** 2)))
                 if rms < self._cfg.silence_rms_threshold:
                     logger.debug("chunk silent rms=%.5f, skipping ASR", rms)
+                    committed_before_silence = len(self._state.segments)
                     self._state.elapsed_seconds = max(
                         self._state.elapsed_seconds,
                         buf_start + len(merged) / sample_rate,
                     )
+                    await self._flush_silence_boundary_segments()
                     await self._emit_session_progress_if_needed()
+                    if len(self._state.segments) > committed_before_silence:
+                        self._schedule_summary(self._maybe_emit_rolling())
+                        self._schedule_summary(self._maybe_emit_memory())
+                        self._schedule_summary(self._maybe_emit_cumulative())
                     overlap_buf = np.zeros(0, dtype=np.float32)
                     return
 
@@ -820,19 +977,27 @@ class SessionManager:
     
                 if candidate_segments and self._state.pending_segments:
                     candidate_segments[0] = self._consume_pending_segment(candidate_segments[0])
+
+                candidate_segments = await self._reconcile_preview_candidate(candidate_segments)
     
                 tail_segment = None
                 if candidate_segments and not self._is_sentence_complete(candidate_segments[-1].text):
                     tail_segment = candidate_segments.pop()
     
+                preview_complete_segment = None
                 if candidate_segments and tail_segment is None:
-                    await self._emit_transcript_preview(candidate_segments[-1])
-    
+                    preview_complete_segment = candidate_segments.pop()
+
                 for seg in candidate_segments:
                     await self._persist_and_emit_segment(seg)
     
                 if tail_segment is not None:
                     await self._queue_pending_segment(tail_segment)
+                elif (
+                    preview_complete_segment is not None
+                    and not self._is_redundant_preview_candidate(preview_complete_segment)
+                ):
+                    await self._queue_preview_candidate(preview_complete_segment)
     
                 if repetition_tripped:
                     overlap_buf = np.zeros(0, dtype=np.float32)
@@ -901,6 +1066,9 @@ class SessionManager:
 
                         energy_chunk = noise_reducer.process(raw_chunk)
                         prepared_chunk = pre_vad_conditioner.process(energy_chunk)
+                        pre_vad.set_trailing_silence_seconds(
+                            self._resolve_pre_vad_trailing_silence_seconds()
+                        )
                         vad_chunks = pre_vad.push(prepared_chunk)
                         if vad_chunks:
                             clear_weak_rescue_buffer()
@@ -924,6 +1092,7 @@ class SessionManager:
                     source_switched = True
 
                 if source_switched:
+                    self._clear_preview_candidate()
                     self._state.pending_segments.clear()
                     await self._emit_transcript_preview(None)
                     continue
@@ -1013,6 +1182,8 @@ class SessionManager:
                 while self._state.pending_segments:
                     await self._emit_oldest_pending_segment()
 
+                await self._flush_preview_candidate()
+
                 # Wait for in-flight summary tasks before final summary.
                 if self._summary_tasks:
                     await asyncio.wait(self._summary_tasks, timeout=15.0)
@@ -1027,6 +1198,7 @@ class SessionManager:
                 break
             except Exception as exc:
                 if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
+                    self._clear_preview_candidate()
                     self._state.pending_segments.clear()
                     await self._emit_transcript_preview(None)
                     continue
@@ -1046,9 +1218,23 @@ class SessionManager:
         self._summary_tasks.add(task)
         task.add_done_callback(self._summary_tasks.discard)
 
-    def _schedule_translation(self, coro) -> None:
-        self._trim_translation_backlog()
-        task = asyncio.create_task(coro)
+    def _schedule_translation(self, seg: TranscriptSegment, target_language: LanguageCode) -> None:
+        if seg.original_language == target_language:
+            return
+        if seg.translations.get(target_language):
+            return
+
+        previous_segment_id = self._translation_requested_segment_ids.get(target_language)
+        if previous_segment_id and previous_segment_id != seg.id:
+            self._state.translation_backlog_trim_total += 1
+        self._translation_requested_segment_ids[target_language] = seg.id
+
+        task = self._translation_workers_by_language.get(target_language)
+        if task is not None and not task.done():
+            return
+
+        task = asyncio.create_task(self._drain_live_translations(target_language))
+        self._translation_workers_by_language[target_language] = task
         self._translation_tasks.add(task)
         self._translation_task_order.append(task)
         task.add_done_callback(self._translation_tasks.discard)
@@ -1059,6 +1245,9 @@ class SessionManager:
             self._translation_task_order.remove(task)
         except ValueError:
             pass
+        for language, current in list(self._translation_workers_by_language.items()):
+            if current is task:
+                self._translation_workers_by_language.pop(language, None)
 
     def _trim_translation_backlog(self) -> None:
         max_pending = self._effective_translation_max_pending()
@@ -1102,11 +1291,52 @@ class SessionManager:
         limit = max(0, self._cfg.live_translation_backfill_limit)
         if limit == 0:
             return
-        # Prefer the newest segments first. If the user turns subtitles on after
-        # a long meeting, we must not enqueue hundreds of stale translations in
-        # front of the live tail.
+        latest = next(
+            (
+                seg for seg in reversed(self._state.segments[-limit:])
+                if seg.original_language != self._cfg.live_translation_language
+                and not seg.translations.get(self._cfg.live_translation_language)
+            ),
+            None,
+        )
+        if latest is not None:
+            self._schedule_translation(latest, self._cfg.live_translation_language)
+
+    def _next_translation_segment(self, target_language: LanguageCode) -> Optional[TranscriptSegment]:
+        requested_segment_id = self._translation_requested_segment_ids.get(target_language)
+        if requested_segment_id is not None:
+            for seg in reversed(self._state.segments):
+                if seg.id != requested_segment_id:
+                    continue
+                if seg.original_language == target_language or seg.translations.get(target_language):
+                    self._translation_requested_segment_ids.pop(target_language, None)
+                    break
+                return seg
+            else:
+                self._translation_requested_segment_ids.pop(target_language, None)
+
+        limit = max(0, self._cfg.live_translation_backfill_limit)
+        if limit == 0:
+            return None
         for seg in reversed(self._state.segments[-limit:]):
-            self._schedule_translation(self._translate_segment(seg, self._cfg.live_translation_language))
+            if seg.original_language == target_language:
+                continue
+            if seg.translations.get(target_language):
+                continue
+            if (seg.id, target_language) in self._translation_in_flight:
+                continue
+            return seg
+        return None
+
+    async def _drain_live_translations(self, target_language: LanguageCode) -> None:
+        while True:
+            self._trim_translation_backlog()
+            seg = self._next_translation_segment(target_language)
+            if seg is None:
+                return
+            if self._translation_requested_segment_ids.get(target_language) == seg.id:
+                self._translation_requested_segment_ids.pop(target_language, None)
+            await self._translate_segment(seg, target_language)
 
     async def _emit_session_progress_if_needed(self, *, force: bool = False) -> None:
         current_second = int(self._state.elapsed_seconds)
@@ -1367,6 +1597,44 @@ class SessionManager:
     def _is_suspicious_asr_segment(self, seg) -> bool:
         return self._classify_asr_segment(seg) == "drop"
 
+    def _resolve_asr_flush_threshold(
+        self,
+        *,
+        threshold: float,
+        accum_chunk_rms: list[float],
+        current_chunk_rms: float,
+    ) -> float:
+        if not self._cfg.asr_early_flush_enabled:
+            return threshold
+
+        early_threshold = min(threshold, max(0.1, self._cfg.asr_early_flush_min_seconds))
+        if len(accum_chunk_rms) == 1:
+            return early_threshold
+
+        if (
+            current_chunk_rms < self._cfg.silence_rms_threshold
+            and any(rms >= self._cfg.silence_rms_threshold for rms in accum_chunk_rms[:-1])
+        ):
+            return early_threshold
+
+        return threshold
+
+    def _resolve_pre_vad_trailing_silence_seconds(self) -> float:
+        base = max(0.0, self._cfg.pre_vad_trailing_silence_seconds)
+        if not self._cfg.pre_vad_adaptive_trailing_silence_enabled:
+            return base
+        if self._asr_safeguard_active():
+            return base
+        if self._state.pending_segments or self._state.preview_candidate_segment is not None:
+            return base
+
+        rtf = self._state.asr_realtime_factor
+        if rtf is not None and rtf > self._cfg.pre_vad_adaptive_max_realtime_factor:
+            return base
+
+        fast = max(0.0, self._cfg.pre_vad_adaptive_fast_trailing_silence_seconds)
+        return min(base, fast)
+
     def _is_sentence_complete(self, text: str) -> bool:
         stripped = text.strip()
         if not stripped:
@@ -1395,6 +1663,12 @@ class SessionManager:
         if not self._state.pending_segments:
             return None
         return self._state.pending_segments[-1]
+
+    def _latest_preview_segment(self) -> Optional[TranscriptSegment]:
+        pending = self._latest_pending_segment()
+        if pending is not None:
+            return pending
+        return self._state.preview_candidate_segment
 
     def _can_merge_pending_segment(self, seg: TranscriptSegment) -> bool:
         pending = self._latest_pending_segment()
@@ -1440,9 +1714,10 @@ class SessionManager:
         self._state.segments.append(seg)
         self._cfg.storage.insert_segment(seg)
         self._state.last_emitted_text = seg.text.strip()
+        self._state.last_emitted_end_time = seg.end_time
         await self._emit("transcript_segment", seg)
         if self._cfg.live_translation_language is not None:
-            self._schedule_translation(self._translate_segment(seg, self._cfg.live_translation_language))
+            self._schedule_translation(seg, self._cfg.live_translation_language)
 
     async def _translate_segment(self, seg: TranscriptSegment, target_language: LanguageCode) -> None:
         if seg.original_language == target_language:
@@ -1484,7 +1759,7 @@ class SessionManager:
     async def _emit_transcript_preview(self, segment: Optional[TranscriptSegment] = None) -> None:
         await self._emit(
             "transcript_preview",
-            TranscriptPreviewPayload(segment=segment if segment is not None else self._latest_pending_segment()),
+            TranscriptPreviewPayload(segment=segment if segment is not None else self._latest_preview_segment()),
         )
 
     async def _emit_oldest_pending_segment(self) -> None:

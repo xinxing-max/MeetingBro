@@ -36,6 +36,50 @@ from meetingbro.summarization.base import Summarizer  # noqa: E402
 from meetingbro.translation.base import Translator  # noqa: E402
 
 
+PROFILE_PRESETS: dict[str, dict[str, Any]] = {
+    "legacy": {
+        "chunk_seconds": 5.0,
+        "asr_accumulation_seconds": 2.5,
+        "pre_vad_enabled": False,
+        "asr_early_flush_enabled": False,
+        "silence_commit_min_confidence": 1.1,
+        "silence_commit_min_duration_seconds": 10.0,
+        "pre_vad_adaptive_trailing_silence_enabled": False,
+        "language_lock_enabled": False,
+    },
+    "tuned_base": {
+        "chunk_seconds": 0.5,
+        "asr_accumulation_seconds": 1.5,
+        "pre_vad_enabled": False,
+        "asr_early_flush_enabled": False,
+        "silence_commit_min_confidence": 1.1,
+        "silence_commit_min_duration_seconds": 10.0,
+        "pre_vad_adaptive_trailing_silence_enabled": False,
+        "language_lock_enabled": False,
+    },
+    "tuned_commit": {
+        "chunk_seconds": 0.5,
+        "asr_accumulation_seconds": 1.5,
+        "pre_vad_enabled": False,
+        "asr_early_flush_enabled": True,
+        "silence_commit_min_confidence": 0.75,
+        "silence_commit_min_duration_seconds": 0.6,
+        "pre_vad_adaptive_trailing_silence_enabled": False,
+        "language_lock_enabled": False,
+    },
+    "full_current": {
+        "chunk_seconds": 0.5,
+        "asr_accumulation_seconds": 1.5,
+        "pre_vad_enabled": True,
+        "asr_early_flush_enabled": True,
+        "silence_commit_min_confidence": 0.75,
+        "silence_commit_min_duration_seconds": 0.6,
+        "pre_vad_adaptive_trailing_silence_enabled": True,
+        "language_lock_enabled": False,
+    },
+}
+
+
 class NoopSummarizer(Summarizer):
     def summarize(self, segments, *, kind, language, previous_summary=None):
         return ""
@@ -65,6 +109,42 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cfg_value(overrides: dict[str, Any], key: str, env_name: str, default: Any) -> Any:
+    if key in overrides:
+        return overrides[key]
+    return os.environ.get(env_name, default)
+
+
+def _cfg_float(overrides: dict[str, Any], key: str, env_name: str, default: float) -> float:
+    if key in overrides:
+        return float(overrides[key])
+    return _env_float(env_name, default)
+
+
+def _cfg_int(overrides: dict[str, Any], key: str, env_name: str, default: int) -> int:
+    if key in overrides:
+        return int(overrides[key])
+    return _env_int(env_name, default)
+
+
+def _cfg_bool(overrides: dict[str, Any], key: str, env_name: str, default: bool) -> bool:
+    if key in overrides:
+        return bool(overrides[key])
+    return _env_bool(env_name, default)
+
+
+def _parse_profiles(raw: str) -> list[str]:
+    names = [item.strip() for item in raw.split(",") if item.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError("at least one profile name is required")
+    invalid = [name for name in names if name not in PROFILE_PRESETS]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"unknown profile(s): {', '.join(invalid)}. valid: {', '.join(PROFILE_PRESETS)}"
+        )
+    return names
 
 
 def _resolve_inputs(patterns: list[str]) -> list[Path]:
@@ -118,15 +198,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--compute-type", default=os.environ.get("MEETINGBRO_WHISPER_COMPUTE_TYPE", "int8"))
     parser.add_argument("--beam-size", type=int, default=_env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 3))
     parser.add_argument("--chunk-seconds", type=float, default=_env_float("MEETINGBRO_FILE_CHUNK_SECONDS", 5.0))
+    parser.add_argument(
+        "--profiles",
+        type=_parse_profiles,
+        default=["full_current"],
+        help="Comma-separated named config profiles to compare. Default: full_current",
+    )
     parser.add_argument("--keywords", nargs="*", default=[], help="Expected keywords for rough recall.")
     parser.add_argument("--json-out", default=None, help="Optional JSON report path.")
     parser.add_argument("--text-out-dir", default=None, help="Optional directory for transcript .txt files.")
     return parser.parse_args(argv[1:])
 
 
-async def _run_one(path: Path, args: argparse.Namespace) -> dict[str, Any]:
+async def _run_one(path: Path, args: argparse.Namespace, *, profile_name: str, overrides: dict[str, Any]) -> dict[str, Any]:
     forced_language = None if args.language == "auto" else args.language
     audio_duration = _wav_duration_seconds(path)
+    chunk_seconds = float(overrides.get("chunk_seconds", args.chunk_seconds))
     with tempfile.TemporaryDirectory() as tmp:
         storage = Storage(Path(tmp) / "benchmark.db")
         try:
@@ -135,16 +222,16 @@ async def _run_one(path: Path, args: argparse.Namespace) -> dict[str, Any]:
                 device=args.device,
                 compute_type=args.compute_type,
                 beam_size=args.beam_size,
-                cpu_threads=_env_int("MEETINGBRO_WHISPER_CPU_THREADS", 0),
-                num_workers=_env_int("MEETINGBRO_WHISPER_NUM_WORKERS", 1),
-                vad_threshold=_env_float("MEETINGBRO_WHISPER_VAD_THRESHOLD", 0.3),
-                vad_min_speech_ms=_env_int("MEETINGBRO_WHISPER_VAD_MIN_SPEECH_MS", 100),
-                vad_min_silence_ms=_env_int("MEETINGBRO_WHISPER_VAD_MIN_SILENCE_MS", 300),
-                vad_speech_pad_ms=_env_int("MEETINGBRO_WHISPER_VAD_SPEECH_PAD_MS", 400),
-                multilingual=_env_bool("MEETINGBRO_WHISPER_MULTILINGUAL", False),
+                cpu_threads=_cfg_int(overrides, "whisper_cpu_threads", "MEETINGBRO_WHISPER_CPU_THREADS", 0),
+                num_workers=_cfg_int(overrides, "whisper_num_workers", "MEETINGBRO_WHISPER_NUM_WORKERS", 1),
+                vad_threshold=_cfg_float(overrides, "whisper_vad_threshold", "MEETINGBRO_WHISPER_VAD_THRESHOLD", 0.3),
+                vad_min_speech_ms=_cfg_int(overrides, "whisper_vad_min_speech_ms", "MEETINGBRO_WHISPER_VAD_MIN_SPEECH_MS", 100),
+                vad_min_silence_ms=_cfg_int(overrides, "whisper_vad_min_silence_ms", "MEETINGBRO_WHISPER_VAD_MIN_SILENCE_MS", 300),
+                vad_speech_pad_ms=_cfg_int(overrides, "whisper_vad_speech_pad_ms", "MEETINGBRO_WHISPER_VAD_SPEECH_PAD_MS", 400),
+                multilingual=_cfg_bool(overrides, "whisper_multilingual", "MEETINGBRO_WHISPER_MULTILINGUAL", False),
             )
             cfg = SessionConfig(
-                audio_source=WavFileSource(path, sample_rate=16_000, chunk_seconds=args.chunk_seconds, realtime=False),
+                audio_source=WavFileSource(path, sample_rate=16_000, chunk_seconds=chunk_seconds, realtime=False),
                 asr=asr,
                 summarizer=NoopSummarizer(),
                 translator=NoopTranslator(),
@@ -157,37 +244,46 @@ async def _run_one(path: Path, args: argparse.Namespace) -> dict[str, Any]:
                 min_segments_for_rolling=999999,
                 min_segments_for_memory=999999,
                 min_segments_for_cumulative=999999,
-                asr_accumulation_seconds=_env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 2.5),
-                silence_rms_threshold=_env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.001),
-                asr_overlap_seconds=_env_float("MEETINGBRO_ASR_OVERLAP_SECONDS", 0.0),
-                vocabulary_hint=os.environ.get("MEETINGBRO_VOCABULARY_HINT") or None,
-                asr_retry_enabled=_env_bool("MEETINGBRO_ASR_RETRY_ENABLED", True),
-                asr_safeguard_enabled=_env_bool("MEETINGBRO_ASR_SAFEGUARD_ENABLED", True),
-                asr_safeguard_rtf_threshold=_env_float("MEETINGBRO_ASR_SAFEGUARD_RTF_THRESHOLD", 0.9),
-                asr_safeguard_cooldown_windows=_env_int("MEETINGBRO_ASR_SAFEGUARD_COOLDOWN_WINDOWS", 5),
-                denoise_enabled=_env_bool("MEETINGBRO_DENOISE_ENABLED", False),
-                denoise_strength=_env_float("MEETINGBRO_DENOISE_STRENGTH", 1.1),
-                denoise_noise_update_rms_threshold=_env_float("MEETINGBRO_DENOISE_NOISE_UPDATE_RMS_THRESHOLD", 0.02),
-                audio_conditioning_enabled=_env_bool("MEETINGBRO_AUDIO_CONDITIONING_ENABLED", True),
-                audio_conditioning_target_rms=_env_float("MEETINGBRO_AUDIO_CONDITIONING_TARGET_RMS", 0.035),
-                audio_conditioning_min_rms=_env_float("MEETINGBRO_AUDIO_CONDITIONING_MIN_RMS", 0.003),
-                audio_conditioning_max_gain=_env_float("MEETINGBRO_AUDIO_CONDITIONING_MAX_GAIN", 2.5),
-                audio_conditioning_peak_limit=_env_float("MEETINGBRO_AUDIO_CONDITIONING_PEAK_LIMIT", 0.98),
-                pre_vad_enabled=_env_bool("MEETINGBRO_PRE_VAD_ENABLED", True),
-                pre_vad_conditioning_enabled=_env_bool("MEETINGBRO_PRE_VAD_CONDITIONING_ENABLED", True),
-                pre_vad_conditioning_target_rms=_env_float("MEETINGBRO_PRE_VAD_CONDITIONING_TARGET_RMS", 0.03),
-                pre_vad_conditioning_min_rms=_env_float("MEETINGBRO_PRE_VAD_CONDITIONING_MIN_RMS", 0.001),
-                pre_vad_conditioning_max_gain=_env_float("MEETINGBRO_PRE_VAD_CONDITIONING_MAX_GAIN", 4.0),
-                pre_vad_threshold=_env_float("MEETINGBRO_PRE_VAD_THRESHOLD", 0.38),
-                pre_vad_energy_rms_threshold=_env_float("MEETINGBRO_PRE_VAD_ENERGY_RMS_THRESHOLD", 0.005),
-                pre_vad_trailing_silence_seconds=_env_float("MEETINGBRO_PRE_VAD_TRAILING_SILENCE_SECONDS", 0.45),
-                pre_vad_max_segment_seconds=_env_float("MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS", 8.0),
-                weak_speech_rescue_enabled=_env_bool("MEETINGBRO_WEAK_SPEECH_RESCUE_ENABLED", True),
-                weak_speech_rescue_rms_min=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MIN", 0.0008),
-                weak_speech_rescue_rms_max=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MAX", 0.02),
-                weak_speech_rescue_window_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_WINDOW_SECONDS", 6.0),
-                weak_speech_rescue_cooldown_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_COOLDOWN_SECONDS", 8.0),
-                language_lock_enabled=_env_bool("MEETINGBRO_LANGUAGE_LOCK_ENABLED", False),
+                asr_accumulation_seconds=_cfg_float(overrides, "asr_accumulation_seconds", "MEETINGBRO_ASR_ACCUM_SECONDS", 2.5),
+                silence_rms_threshold=_cfg_float(overrides, "silence_rms_threshold", "MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.001),
+                asr_overlap_seconds=_cfg_float(overrides, "asr_overlap_seconds", "MEETINGBRO_ASR_OVERLAP_SECONDS", 0.0),
+                vocabulary_hint=_cfg_value(overrides, "vocabulary_hint", "MEETINGBRO_VOCABULARY_HINT", "") or None,
+                asr_retry_enabled=_cfg_bool(overrides, "asr_retry_enabled", "MEETINGBRO_ASR_RETRY_ENABLED", True),
+                asr_safeguard_enabled=_cfg_bool(overrides, "asr_safeguard_enabled", "MEETINGBRO_ASR_SAFEGUARD_ENABLED", True),
+                asr_safeguard_rtf_threshold=_cfg_float(overrides, "asr_safeguard_rtf_threshold", "MEETINGBRO_ASR_SAFEGUARD_RTF_THRESHOLD", 0.9),
+                asr_safeguard_cooldown_windows=_cfg_int(overrides, "asr_safeguard_cooldown_windows", "MEETINGBRO_ASR_SAFEGUARD_COOLDOWN_WINDOWS", 5),
+                asr_early_flush_enabled=_cfg_bool(overrides, "asr_early_flush_enabled", "MEETINGBRO_ASR_EARLY_FLUSH_ENABLED", True),
+                asr_early_flush_min_seconds=_cfg_float(overrides, "asr_early_flush_min_seconds", "MEETINGBRO_ASR_EARLY_FLUSH_MIN_SECONDS", 0.8),
+                silence_commit_min_confidence=_cfg_float(overrides, "silence_commit_min_confidence", "MEETINGBRO_SILENCE_COMMIT_MIN_CONFIDENCE", 0.75),
+                silence_commit_min_duration_seconds=_cfg_float(overrides, "silence_commit_min_duration_seconds", "MEETINGBRO_SILENCE_COMMIT_MIN_DURATION_SECONDS", 0.6),
+                denoise_enabled=_cfg_bool(overrides, "denoise_enabled", "MEETINGBRO_DENOISE_ENABLED", False),
+                denoise_strength=_cfg_float(overrides, "denoise_strength", "MEETINGBRO_DENOISE_STRENGTH", 1.1),
+                denoise_noise_update_rms_threshold=_cfg_float(overrides, "denoise_noise_update_rms_threshold", "MEETINGBRO_DENOISE_NOISE_UPDATE_RMS_THRESHOLD", 0.02),
+                audio_conditioning_enabled=_cfg_bool(overrides, "audio_conditioning_enabled", "MEETINGBRO_AUDIO_CONDITIONING_ENABLED", True),
+                audio_conditioning_target_rms=_cfg_float(overrides, "audio_conditioning_target_rms", "MEETINGBRO_AUDIO_CONDITIONING_TARGET_RMS", 0.035),
+                audio_conditioning_min_rms=_cfg_float(overrides, "audio_conditioning_min_rms", "MEETINGBRO_AUDIO_CONDITIONING_MIN_RMS", 0.003),
+                audio_conditioning_max_gain=_cfg_float(overrides, "audio_conditioning_max_gain", "MEETINGBRO_AUDIO_CONDITIONING_MAX_GAIN", 2.5),
+                audio_conditioning_peak_limit=_cfg_float(overrides, "audio_conditioning_peak_limit", "MEETINGBRO_AUDIO_CONDITIONING_PEAK_LIMIT", 0.98),
+                pre_vad_enabled=_cfg_bool(overrides, "pre_vad_enabled", "MEETINGBRO_PRE_VAD_ENABLED", True),
+                pre_vad_conditioning_enabled=_cfg_bool(overrides, "pre_vad_conditioning_enabled", "MEETINGBRO_PRE_VAD_CONDITIONING_ENABLED", True),
+                pre_vad_conditioning_target_rms=_cfg_float(overrides, "pre_vad_conditioning_target_rms", "MEETINGBRO_PRE_VAD_CONDITIONING_TARGET_RMS", 0.03),
+                pre_vad_conditioning_min_rms=_cfg_float(overrides, "pre_vad_conditioning_min_rms", "MEETINGBRO_PRE_VAD_CONDITIONING_MIN_RMS", 0.001),
+                pre_vad_conditioning_max_gain=_cfg_float(overrides, "pre_vad_conditioning_max_gain", "MEETINGBRO_PRE_VAD_CONDITIONING_MAX_GAIN", 4.0),
+                pre_vad_threshold=_cfg_float(overrides, "pre_vad_threshold", "MEETINGBRO_PRE_VAD_THRESHOLD", 0.38),
+                pre_vad_energy_rms_threshold=_cfg_float(overrides, "pre_vad_energy_rms_threshold", "MEETINGBRO_PRE_VAD_ENERGY_RMS_THRESHOLD", 0.005),
+                pre_vad_trailing_silence_seconds=_cfg_float(overrides, "pre_vad_trailing_silence_seconds", "MEETINGBRO_PRE_VAD_TRAILING_SILENCE_SECONDS", 0.45),
+                pre_vad_adaptive_trailing_silence_enabled=_cfg_bool(overrides, "pre_vad_adaptive_trailing_silence_enabled", "MEETINGBRO_PRE_VAD_ADAPTIVE_TRAILING_SILENCE_ENABLED", True),
+                pre_vad_adaptive_fast_trailing_silence_seconds=_cfg_float(overrides, "pre_vad_adaptive_fast_trailing_silence_seconds", "MEETINGBRO_PRE_VAD_ADAPTIVE_FAST_TRAILING_SILENCE_SECONDS", 0.30),
+                pre_vad_adaptive_max_realtime_factor=_cfg_float(overrides, "pre_vad_adaptive_max_realtime_factor", "MEETINGBRO_PRE_VAD_ADAPTIVE_MAX_REALTIME_FACTOR", 0.5),
+                pre_vad_max_segment_seconds=_cfg_float(overrides, "pre_vad_max_segment_seconds", "MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS", 8.0),
+                weak_speech_rescue_enabled=_cfg_bool(overrides, "weak_speech_rescue_enabled", "MEETINGBRO_WEAK_SPEECH_RESCUE_ENABLED", True),
+                weak_speech_rescue_rms_min=_cfg_float(overrides, "weak_speech_rescue_rms_min", "MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MIN", 0.0008),
+                weak_speech_rescue_rms_max=_cfg_float(overrides, "weak_speech_rescue_rms_max", "MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MAX", 0.02),
+                weak_speech_rescue_fast_rms_max=_cfg_float(overrides, "weak_speech_rescue_fast_rms_max", "MEETINGBRO_WEAK_SPEECH_RESCUE_FAST_RMS_MAX", 0.01),
+                weak_speech_rescue_fast_window_seconds=_cfg_float(overrides, "weak_speech_rescue_fast_window_seconds", "MEETINGBRO_WEAK_SPEECH_RESCUE_FAST_WINDOW_SECONDS", 2.5),
+                weak_speech_rescue_window_seconds=_cfg_float(overrides, "weak_speech_rescue_window_seconds", "MEETINGBRO_WEAK_SPEECH_RESCUE_WINDOW_SECONDS", 6.0),
+                weak_speech_rescue_cooldown_seconds=_cfg_float(overrides, "weak_speech_rescue_cooldown_seconds", "MEETINGBRO_WEAK_SPEECH_RESCUE_COOLDOWN_SECONDS", 8.0),
+                language_lock_enabled=_cfg_bool(overrides, "language_lock_enabled", "MEETINGBRO_LANGUAGE_LOCK_ENABLED", False),
             )
             manager = SessionManager(cfg)
             t0 = time.perf_counter()
@@ -204,13 +300,16 @@ async def _run_one(path: Path, args: argparse.Namespace) -> dict[str, Any]:
             if args.text_out_dir:
                 out_dir = Path(args.text_out_dir)
                 out_dir.mkdir(parents=True, exist_ok=True)
-                (out_dir / f"{path.stem}.txt").write_text(transcript, encoding="utf-8")
+                (out_dir / f"{path.stem}.{profile_name}.txt").write_text(transcript, encoding="utf-8")
 
             return {
+                "profile": profile_name,
                 "file": str(path.relative_to(ROOT) if path.is_relative_to(ROOT) else path),
                 "audio_seconds": audio_duration,
                 "wall_seconds": wall_seconds,
                 "pipeline_realtime_factor": wall_seconds / max(audio_duration, 1e-6),
+                "chunk_seconds": chunk_seconds,
+                "asr_accumulation_seconds": cfg.asr_accumulation_seconds,
                 "segments": len(segments),
                 "transcript_chars": len(transcript),
                 "languages": dict(language_counts),
@@ -239,8 +338,11 @@ async def _run_one(path: Path, args: argparse.Namespace) -> dict[str, Any]:
 
 def _print_table(rows: list[dict[str, Any]]) -> None:
     headers = [
+        "profile",
         "file",
         "audio",
+        "chunk",
+        "accum",
         "wall",
         "rtf",
         "seg",
@@ -257,8 +359,11 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
         print(
             "\t".join(
                 [
+                    row["profile"],
                     row["file"],
                     f"{row['audio_seconds']:.1f}",
+                    f"{row['chunk_seconds']:.1f}",
+                    f"{row['asr_accumulation_seconds']:.1f}",
                     f"{row['wall_seconds']:.1f}",
                     f"{row['pipeline_realtime_factor']:.2f}",
                     str(row["segments"]),
@@ -281,8 +386,10 @@ async def main(argv: list[str]) -> int:
         return 2
 
     rows = []
-    for wav in wavs:
-        rows.append(await _run_one(wav, args))
+    for profile_name in args.profiles:
+        overrides = PROFILE_PRESETS[profile_name]
+        for wav in wavs:
+            rows.append(await _run_one(wav, args, profile_name=profile_name, overrides=overrides))
 
     _print_table(rows)
     if args.json_out:
