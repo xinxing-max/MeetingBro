@@ -2058,7 +2058,7 @@ class SessionManager:
             result = await loop.run_in_executor(
                 self._summary_executor,
                 lambda: self._cfg.summarizer.finalize_meeting(
-                    self._state.segments,
+                    self._summary_context_segments(),
                     language=self._cfg.summary_language,
                     vocabulary=self._cfg.vocabulary_hint,
                     meeting_memory=self._state.latest_meeting_memory,

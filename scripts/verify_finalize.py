@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ sys.path.insert(0, str(ROOT / "app" / "backend"))
 
 from meetingbro.asr.base import ASRAdapter, ASRSegment  # noqa: E402
 from meetingbro.audio.capture import AudioChunk, AudioSource  # noqa: E402
+from meetingbro.schemas import TranscriptSegment  # noqa: E402
 from meetingbro.session.manager import SessionConfig, SessionManager  # noqa: E402
 from meetingbro.storage.db import Storage  # noqa: E402
 from meetingbro.summarization.llm import LLMSummarizer  # noqa: E402
@@ -76,13 +78,56 @@ class _FinalizeSummarizer(LLMSummarizer):
         super().__init__()
         self._compatible_client = _CompatClient(response)
         self.finalize_calls = 0
+        self.recorded_segments_count = 0
+        self.recorded_segment_ids: list[str] = []
+        self.recorded_meeting_memory = None
 
     def _ensure_client(self):
         return "openai_compatible"
 
     def finalize_meeting(self, *args, **kwargs):
         self.finalize_calls += 1
+        segments = list(args[0]) if args else []
+        self.recorded_segments_count = len(segments)
+        self.recorded_segment_ids = [segment.id for segment in segments]
+        self.recorded_meeting_memory = kwargs.get("meeting_memory")
         return super().finalize_meeting(*args, **kwargs)
+
+
+async def _run_long_meeting(summarizer: _FinalizeSummarizer, *, meeting_memory: str | None):
+    with tempfile.TemporaryDirectory() as tmp:
+        storage = Storage(Path(tmp) / "verify_finalize_long.db")
+        try:
+            manager = SessionManager(SessionConfig(
+                audio_source=_Source(0),
+                asr=_ASR(),
+                summarizer=summarizer,
+                translator=_Translator(),
+                storage=storage,
+                forced_language="en",
+                summary_language="en",
+                summary_tail_seconds=120.0,
+            ))
+            storage.create_meeting(manager._state.meeting_id, preferred_summary_language="en")
+            manager._state.segments = [
+                TranscriptSegment(
+                    id=f"seg-{index}",
+                    meeting_id=manager._state.meeting_id,
+                    start_time=index * 30.0,
+                    end_time=index * 30.0 + 20.0,
+                    text=f"Segment {index}",
+                    original_language="en",
+                    confidence=0.95,
+                    created_at=datetime.now(tz=timezone.utc),
+                )
+                for index in range(60)
+            ]
+            manager._state.elapsed_seconds = manager._state.segments[-1].end_time
+            manager._state.latest_meeting_memory = meeting_memory
+            await manager._emit_final()
+            return storage.list_snapshots(manager._state.meeting_id), summarizer.recorded_segments_count, summarizer.recorded_segment_ids, summarizer.recorded_meeting_memory
+        finally:
+            storage.close()
 
 
 async def _run(chunks: int, summarizer: _FinalizeSummarizer):
@@ -168,6 +213,19 @@ async def main() -> int:
     snapshots, errors, calls = await _run(0, _FinalizeSummarizer(happy))
     ok = not snapshots and not errors and calls == 0
     print(f"[{'OK' if ok else 'FAIL'}] empty meeting")
+    failed = failed or not ok
+    long_memory = "## Topics\n- Q2 roadmap\n## Decisions\n- Allocate 2 engineers"
+    snapshots, segment_count, segment_ids, recorded_memory = await _run_long_meeting(_FinalizeSummarizer(happy), meeting_memory=long_memory)
+    latest = {snap.summary_type: snap for snap in snapshots if snap.is_latest}
+    ok = {'final_summary', 'chapter_list', 'action_item_list'} <= set(latest) and segment_count < 60 and segment_count == len(segment_ids) and all(int(segment_id.split('-')[-1]) >= 55 for segment_id in segment_ids) and recorded_memory == long_memory
+    print(f"[{'OK' if ok else 'FAIL'}] long meeting + memory (finalize segments={segment_count} / full=60)")
+    failed = failed or not ok
+
+    summarizer = _FinalizeSummarizer(happy)
+    snapshots, segment_count, _, recorded_memory = await _run_long_meeting(summarizer, meeting_memory=None)
+    latest = {snap.summary_type: snap for snap in snapshots if snap.is_latest}
+    ok = {'final_summary', 'chapter_list', 'action_item_list'} <= set(latest) and segment_count < 60 and recorded_memory is None and summarizer.finalize_calls == 1
+    print(f"[{'OK' if ok else 'FAIL'}] long meeting + empty memory (finalize segments={segment_count} / full=60)")
     failed = failed or not ok
     print(f"chapters[0]: {chapters[0]}")
     print(f"action_items[0]: {actions[0]}")

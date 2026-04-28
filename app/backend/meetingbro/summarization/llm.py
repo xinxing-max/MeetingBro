@@ -53,13 +53,15 @@ _PROMPTS = {
 }
 
 _FINALIZE_PROMPT = (
-    "You are finalizing a meeting in {language}. Given the full transcript and known vocabulary, "
+    "You are finalizing a meeting in {language}. Given the compressed meeting memory, a recent transcript tail, and known vocabulary, "
     "output ONLY valid JSON with the exact shape: "
     '{{"chapters":[{{"title":"<<8 words","time_start":0,"time_end":0,"summary":"<<3 sentences"}}],'
     '"action_items":[{{"text":"...","assignee":"<name or null>","due":"<date or null>"}}],'
     '"final_summary":"5-10 sentences in {language} covering decisions, key points, open questions"}}. '
     "Do NOT invent content. Use the vocabulary list as exact spellings of names/terms. "
-    "The transcript may mix Chinese, English, German."
+    "The transcript may mix Chinese, English, German. Earlier meeting content has been condensed into the compressed meeting memory above. "
+    "The recent transcript tail provides verbatim grounding for the most recent minutes; older topics, decisions, and action items should be derived from the compressed memory. "
+    "For chapters that fall outside the verbatim tail's time range, provide best-effort approximate time_start and time_end based on the meeting's overall structure; precise sub-second accuracy is not required."
 )
 
 _LANG_NAMES = {"en": "English", "zh": "Chinese", "de": "German"}
@@ -221,7 +223,7 @@ class LLMSummarizer(Summarizer):
             f"Known vocabulary: {vocabulary.strip() if vocabulary and vocabulary.strip() else '(none provided)'}\n\n"
             "Compressed meeting memory (durable context):\n"
             f"{meeting_memory.strip() if meeting_memory and meeting_memory.strip() else '(empty)'}\n\n"
-            f"Full transcript:\n{transcript_text}"
+            f"Recent transcript tail (verbatim, with timestamps):\n{transcript_text}"
         )
         system_prompt = _FINALIZE_PROMPT.format(language=_LANG_NAMES.get(language, language))
         if provider == "openai_compatible":
