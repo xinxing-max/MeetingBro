@@ -22,7 +22,16 @@ from meetingbro.asr.base import ASRSegment
 # ── Mock ASR: blocks for 8 s then returns one segment ────────────────────────
 
 class SlowASR:
-    def transcribe(self, samples, sample_rate, *, forced_language=None, offset_seconds=0.0, initial_prompt=None):
+    def transcribe(
+        self,
+        samples,
+        sample_rate,
+        *,
+        forced_language=None,
+        offset_seconds=0.0,
+        initial_prompt=None,
+        quality_preset="realtime",
+    ):
         time.sleep(8)  # simulate slow model on a large audio block
         return [ASRSegment(
             start_time=0.6,
@@ -87,6 +96,7 @@ async def run_test():
         asr_accumulation_seconds=2.4,
         silence_rms_threshold=0.0,
         asr_overlap_seconds=0.5,
+        pre_vad_enabled=False,
     )
 
     mgr = SessionManager(cfg)

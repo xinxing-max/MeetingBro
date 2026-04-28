@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,7 +15,7 @@ import numpy as np
 from ..asr.base import ASRAdapter
 from ..audio.capture import AudioChunk, AudioSource
 from ..audio.mixed import MixedAudioSource
-from ..audio.enhancement import AdaptiveNoiseReducer
+from ..audio.enhancement import AdaptiveNoiseReducer, AudioConditioner
 from ..audio.vad import PreVadSegmenter
 from ..diarization.base import Diarizer
 from ..schemas import (
@@ -72,12 +73,36 @@ class SessionConfig:
     suspicious_segment_no_speech_prob: float = 0.6
     suspicious_segment_avg_logprob: float = -0.9
     suspicious_segment_compression_ratio: float = 2.1
+    asr_retry_enabled: bool = True
+    asr_safeguard_enabled: bool = True
+    asr_safeguard_rtf_threshold: float = 0.9
+    asr_safeguard_cooldown_windows: int = 5
     denoise_enabled: bool = False
     denoise_strength: float = 1.1
     denoise_noise_update_rms_threshold: float = 0.02
+    audio_conditioning_enabled: bool = True
+    audio_conditioning_target_rms: float = 0.035
+    audio_conditioning_min_rms: float = 0.003
+    audio_conditioning_max_gain: float = 2.5
+    audio_conditioning_peak_limit: float = 0.98
     pre_vad_enabled: bool = True
+    pre_vad_conditioning_enabled: bool = True
+    pre_vad_conditioning_target_rms: float = 0.03
+    pre_vad_conditioning_min_rms: float = 0.001
+    pre_vad_conditioning_max_gain: float = 4.0
+    pre_vad_threshold: float = 0.38
+    pre_vad_energy_rms_threshold: float = 0.005
     pre_vad_trailing_silence_seconds: float = 0.45
-    pre_vad_max_segment_seconds: float = 12.0
+    pre_vad_max_segment_seconds: float = 8.0
+    weak_speech_rescue_enabled: bool = True
+    weak_speech_rescue_rms_min: float = 0.0008
+    weak_speech_rescue_rms_max: float = 0.02
+    weak_speech_rescue_window_seconds: float = 6.0
+    weak_speech_rescue_cooldown_seconds: float = 8.0
+    language_lock_enabled: bool = False
+    live_translation_backfill_limit: int = 20
+    live_translation_max_pending: int = 12
+    live_translation_safeguard_max_pending: int = 4
     # Executor sizing is not a user-facing tuning surface. Defaults are chosen
     # automatically in main.py and may be overridden only via hidden env vars.
     asr_executor_workers: int = 1
@@ -121,6 +146,16 @@ class _State:
     retry_windows_unchanged: int = 0
     retry_windows_diverged: int = 0
     last_backpressure_elapsed_seconds: Optional[float] = None
+    asr_last_audio_seconds: Optional[float] = None
+    asr_last_wall_seconds: Optional[float] = None
+    asr_realtime_factor: Optional[float] = None
+    asr_safeguard_reason: Optional[str] = None
+    asr_safeguard_cooldown_windows: int = 0
+    asr_safeguard_events: int = 0
+    weak_rescue_attempts: int = 0
+    weak_rescue_emitted: int = 0
+    weak_rescue_buffer_seconds: float = 0.0
+    translation_backlog_trim_total: int = 0
 
 
 class SessionManager:
@@ -140,6 +175,7 @@ class SessionManager:
         self._task: Optional[asyncio.Task[None]] = None
         self._summary_tasks: set[asyncio.Task[None]] = set()
         self._translation_tasks: set[asyncio.Task[None]] = set()
+        self._translation_task_order: list[asyncio.Task[None]] = []
         self._translation_in_flight: set[tuple[str, str]] = set()
         self._pending_speaker_updates: list[Speaker] = []
         self._queue_drop_count: int = 0
@@ -165,6 +201,7 @@ class SessionManager:
         return self._state.meeting_id
 
     def _session_state_payload(self, *, state: str) -> SessionStatePayload:
+        self._prune_background_task_lists()
         mixed_microphone_gain = None
         mixed_system_gain = None
         mixed_effective_microphone_gain = None
@@ -185,6 +222,19 @@ class SessionManager:
             retry_windows_unchanged=self._state.retry_windows_unchanged,
             retry_windows_diverged=self._state.retry_windows_diverged,
             last_backpressure_elapsed_seconds=self._state.last_backpressure_elapsed_seconds,
+            asr_last_audio_seconds=self._state.asr_last_audio_seconds,
+            asr_last_wall_seconds=self._state.asr_last_wall_seconds,
+            asr_realtime_factor=self._state.asr_realtime_factor,
+            asr_safeguard_active=self._asr_safeguard_active(),
+            asr_safeguard_reason=self._state.asr_safeguard_reason,
+            asr_safeguard_events=self._state.asr_safeguard_events,
+            weak_rescue_attempts=self._state.weak_rescue_attempts,
+            weak_rescue_emitted=self._state.weak_rescue_emitted,
+            weak_rescue_buffer_seconds=self._state.weak_rescue_buffer_seconds,
+            summary_pending_count=sum(1 for task in self._summary_tasks if not task.done()),
+            translation_pending_count=sum(1 for task in self._translation_task_order if not task.done()),
+            translation_backlog_trim_total=self._state.translation_backlog_trim_total,
+            audio_drop_total=self._audio_drop_total,
             mixed_microphone_gain=mixed_microphone_gain,
             mixed_system_gain=mixed_system_gain,
             mixed_effective_microphone_gain=mixed_effective_microphone_gain,
@@ -359,6 +409,8 @@ class SessionManager:
             pre_vad = PreVadSegmenter(
                 sample_rate=source.sample_rate,
                 enabled=self._cfg.pre_vad_enabled,
+                detector_threshold=self._cfg.pre_vad_threshold,
+                detector_energy_rms_threshold=self._cfg.pre_vad_energy_rms_threshold,
                 trailing_silence_seconds=self._cfg.pre_vad_trailing_silence_seconds,
                 max_segment_seconds=self._cfg.pre_vad_max_segment_seconds,
             )
@@ -368,7 +420,88 @@ class SessionManager:
                 strength=self._cfg.denoise_strength,
                 noise_update_rms_threshold=self._cfg.denoise_noise_update_rms_threshold,
             )
+            pre_vad_conditioner = AudioConditioner(
+                enabled=self._cfg.pre_vad_conditioning_enabled,
+                target_rms=self._cfg.pre_vad_conditioning_target_rms,
+                min_rms_for_gain=self._cfg.pre_vad_conditioning_min_rms,
+                max_gain=self._cfg.pre_vad_conditioning_max_gain,
+                peak_limit=self._cfg.audio_conditioning_peak_limit,
+            )
+            audio_conditioner = AudioConditioner(
+                enabled=self._cfg.audio_conditioning_enabled,
+                target_rms=self._cfg.audio_conditioning_target_rms,
+                min_rms_for_gain=self._cfg.audio_conditioning_min_rms,
+                max_gain=self._cfg.audio_conditioning_max_gain,
+                peak_limit=self._cfg.audio_conditioning_peak_limit,
+            )
             source_switched = False
+            weak_rescue_samples: list[np.ndarray] = []
+            weak_rescue_start_time: Optional[float] = None
+            weak_rescue_duration: float = 0.0
+            weak_rescue_last_attempt_end: float = -1_000_000.0
+
+            def clear_weak_rescue_buffer() -> None:
+                nonlocal weak_rescue_start_time, weak_rescue_duration
+                weak_rescue_samples.clear()
+                weak_rescue_start_time = None
+                weak_rescue_duration = 0.0
+                self._state.weak_rescue_buffer_seconds = 0.0
+
+            async def maybe_rescue_weak_speech(
+                *,
+                energy_chunk: AudioChunk,
+                prepared_chunk: AudioChunk,
+            ) -> None:
+                nonlocal weak_rescue_start_time, weak_rescue_duration, weak_rescue_last_attempt_end
+
+                if not self._cfg.weak_speech_rescue_enabled or self._asr_safeguard_active():
+                    clear_weak_rescue_buffer()
+                    return
+                if energy_chunk.samples.size == 0 or prepared_chunk.samples.size == 0:
+                    return
+
+                rms = float(np.sqrt(np.mean(energy_chunk.samples ** 2)))
+                if (
+                    rms < self._cfg.weak_speech_rescue_rms_min
+                    or rms > self._cfg.weak_speech_rescue_rms_max
+                ):
+                    clear_weak_rescue_buffer()
+                    return
+
+                if weak_rescue_start_time is None:
+                    weak_rescue_start_time = prepared_chunk.start_time
+                weak_rescue_samples.append(prepared_chunk.samples.astype(np.float32, copy=False).copy())
+                weak_rescue_duration += len(prepared_chunk.samples) / prepared_chunk.sample_rate
+                self._state.weak_rescue_buffer_seconds = weak_rescue_duration
+
+                if weak_rescue_duration < self._cfg.weak_speech_rescue_window_seconds:
+                    return
+
+                rescue_end = weak_rescue_start_time + weak_rescue_duration
+                if rescue_end - weak_rescue_last_attempt_end < self._cfg.weak_speech_rescue_cooldown_seconds:
+                    clear_weak_rescue_buffer()
+                    return
+
+                merged = np.concatenate(weak_rescue_samples).astype(np.float32, copy=False)
+                rescue_chunk = AudioChunk(
+                    samples=merged,
+                    sample_rate=prepared_chunk.sample_rate,
+                    start_time=weak_rescue_start_time,
+                )
+                before_count = len(self._state.segments) + len(self._state.pending_segments)
+                self._state.weak_rescue_attempts += 1
+                logger.info(
+                    "weak speech rescue attempt duration=%.2fs rms=%.5f start=%.2f",
+                    weak_rescue_duration,
+                    rms,
+                    weak_rescue_start_time,
+                )
+                clear_weak_rescue_buffer()
+                weak_rescue_last_attempt_end = rescue_end
+                await consume_asr_chunk(rescue_chunk)
+                after_count = len(self._state.segments) + len(self._state.pending_segments)
+                if after_count > before_count:
+                    self._state.weak_rescue_emitted += 1
 
             async def consume_asr_chunk(chunk: AudioChunk) -> None:
                 nonlocal accum_duration, accum_start_time, overlap_buf, accum_samples
@@ -407,6 +540,8 @@ class SessionManager:
                     await self._emit_session_progress_if_needed()
                     overlap_buf = np.zeros(0, dtype=np.float32)
                     return
+
+                merged = audio_conditioner.process_samples(merged)
     
                 # Prepend overlap tail from the previous window to recover words
                 # that would otherwise be cut at the chunk boundary.
@@ -416,7 +551,9 @@ class SessionManager:
                 asr_buf_start = buf_start - overlap_duration
     
                 prompt = self._cfg.vocabulary_hint or None
-                effective_lang = self._cfg.forced_language or self._state.locked_language
+                effective_lang = self._cfg.forced_language or (
+                    self._state.locked_language if self._cfg.language_lock_enabled else None
+                )
                 try:
                     segments = await self._transcribe_window(
                         loop,
@@ -523,7 +660,7 @@ class SessionManager:
                 if repetition_tripped:
                     overlap_buf = np.zeros(0, dtype=np.float32)
     
-                if self._cfg.forced_language is None and segments:
+                if self._cfg.language_lock_enabled and self._cfg.forced_language is None and segments:
                     batch_rep = next(
                         (s for s in segments if s.start_time >= overlap_duration and s.language != "unknown"),
                         None,
@@ -576,8 +713,17 @@ class SessionManager:
                         source_switched = True
                         break
 
-                    prepared_chunk = noise_reducer.process(raw_chunk)
-                    for chunk in pre_vad.push(prepared_chunk):
+                    energy_chunk = noise_reducer.process(raw_chunk)
+                    prepared_chunk = pre_vad_conditioner.process(energy_chunk)
+                    vad_chunks = pre_vad.push(prepared_chunk)
+                    if vad_chunks:
+                        clear_weak_rescue_buffer()
+                    else:
+                        await maybe_rescue_weak_speech(
+                            energy_chunk=energy_chunk,
+                            prepared_chunk=prepared_chunk,
+                        )
+                    for chunk in vad_chunks:
                         await consume_asr_chunk(chunk)
 
                     # Drain audio drop counter and emit error every 10 cumulative drops.
@@ -609,24 +755,38 @@ class SessionManager:
                 if accum_samples:
                     merged = np.concatenate(accum_samples)
                     sample_rate = source.sample_rate
-                    overlap_frames = int(self._cfg.asr_overlap_seconds * sample_rate)
-                    overlap_duration = len(overlap_buf) / sample_rate
-                    extended = np.concatenate([overlap_buf, merged]) if len(overlap_buf) > 0 else merged
-                    asr_buf_start = accum_start_time - overlap_duration
-                    prompt = self._cfg.vocabulary_hint or None
-                    effective_lang = self._cfg.forced_language or self._state.locked_language
-                    try:
-                        segments = await self._transcribe_window(
-                            loop,
-                            extended,
-                            sample_rate,
-                            prompt=prompt,
-                            forced_language=effective_lang,
+                    final_rms = float(np.sqrt(np.mean(merged ** 2)))
+                    if final_rms < self._cfg.silence_rms_threshold:
+                        self._state.elapsed_seconds = max(
+                            self._state.elapsed_seconds,
+                            accum_start_time + len(merged) / sample_rate,
                         )
-                    except Exception as exc:
-                        logger.warning("ASR failed on final flush, skipping: %s", exc)
-                        await self._emit("error", ErrorPayload(code="asr_error", message=str(exc)))
+                        await self._emit_session_progress_if_needed(force=True)
                         segments = []
+                        overlap_duration = 0.0
+                        asr_buf_start = accum_start_time
+                    else:
+                        merged = audio_conditioner.process_samples(merged)
+                        overlap_frames = int(self._cfg.asr_overlap_seconds * sample_rate)
+                        overlap_duration = len(overlap_buf) / sample_rate
+                        extended = np.concatenate([overlap_buf, merged]) if len(overlap_buf) > 0 else merged
+                        asr_buf_start = accum_start_time - overlap_duration
+                        prompt = self._cfg.vocabulary_hint or None
+                        effective_lang = self._cfg.forced_language or (
+                            self._state.locked_language if self._cfg.language_lock_enabled else None
+                        )
+                        try:
+                            segments = await self._transcribe_window(
+                                loop,
+                                extended,
+                                sample_rate,
+                                prompt=prompt,
+                                forced_language=effective_lang,
+                            )
+                        except Exception as exc:
+                            logger.warning("ASR failed on final flush, skipping: %s", exc)
+                            await self._emit("error", ErrorPayload(code="asr_error", message=str(exc)))
+                            segments = []
                     for asr_seg in segments:
                         if asr_seg.start_time < overlap_duration:
                             continue
@@ -699,19 +859,73 @@ class SessionManager:
 
     def _schedule_summary(self, coro) -> None:
         """Run a summary coroutine as a background task."""
+        if self._asr_safeguard_active():
+            coro.close()
+            return
         task = asyncio.create_task(coro)
         self._summary_tasks.add(task)
         task.add_done_callback(self._summary_tasks.discard)
 
     def _schedule_translation(self, coro) -> None:
+        self._trim_translation_backlog()
         task = asyncio.create_task(coro)
         self._translation_tasks.add(task)
+        self._translation_task_order.append(task)
         task.add_done_callback(self._translation_tasks.discard)
+        task.add_done_callback(self._forget_translation_task)
+
+    def _forget_translation_task(self, task: asyncio.Task[None]) -> None:
+        try:
+            self._translation_task_order.remove(task)
+        except ValueError:
+            pass
+
+    def _trim_translation_backlog(self) -> None:
+        max_pending = self._effective_translation_max_pending()
+        pending = [task for task in self._translation_task_order if not task.done()]
+        self._translation_task_order = pending
+        overflow = len(pending) - max_pending + 1
+        if overflow <= 0:
+            return
+        cancelled = 0
+        for task in pending:
+            if cancelled >= overflow:
+                break
+            if task.done():
+                continue
+            task.cancel()
+            cancelled += 1
+        if cancelled:
+            self._state.translation_backlog_trim_total += cancelled
+            logger.info(
+                "translation backlog trimmed: cancelled %d stale task(s), pending=%d max=%d",
+                cancelled,
+                len(pending),
+                max_pending,
+            )
+
+    def _effective_translation_max_pending(self) -> int:
+        max_pending = max(1, self._cfg.live_translation_max_pending)
+        if self._asr_safeguard_active():
+            return max(1, min(max_pending, self._cfg.live_translation_safeguard_max_pending))
+        return max_pending
+
+    def _prune_background_task_lists(self) -> None:
+        self._translation_task_order = [
+            task for task in self._translation_task_order if not task.done()
+        ]
+        self._summary_tasks = {task for task in self._summary_tasks if not task.done()}
 
     def _backfill_live_translations(self) -> None:
         if self._cfg.live_translation_language is None:
             return
-        for seg in self._state.segments[-200:]:
+        limit = max(0, self._cfg.live_translation_backfill_limit)
+        if limit == 0:
+            return
+        # Prefer the newest segments first. If the user turns subtitles on after
+        # a long meeting, we must not enqueue hundreds of stale translations in
+        # front of the live tail.
+        for seg in reversed(self._state.segments[-limit:]):
             self._schedule_translation(self._translate_segment(seg, self._cfg.live_translation_language))
 
     async def _emit_session_progress_if_needed(self, *, force: bool = False) -> None:
@@ -737,6 +951,55 @@ class SessionManager:
             )
         return hard_cap
 
+    def _asr_safeguard_active(self) -> bool:
+        return self._cfg.asr_safeguard_enabled and self._state.asr_safeguard_cooldown_windows > 0
+
+    def _record_asr_timing(self, *, audio_seconds: float, wall_seconds: float, phase: str) -> None:
+        self._state.asr_last_audio_seconds = audio_seconds
+        self._state.asr_last_wall_seconds = wall_seconds
+        rtf = wall_seconds / max(audio_seconds, 1e-6)
+        self._state.asr_realtime_factor = rtf
+
+        if not self._cfg.asr_safeguard_enabled:
+            return
+
+        threshold = max(0.1, self._cfg.asr_safeguard_rtf_threshold)
+        if rtf >= threshold:
+            was_active = self._asr_safeguard_active()
+            self._state.asr_safeguard_cooldown_windows = max(
+                1,
+                self._cfg.asr_safeguard_cooldown_windows,
+            )
+            self._state.asr_safeguard_reason = (
+                f"ASR realtime factor {rtf:.2f} exceeded {threshold:.2f} during {phase}"
+            )
+            if not was_active:
+                self._state.asr_safeguard_events += 1
+                logger.warning(
+                    "ASR safeguard enabled rtf=%.2f wall=%.2fs audio=%.2fs phase=%s",
+                    rtf,
+                    wall_seconds,
+                    audio_seconds,
+                    phase,
+                )
+                asyncio.create_task(self._emit(
+                    "error",
+                    ErrorPayload(
+                        code="asr_safeguard",
+                        message=(
+                            "ASR is close to falling behind realtime; "
+                            "temporarily skipping retry/old translations"
+                        ),
+                    ),
+                ))
+            return
+
+        if self._state.asr_safeguard_cooldown_windows > 0:
+            self._state.asr_safeguard_cooldown_windows -= 1
+            if self._state.asr_safeguard_cooldown_windows <= 0:
+                logger.info("ASR safeguard cleared rtf=%.2f", rtf)
+                self._state.asr_safeguard_reason = None
+
     def _log_accumulation_flush_reason(
         self,
         accum_duration: float,
@@ -750,6 +1013,15 @@ class SessionManager:
         )
         if accum_duration > hard_cap_seconds:
             self._state.last_backpressure_elapsed_seconds = self._state.elapsed_seconds
+            if self._cfg.asr_safeguard_enabled:
+                self._state.asr_safeguard_cooldown_windows = max(
+                    1,
+                    self._cfg.asr_safeguard_cooldown_windows,
+                )
+                self._state.asr_safeguard_reason = (
+                    f"audio accumulation exceeded {hard_cap_seconds:.1f}s"
+                )
+                self._state.asr_safeguard_events += 1
             logger.warning(
                 "real_backpressure_or_slow_asr accumulation=%.1fs threshold=%.1fs hard_cap=%.1fs — forcing flush",
                 accum_duration,
@@ -818,6 +1090,8 @@ class SessionManager:
         prompt: Optional[str],
         forced_language: Optional[str],
     ):
+        audio_seconds = len(samples) / sample_rate
+        start = time.perf_counter()
         segments = await loop.run_in_executor(
             self._asr_executor,
             lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
@@ -829,8 +1103,19 @@ class SessionManager:
                 quality_preset="realtime",
             ),
         )
-        if any(self._classify_asr_segment(seg) == "retry" for seg in segments):
+        realtime_wall = time.perf_counter() - start
+        self._record_asr_timing(
+            audio_seconds=audio_seconds,
+            wall_seconds=realtime_wall,
+            phase="realtime",
+        )
+        if (
+            self._cfg.asr_retry_enabled
+            and not self._asr_safeguard_active()
+            and any(self._classify_asr_segment(seg) == "retry" for seg in segments)
+        ):
             logger.info("retrying ASR window with higher-quality preset")
+            retry_start = time.perf_counter()
             retry_segments = await loop.run_in_executor(
                 self._asr_executor,
                 lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
@@ -841,6 +1126,12 @@ class SessionManager:
                     initial_prompt=p,
                     quality_preset="retry",
                 ),
+            )
+            retry_wall = time.perf_counter() - retry_start
+            self._record_asr_timing(
+                audio_seconds=audio_seconds,
+                wall_seconds=realtime_wall + retry_wall,
+                phase="retry",
             )
             self._log_retry_outcome(segments, retry_segments)
             return retry_segments

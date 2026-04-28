@@ -53,7 +53,7 @@ def _recommended_summary_executor_workers() -> int:
 
 
 def _recommended_translation_executor_workers() -> int:
-    return 1
+    return 2
 
 
 def _env_float(name: str, default: float) -> float:
@@ -97,20 +97,47 @@ async def lifespan(app: FastAPI):
     storage = Storage(Path(os.environ.get("MEETINGBRO_DB", str(DEFAULT_DB_PATH))))
     asr = FasterWhisperAdapter(
         model_size=os.environ.get("MEETINGBRO_WHISPER_SIZE", "medium"),
+        device=os.environ.get("MEETINGBRO_WHISPER_DEVICE", "cpu"),
+        compute_type=os.environ.get("MEETINGBRO_WHISPER_COMPUTE_TYPE", "int8"),
         beam_size=_env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 3),
+        cpu_threads=_env_int("MEETINGBRO_WHISPER_CPU_THREADS", 0),
+        num_workers=_env_int("MEETINGBRO_WHISPER_NUM_WORKERS", 1),
+        vad_threshold=_env_float("MEETINGBRO_WHISPER_VAD_THRESHOLD", 0.3),
+        vad_min_speech_ms=_env_int("MEETINGBRO_WHISPER_VAD_MIN_SPEECH_MS", 100),
+        vad_min_silence_ms=_env_int("MEETINGBRO_WHISPER_VAD_MIN_SILENCE_MS", 300),
+        vad_speech_pad_ms=_env_int("MEETINGBRO_WHISPER_VAD_SPEECH_PAD_MS", 400),
+        multilingual=_env_bool("MEETINGBRO_WHISPER_MULTILINGUAL", False),
+        language_detection_threshold=_env_float("MEETINGBRO_WHISPER_LANGUAGE_DETECTION_THRESHOLD", 0.5),
+        language_detection_segments=_env_int("MEETINGBRO_WHISPER_LANGUAGE_DETECTION_SEGMENTS", 1),
     )
     app.state.storage = storage
     app.state.asr = asr
     logger.info(
-        "MeetingBro backend starting db=%s whisper_size=%s beam=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f denoise=%s pre_vad=%s suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d",
+        "MeetingBro backend starting db=%s whisper_size=%s whisper_device=%s compute=%s beam=%d cpu_threads=%d whisper_workers=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f audio_conditioning=%s denoise=%s pre_vad=%s pre_vad_conditioning=%s pre_vad_threshold=%.2f pre_vad_energy_rms=%.4f pre_vad_max=%.1fs weak_rescue=%s weak_rescue_rms=%.4f..%.4f language_lock=%s asr_retry=%s asr_safeguard=%s safeguard_rtf=%.2f suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d translation_backfill=%d translation_max_pending=%d",
         storage._db_path,
         os.environ.get("MEETINGBRO_WHISPER_SIZE", "medium"),
+        os.environ.get("MEETINGBRO_WHISPER_DEVICE", "cpu"),
+        os.environ.get("MEETINGBRO_WHISPER_COMPUTE_TYPE", "int8"),
         _env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 3),
+        _env_int("MEETINGBRO_WHISPER_CPU_THREADS", 0),
+        _env_int("MEETINGBRO_WHISPER_NUM_WORKERS", 1),
         _env_float("MEETINGBRO_CHUNK_SECONDS", 2.5),
         _env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 2.5),
         _env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.002),
+        _env_bool("MEETINGBRO_AUDIO_CONDITIONING_ENABLED", True),
         _env_bool("MEETINGBRO_DENOISE_ENABLED", False),
         _env_bool("MEETINGBRO_PRE_VAD_ENABLED", True),
+        _env_bool("MEETINGBRO_PRE_VAD_CONDITIONING_ENABLED", True),
+        _env_float("MEETINGBRO_PRE_VAD_THRESHOLD", 0.38),
+        _env_float("MEETINGBRO_PRE_VAD_ENERGY_RMS_THRESHOLD", 0.005),
+        _env_float("MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS", 8.0),
+        _env_bool("MEETINGBRO_WEAK_SPEECH_RESCUE_ENABLED", True),
+        _env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MIN", 0.0008),
+        _env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MAX", 0.02),
+        _env_bool("MEETINGBRO_LANGUAGE_LOCK_ENABLED", False),
+        _env_bool("MEETINGBRO_ASR_RETRY_ENABLED", True),
+        _env_bool("MEETINGBRO_ASR_SAFEGUARD_ENABLED", True),
+        _env_float("MEETINGBRO_ASR_SAFEGUARD_RTF_THRESHOLD", 0.9),
         _env_float("MEETINGBRO_SUSPICIOUS_SEGMENT_NO_SPEECH_PROB", 0.6),
         _env_float("MEETINGBRO_SUSPICIOUS_SEGMENT_AVG_LOGPROB", -0.9),
         _env_float("MEETINGBRO_SUSPICIOUS_SEGMENT_COMPRESSION_RATIO", 2.1),
@@ -121,6 +148,8 @@ async def lifespan(app: FastAPI):
         _env_int("MEETINGBRO_ASR_EXECUTOR_WORKERS", _recommended_asr_executor_workers()),
         _env_int("MEETINGBRO_SUMMARY_EXECUTOR_WORKERS", _recommended_summary_executor_workers()),
         _env_int("MEETINGBRO_TRANSLATION_EXECUTOR_WORKERS", _recommended_translation_executor_workers()),
+        _env_int("MEETINGBRO_LIVE_TRANSLATION_BACKFILL_LIMIT", 20),
+        _env_int("MEETINGBRO_LIVE_TRANSLATION_MAX_PENDING", 12),
     )
     try:
         yield
@@ -274,15 +303,39 @@ async def session_ws(
             "MEETINGBRO_SUSPICIOUS_SEGMENT_COMPRESSION_RATIO",
             2.1,
         ),
+        asr_retry_enabled=_env_bool("MEETINGBRO_ASR_RETRY_ENABLED", True),
+        asr_safeguard_enabled=_env_bool("MEETINGBRO_ASR_SAFEGUARD_ENABLED", True),
+        asr_safeguard_rtf_threshold=_env_float("MEETINGBRO_ASR_SAFEGUARD_RTF_THRESHOLD", 0.9),
+        asr_safeguard_cooldown_windows=_env_int("MEETINGBRO_ASR_SAFEGUARD_COOLDOWN_WINDOWS", 5),
         denoise_enabled=_env_bool("MEETINGBRO_DENOISE_ENABLED", False),
         denoise_strength=_env_float("MEETINGBRO_DENOISE_STRENGTH", 1.1),
         denoise_noise_update_rms_threshold=_env_float(
             "MEETINGBRO_DENOISE_NOISE_UPDATE_RMS_THRESHOLD",
             0.02,
         ),
+        audio_conditioning_enabled=_env_bool("MEETINGBRO_AUDIO_CONDITIONING_ENABLED", True),
+        audio_conditioning_target_rms=_env_float("MEETINGBRO_AUDIO_CONDITIONING_TARGET_RMS", 0.035),
+        audio_conditioning_min_rms=_env_float("MEETINGBRO_AUDIO_CONDITIONING_MIN_RMS", 0.003),
+        audio_conditioning_max_gain=_env_float("MEETINGBRO_AUDIO_CONDITIONING_MAX_GAIN", 2.5),
+        audio_conditioning_peak_limit=_env_float("MEETINGBRO_AUDIO_CONDITIONING_PEAK_LIMIT", 0.98),
         pre_vad_enabled=_env_bool("MEETINGBRO_PRE_VAD_ENABLED", True),
+        pre_vad_conditioning_enabled=_env_bool("MEETINGBRO_PRE_VAD_CONDITIONING_ENABLED", True),
+        pre_vad_conditioning_target_rms=_env_float("MEETINGBRO_PRE_VAD_CONDITIONING_TARGET_RMS", 0.03),
+        pre_vad_conditioning_min_rms=_env_float("MEETINGBRO_PRE_VAD_CONDITIONING_MIN_RMS", 0.001),
+        pre_vad_conditioning_max_gain=_env_float("MEETINGBRO_PRE_VAD_CONDITIONING_MAX_GAIN", 4.0),
+        pre_vad_threshold=_env_float("MEETINGBRO_PRE_VAD_THRESHOLD", 0.38),
+        pre_vad_energy_rms_threshold=_env_float("MEETINGBRO_PRE_VAD_ENERGY_RMS_THRESHOLD", 0.005),
         pre_vad_trailing_silence_seconds=_env_float("MEETINGBRO_PRE_VAD_TRAILING_SILENCE_SECONDS", 0.45),
-        pre_vad_max_segment_seconds=_env_float("MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS", 12.0),
+        pre_vad_max_segment_seconds=_env_float("MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS", 8.0),
+        weak_speech_rescue_enabled=_env_bool("MEETINGBRO_WEAK_SPEECH_RESCUE_ENABLED", True),
+        weak_speech_rescue_rms_min=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MIN", 0.0008),
+        weak_speech_rescue_rms_max=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MAX", 0.02),
+        weak_speech_rescue_window_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_WINDOW_SECONDS", 6.0),
+        weak_speech_rescue_cooldown_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_COOLDOWN_SECONDS", 8.0),
+        language_lock_enabled=_env_bool("MEETINGBRO_LANGUAGE_LOCK_ENABLED", False),
+        live_translation_backfill_limit=_env_int("MEETINGBRO_LIVE_TRANSLATION_BACKFILL_LIMIT", 20),
+        live_translation_max_pending=_env_int("MEETINGBRO_LIVE_TRANSLATION_MAX_PENDING", 12),
+        live_translation_safeguard_max_pending=_env_int("MEETINGBRO_LIVE_TRANSLATION_SAFEGUARD_MAX_PENDING", 4),
         asr_executor_workers=_env_int(
             "MEETINGBRO_ASR_EXECUTOR_WORKERS",
             _recommended_asr_executor_workers(),

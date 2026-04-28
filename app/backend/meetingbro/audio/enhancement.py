@@ -107,3 +107,59 @@ class AdaptiveNoiseReducer:
         except Exception as exc:
             logger.debug("noise reduction skipped for chunk: %s", exc)
             return chunk
+
+
+class AudioConditioner:
+    """Small ASR-facing level conditioner.
+
+    The intent is to remove DC offset, gently lift quiet valid speech, and keep
+    peaks below clipping before speech detection or Whisper sees the buffer.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        target_rms: float = 0.035,
+        min_rms_for_gain: float = 0.003,
+        max_gain: float = 2.5,
+        peak_limit: float = 0.98,
+        remove_dc: bool = True,
+    ) -> None:
+        self._enabled = enabled
+        self._target_rms = max(0.0, target_rms)
+        self._min_rms_for_gain = max(0.0, min_rms_for_gain)
+        self._max_gain = max(1.0, max_gain)
+        self._peak_limit = min(1.0, max(0.1, peak_limit))
+        self._remove_dc = remove_dc
+
+    def process(self, chunk: AudioChunk) -> AudioChunk:
+        processed = self.process_samples(chunk.samples)
+        if processed is chunk.samples:
+            return chunk
+        return AudioChunk(
+            samples=processed,
+            sample_rate=chunk.sample_rate,
+            start_time=chunk.start_time,
+        )
+
+    def process_samples(self, samples: np.ndarray) -> np.ndarray:
+        if not self._enabled or samples.size == 0:
+            return samples
+
+        out = samples.astype(np.float32, copy=False)
+        if self._remove_dc:
+            # Capture devices can have a small DC bias; Whisper and RMS gates do
+            # better when the waveform is centered around zero.
+            out = out - np.float32(np.mean(out))
+
+        rms = float(np.sqrt(np.mean(out ** 2)))
+        if self._target_rms > 0.0 and rms >= self._min_rms_for_gain and rms < self._target_rms:
+            gain = min(self._max_gain, self._target_rms / max(rms, 1e-8))
+            out = out * np.float32(gain)
+
+        peak = float(np.max(np.abs(out))) if out.size else 0.0
+        if peak > self._peak_limit:
+            out = out * np.float32(self._peak_limit / max(peak, 1e-8))
+
+        return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)

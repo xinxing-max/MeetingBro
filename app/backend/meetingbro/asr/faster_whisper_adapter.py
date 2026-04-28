@@ -38,11 +38,29 @@ class FasterWhisperAdapter(ASRAdapter):
         device: str = "cpu",
         compute_type: str = "int8",
         beam_size: int = 3,
+        cpu_threads: int = 0,
+        num_workers: int = 1,
+        vad_threshold: float = 0.3,
+        vad_min_speech_ms: int = 100,
+        vad_min_silence_ms: int = 300,
+        vad_speech_pad_ms: int = 400,
+        multilingual: bool = False,
+        language_detection_threshold: float = 0.5,
+        language_detection_segments: int = 1,
     ) -> None:
         self._model_size = model_size
         self._device = device
         self._compute_type = compute_type
         self._beam_size = beam_size
+        self._cpu_threads = max(0, cpu_threads)
+        self._num_workers = max(1, num_workers)
+        self._vad_threshold = vad_threshold
+        self._vad_min_speech_ms = max(0, vad_min_speech_ms)
+        self._vad_min_silence_ms = max(0, vad_min_silence_ms)
+        self._vad_speech_pad_ms = max(0, vad_speech_pad_ms)
+        self._multilingual = multilingual
+        self._language_detection_threshold = language_detection_threshold
+        self._language_detection_segments = max(1, language_detection_segments)
         self._model = None  # lazy
 
     def _ensure_model(self):
@@ -50,13 +68,19 @@ class FasterWhisperAdapter(ASRAdapter):
             from faster_whisper import WhisperModel
 
             logger.info(
-                "loading faster-whisper model size=%s device=%s compute=%s",
-                self._model_size, self._device, self._compute_type,
+                "loading faster-whisper model size=%s device=%s compute=%s cpu_threads=%d num_workers=%d",
+                self._model_size,
+                self._device,
+                self._compute_type,
+                self._cpu_threads,
+                self._num_workers,
             )
             self._model = WhisperModel(
                 self._model_size,
                 device=self._device,
                 compute_type=self._compute_type,
+                cpu_threads=self._cpu_threads,
+                num_workers=self._num_workers,
             )
         return self._model
 
@@ -85,15 +109,18 @@ class FasterWhisperAdapter(ASRAdapter):
             initial_prompt=initial_prompt or None,
             vad_filter=True,
             vad_parameters=dict(
-                threshold=0.3,
-                min_speech_duration_ms=100,
-                min_silence_duration_ms=300,
-                speech_pad_ms=400,
+                threshold=self._vad_threshold,
+                min_speech_duration_ms=self._vad_min_speech_ms,
+                min_silence_duration_ms=self._vad_min_silence_ms,
+                speech_pad_ms=self._vad_speech_pad_ms,
             ),
             temperature=0.0,
             condition_on_previous_text=False,
             no_repeat_ngram_size=3,
             word_timestamps=False,
+            multilingual=self._multilingual,
+            language_detection_threshold=self._language_detection_threshold,
+            language_detection_segments=self._language_detection_segments,
         )
         if quality_preset == "retry":
             transcribe_kwargs.update(

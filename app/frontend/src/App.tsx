@@ -64,6 +64,11 @@ function formatGain(value: number | null | undefined): string {
   return `${value.toFixed(2)}x`;
 }
 
+function formatRtf(value: number | null | undefined): string {
+  if (value == null) return "???";
+  return `${value.toFixed(2)}x`;
+}
+
 function getGainTone(
   effectiveMicrophoneGain: number | null | undefined,
   baseMicrophoneGain: number | null | undefined,
@@ -301,6 +306,18 @@ export default function App() {
   const retryImproved = sessionStats?.retry_windows_improved ?? 0;
   const retryUnchanged = sessionStats?.retry_windows_unchanged ?? 0;
   const retryDiverged = sessionStats?.retry_windows_diverged ?? 0;
+  const asrRealtimeFactor = sessionStats?.asr_realtime_factor ?? null;
+  const asrWallSeconds = sessionStats?.asr_last_wall_seconds ?? null;
+  const asrAudioSeconds = sessionStats?.asr_last_audio_seconds ?? null;
+  const asrSafeguardActive = sessionStats?.asr_safeguard_active ?? false;
+  const asrSafeguardEvents = sessionStats?.asr_safeguard_events ?? 0;
+  const weakRescueAttempts = sessionStats?.weak_rescue_attempts ?? 0;
+  const weakRescueEmitted = sessionStats?.weak_rescue_emitted ?? 0;
+  const weakRescueBufferSeconds = sessionStats?.weak_rescue_buffer_seconds ?? 0;
+  const translationPendingCount = sessionStats?.translation_pending_count ?? 0;
+  const summaryPendingCount = sessionStats?.summary_pending_count ?? 0;
+  const translationTrimTotal = sessionStats?.translation_backlog_trim_total ?? 0;
+  const audioDropTotal = sessionStats?.audio_drop_total ?? 0;
   const delayTone = getDelayTone(transcriptLagSeconds);
   const activeSource = sessionStats?.source ?? source;
   const mixedMicGain = sessionStats?.mixed_microphone_gain ?? null;
@@ -626,6 +643,41 @@ export default function App() {
               <span className="diagnostic-label">Retry Summary</span>
               <strong className="diagnostic-value">{retryTotal}</strong>
               <span className="diagnostic-note">improved {retryImproved} · unchanged {retryUnchanged} · diverged {retryDiverged}</span>
+            </div>
+            <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : (asrRealtimeFactor != null && asrRealtimeFactor > 0.8 ? "warn" : "ok")}`}>
+              <span className="diagnostic-label">ASR Realtime</span>
+              <strong className="diagnostic-value">{formatRtf(asrRealtimeFactor)}</strong>
+              <span className="diagnostic-note">
+                audio {formatLagSeconds(asrAudioSeconds)} ? ASR {formatLagSeconds(asrWallSeconds)}
+              </span>
+            </div>
+            <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : "ok"}`}>
+              <span className="diagnostic-label">Realtime Safeguard</span>
+              <strong className="diagnostic-value">{asrSafeguardActive ? "active" : "clear"}</strong>
+              <span className="diagnostic-note">
+                {asrSafeguardActive
+                  ? (sessionStats?.asr_safeguard_reason ?? "protecting realtime path")
+                  : `events ${asrSafeguardEvents}`}
+              </span>
+            </div>
+            <div className="diagnostic-card">
+              <span className="diagnostic-label">Weak Voice Rescue</span>
+              <strong className="diagnostic-value">{weakRescueAttempts}</strong>
+              <span className="diagnostic-note">
+                emitted {weakRescueEmitted} · buffer {formatLagSeconds(weakRescueBufferSeconds)}
+              </span>
+            </div>
+            <div className="diagnostic-card">
+              <span className="diagnostic-label">Background Queue</span>
+              <strong className="diagnostic-value">{translationPendingCount + summaryPendingCount}</strong>
+              <span className="diagnostic-note">
+                translations {translationPendingCount} ? summaries {summaryPendingCount} ? trims {translationTrimTotal}
+              </span>
+            </div>
+            <div className="diagnostic-card">
+              <span className="diagnostic-label">Audio Drops</span>
+              <strong className="diagnostic-value">{audioDropTotal}</strong>
+              <span className="diagnostic-note">capture queue dropped chunks</span>
             </div>
             <div className="diagnostic-card">
               <span className="diagnostic-label">Backpressure</span>

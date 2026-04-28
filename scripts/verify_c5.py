@@ -32,7 +32,16 @@ class SequenceASR:
     def __init__(self):
         self.call_idx = 0
 
-    def transcribe(self, samples, sample_rate, *, forced_language=None, offset_seconds=0.0, initial_prompt=None):
+    def transcribe(
+        self,
+        samples,
+        sample_rate,
+        *,
+        forced_language=None,
+        offset_seconds=0.0,
+        initial_prompt=None,
+        quality_preset="realtime",
+    ):
         if self.call_idx >= len(_LANG_SEQUENCE):
             return []
         lang = _LANG_SEQUENCE[self.call_idx]
@@ -107,6 +116,8 @@ async def run_test():
         asr_accumulation_seconds=2.4,   # just under 2.5 s so each 2.5 s chunk flushes
         silence_rms_threshold=0.0,      # never skip
         asr_overlap_seconds=0.5,
+        pre_vad_enabled=False,
+        language_lock_enabled=True,
     )
 
     mgr = SessionManager(cfg)

@@ -104,13 +104,18 @@ class PreVadSegmenter:
         sample_rate: int,
         detector: Optional[SpeechDetector] = None,
         enabled: bool = True,
+        detector_threshold: float = 0.38,
+        detector_energy_rms_threshold: float = 0.005,
         pre_speech_pad_ms: int = 120,
         post_speech_pad_ms: int = 220,
         trailing_silence_seconds: float = 0.45,
         max_segment_seconds: float = 12.0,
     ) -> None:
         self._sample_rate = sample_rate
-        self._detector = detector or SileroSpeechDetector()
+        self._detector = detector or SileroSpeechDetector(
+            threshold=detector_threshold,
+            energy_rms_threshold=detector_energy_rms_threshold,
+        )
         self._enabled = enabled
         self._pre_speech_pad_frames = int(sample_rate * pre_speech_pad_ms / 1000)
         self._post_speech_pad_frames = int(sample_rate * post_speech_pad_ms / 1000)
@@ -133,16 +138,14 @@ class PreVadSegmenter:
             end_frame = min(len(chunk.samples), spans[-1].end_frame + self._post_speech_pad_frames)
             trimmed = chunk.samples[start_frame:end_frame]
             if trimmed.size > 0:
-                if self._pending_start_time is None:
-                    self._pending_start_time = chunk.start_time + start_frame / chunk.sample_rate
-                    self._pending_samples.clear()
-                self._pending_samples.append(trimmed.astype(np.float32, copy=False).copy())
+                out.extend(
+                    self._append_speech_samples(
+                        trimmed.astype(np.float32, copy=False),
+                        chunk.start_time + start_frame / chunk.sample_rate,
+                    )
+                )
                 speech_end_seconds = end_frame / chunk.sample_rate
                 self._silence_after_speech_seconds = max(0.0, chunk_duration - speech_end_seconds)
-                if self._pending_duration_seconds() >= self._max_segment_seconds:
-                    flushed = self._flush_pending()
-                    if flushed is not None:
-                        out.append(flushed)
         elif self._pending_samples:
             self._silence_after_speech_seconds += chunk_duration
 
@@ -161,6 +164,41 @@ class PreVadSegmenter:
         if not self._pending_samples:
             return 0.0
         return sum(len(part) for part in self._pending_samples) / self._sample_rate
+
+    def _pending_frame_count(self) -> int:
+        return sum(len(part) for part in self._pending_samples)
+
+    def _append_speech_samples(self, samples: np.ndarray, start_time: float) -> list[AudioChunk]:
+        out: list[AudioChunk] = []
+        if samples.size == 0:
+            return out
+
+        max_frames = max(1, int(self._max_segment_seconds * self._sample_rate))
+        offset = 0
+        while offset < len(samples):
+            if self._pending_start_time is None:
+                self._pending_start_time = start_time + offset / self._sample_rate
+                self._pending_samples.clear()
+
+            remaining = max_frames - self._pending_frame_count()
+            if remaining <= 0:
+                flushed = self._flush_pending()
+                if flushed is not None:
+                    out.append(flushed)
+                continue
+
+            take = min(remaining, len(samples) - offset)
+            if take <= 0:
+                break
+            self._pending_samples.append(samples[offset : offset + take].copy())
+            offset += take
+
+            if self._pending_frame_count() >= max_frames:
+                flushed = self._flush_pending()
+                if flushed is not None:
+                    out.append(flushed)
+
+        return out
 
     def _flush_pending(self) -> Optional[AudioChunk]:
         if not self._pending_samples or self._pending_start_time is None:

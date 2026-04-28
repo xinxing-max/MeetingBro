@@ -152,13 +152,69 @@ $env:MEETINGBRO_LLM_MODEL="LongCat-Flash-Chat"
 If no cloud key is configured, the backend falls back to local heuristic
 summaries and passthrough translation markers.
 
-Whisper model size is configurable. The backend default is `base`; use `small`
-or `medium` for better multilingual Chinese/English/German recognition when
-CPU speed is acceptable:
+Whisper model size is configurable. The backend default is `medium`; use
+`small` for lower CPU usage or keep/increase `medium` for better multilingual
+Chinese/English/German recognition when CPU speed is acceptable:
 
 ```powershell
 $env:MEETINGBRO_WHISPER_SIZE="small"
 ```
+
+## ASR performance / robustness tuning
+
+The default path is conservative: local Whisper on CPU, pre-ASR VAD enabled,
+light audio conditioning enabled, and language lock disabled so mixed
+Chinese/English/German meetings can be auto-detected segment by segment.
+
+Useful local `.env` options:
+
+```text
+# Faster or GPU-capable machines
+MEETINGBRO_WHISPER_SIZE=medium
+MEETINGBRO_WHISPER_DEVICE=cpu
+MEETINGBRO_WHISPER_COMPUTE_TYPE=int8
+MEETINGBRO_WHISPER_CPU_THREADS=0
+MEETINGBRO_WHISPER_NUM_WORKERS=1
+
+# Noise / interruption handling
+MEETINGBRO_AUDIO_CONDITIONING_ENABLED=true
+MEETINGBRO_AUDIO_CONDITIONING_TARGET_RMS=0.035
+MEETINGBRO_PRE_VAD_ENABLED=true
+MEETINGBRO_PRE_VAD_CONDITIONING_ENABLED=true
+MEETINGBRO_PRE_VAD_CONDITIONING_TARGET_RMS=0.03
+MEETINGBRO_PRE_VAD_CONDITIONING_MIN_RMS=0.001
+MEETINGBRO_PRE_VAD_CONDITIONING_MAX_GAIN=4.0
+MEETINGBRO_PRE_VAD_THRESHOLD=0.38
+MEETINGBRO_PRE_VAD_ENERGY_RMS_THRESHOLD=0.005
+MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS=8
+MEETINGBRO_WEAK_SPEECH_RESCUE_ENABLED=true
+MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MIN=0.0008
+MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MAX=0.02
+MEETINGBRO_WEAK_SPEECH_RESCUE_WINDOW_SECONDS=6
+MEETINGBRO_WEAK_SPEECH_RESCUE_COOLDOWN_SECONDS=8
+MEETINGBRO_WHISPER_VAD_THRESHOLD=0.3
+MEETINGBRO_ASR_RETRY_ENABLED=true
+MEETINGBRO_ASR_SAFEGUARD_ENABLED=true
+MEETINGBRO_ASR_SAFEGUARD_RTF_THRESHOLD=0.9
+MEETINGBRO_ASR_SAFEGUARD_COOLDOWN_WINDOWS=5
+
+# Mixed-language meetings: keep false unless one dominant language should be forced
+MEETINGBRO_LANGUAGE_LOCK_ENABLED=false
+
+# Live subtitle translation: keep newest segments responsive
+MEETINGBRO_TRANSLATION_EXECUTOR_WORKERS=2
+MEETINGBRO_LIVE_TRANSLATION_BACKFILL_LIMIT=20
+MEETINGBRO_LIVE_TRANSLATION_MAX_PENDING=12
+MEETINGBRO_LIVE_TRANSLATION_SAFEGUARD_MAX_PENDING=4
+```
+
+For noisy rooms, try slightly increasing `MEETINGBRO_WHISPER_VAD_THRESHOLD`
+(`0.35`â€“`0.45`). For very quiet speakers, prefer raising microphone/system
+gain first; then lower `MEETINGBRO_PRE_VAD_THRESHOLD` toward `0.3` and
+`MEETINGBRO_WHISPER_VAD_THRESHOLD` toward `0.25`. If realtime transcription
+falls behind on CPU, try `MEETINGBRO_WHISPER_SIZE=small`, reduce
+`MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS` to `4`, or temporarily set
+`MEETINGBRO_ASR_RETRY_ENABLED=false`.
 
 You may also put the same settings in a project-root `.env` file. Both dotenv
 syntax and PowerShell-style syntax are accepted:

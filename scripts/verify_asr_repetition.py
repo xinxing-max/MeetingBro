@@ -67,7 +67,8 @@ class _LoopingMockASR(ASRAdapter):
         self.calls = 0
 
     def transcribe(self, samples, sample_rate, *, forced_language=None,
-                   offset_seconds=0.0, initial_prompt=None):
+                   offset_seconds=0.0, initial_prompt=None,
+                   quality_preset="realtime"):
         self.calls += 1
         # Always emit the same hallucinated text for the first 17 calls.
         if self.calls <= 17:
@@ -122,6 +123,7 @@ async def main() -> int:
                 asr_accumulation_seconds=2.5,
                 silence_rms_threshold=0.0,  # disable for the synthetic test
                 asr_overlap_seconds=0.5,
+                pre_vad_enabled=False,
             )
             manager = SessionManager(config)
             collected: dict[str, list[dict]] = {
