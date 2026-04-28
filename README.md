@@ -216,6 +216,25 @@ falls behind on CPU, try `MEETINGBRO_WHISPER_SIZE=small`, reduce
 `MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS` to `4`, or temporarily set
 `MEETINGBRO_ASR_RETRY_ENABLED=false`.
 
+## ASR benchmark
+
+Use the local ASR benchmark before/after tuning so accuracy and realtime changes
+are visible instead of purely subjective. The benchmark is LLM-free: it does not
+call LongCat/OpenAI for summary or translation.
+
+```powershell
+python scripts\benchmark_asr.py data\sample_en.wav --language en
+python scripts\benchmark_asr.py data\*.wav --language auto --model-size small --json-out exports\asr_benchmark.json
+python scripts\benchmark_asr.py data\sample_en.wav --keywords Alice Bob budget timeline
+```
+
+Important columns:
+- `rtf`: total pipeline wall time divided by audio duration; lower is faster.
+- `asr_rtf`: latest ASR window realtime factor.
+- `safe`: ASR safeguard trigger count.
+- `rescue`: weak-voice rescue emitted/attempted count.
+- `kw`: matched/expected keyword count when `--keywords` is provided.
+
 You may also put the same settings in a project-root `.env` file. Both dotenv
 syntax and PowerShell-style syntax are accepted:
 
