@@ -421,6 +421,7 @@ class SessionManager:
             content=content,
             source_type=source_type,
             source_id=source_id,
+            time_seconds=self._state.elapsed_seconds if source_type == "bookmark" else None,
             created_at=datetime.now(tz=timezone.utc),
         )
         self._cfg.storage.insert_note(note)

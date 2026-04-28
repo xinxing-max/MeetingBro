@@ -67,6 +67,7 @@ class Note(BaseModel):
     content: str
     source_type: Optional[str] = None
     source_id: Optional[str] = None
+    time_seconds: Optional[float] = None
     created_at: datetime
 
 

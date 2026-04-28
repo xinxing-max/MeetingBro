@@ -296,7 +296,7 @@ export default function App() {
   const [lastExport, setLastExport] = useState<ExportMeetingResponse | null>(null);
   const [exportRoot, setExportRoot] = useState<string>("");
   const [exporting, setExporting] = useState(false);
-  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, latestByType, historyByType, notes, lastError, saveNote, applyVocabulary, exportMeeting, stopSession } =
+  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, stopSession } =
     useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage, runtimeProfile });
 
   const rolling = latestByType.rolling_summary;
@@ -655,6 +655,13 @@ export default function App() {
     window.localStorage.setItem(VOCABULARY_STORAGE_KEY, vocabulary);
     applyVocabulary(vocabulary);
   };
+  const handleBookmark = async () => {
+    const label = window.prompt("Bookmark label (optional)", "");
+    if (label === null) {
+      return;
+    }
+    await saveBookmark(label);
+  };
   const vocabularyHint = sessionEnabled
     ? "Add keywords for better recognition. Save anytime, even during a meeting."
     : "Add keywords for better recognition. Save anytime before or during a meeting.";
@@ -762,7 +769,12 @@ export default function App() {
                 {elapsedSeconds > 0 ? " · backend clock" : " · frontend estimate"} · latest span {latestSegmentRange}{previewSegment ? " · previewing" : ""}
               </p>
             </div>
-            <div className="range">{segments.length} segments</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button type="button" className="secondary-action-btn" onClick={handleBookmark} disabled={!connected || state !== "running"}>
+                Bookmark
+              </button>
+              <div className="range">{segments.length} segments</div>
+            </div>
           </header>
           <div
             ref={transcriptBodyRef}

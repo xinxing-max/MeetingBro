@@ -73,8 +73,8 @@ class _TailOnlyASR(ASRAdapter):
 
 
 class _MarkerSummarizer(Summarizer):
-    def summarize(self, segments, *, kind, language, previous_summary=None):
-        del language, previous_summary
+    def summarize(self, segments, *, kind, language, previous_summary=None, vocabulary=None):
+        del language, previous_summary, vocabulary
         text = " | ".join(seg.text.strip() for seg in segments)
         return f"{kind}:{text}"
 

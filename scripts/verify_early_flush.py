@@ -92,7 +92,7 @@ class _LatencyMockASR(ASRAdapter):
 
 
 class _NoopSummarizer(Summarizer):
-    def summarize(self, segments, *, kind, language, previous_summary=None):
+    def summarize(self, segments, *, kind, language, previous_summary=None, vocabulary=None):
         return ""
 
 

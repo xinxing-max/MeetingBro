@@ -86,6 +86,32 @@ These two live summaries are kept distinct from:
 
 The data model stores each snapshot with a `summary_type` such as `rolling_summary`, `cumulative_meeting_summary`, or `final_summary`, so the history of both live layers is preserved and exportable.
 
+## Meeting Export
+
+Use **Export Meeting** in the Notes / Quick Actions panel. In the desktop app,
+**Browse…** opens a native "save as" dialog where you can confirm the exact
+target folder name and location. If no folder is selected, MeetingBro uses a
+timestamped folder under the project `exports/` directory. The same feature is
+available through:
+
+```http
+POST /meetings/{meeting_id}/export
+```
+
+The backend writes a timestamped folder under `exports/`:
+
+```text
+exports/
+  2026-04-28_16-30-12_meetingbro_<id>/
+    transcript.md
+    summary.md
+    metadata.json
+```
+
+- `transcript.md` contains timestamped live transcript segments and available translations.
+- `summary.md` contains the latest rolling summary, Meeting Board, final summary, compressed memory, and saved notes.
+- `metadata.json` contains machine-readable counts and client-side session metadata such as source and runtime profile.
+
 ## Product Principles
 
 - platform-agnostic first

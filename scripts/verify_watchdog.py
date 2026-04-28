@@ -47,7 +47,7 @@ class _NoopASR(ASRAdapter):
 
 
 class _NoopSummarizer(Summarizer):
-    def summarize(self, segments, *, kind, language, previous_summary=None):
+    def summarize(self, segments, *, kind, language, previous_summary=None, vocabulary=None):
         return ""
 
 
@@ -93,6 +93,12 @@ class _AllSilentSource(_BaseSource):
             yield AudioChunk(samples=SILENT_CHUNK.copy(), sample_rate=self.sample_rate, start_time=start_time)
             start_time += len(SILENT_CHUNK) / self.sample_rate
             await asyncio.sleep(0.01)
+        for _ in range(30):
+            if self._closed:
+                return
+            yield AudioChunk(samples=VOICED_CHUNK.copy(), sample_rate=self.sample_rate, start_time=start_time)
+            start_time += len(VOICED_CHUNK) / self.sample_rate
+            await asyncio.sleep(0.03)
 
 
 class _DropBurstSource(_BaseSource):
@@ -102,9 +108,9 @@ class _DropBurstSource(_BaseSource):
 
     async def stream(self):
         loop = asyncio.get_running_loop()
-        self._burst_deadline = loop.time() + 0.45
+        self._burst_deadline = loop.time() + 0.22
         start_time = 0.0
-        while not self._closed and loop.time() < self._burst_deadline:
+        while not self._closed and loop.time() < self._burst_deadline + 0.24:
             yield AudioChunk(samples=VOICED_CHUNK.copy(), sample_rate=self.sample_rate, start_time=start_time)
             start_time += len(VOICED_CHUNK) / self.sample_rate
             await asyncio.sleep(0.01)
@@ -141,7 +147,14 @@ async def _wait_for(predicate: Callable[[], bool], *, timeout: float, label: str
     raise AssertionError(f"timed out waiting for {label}")
 
 
-async def _run_manager(source: AudioSource, *, wait_for: Callable[[dict[str, list[dict]]], bool], timeout: float) -> dict[str, list[dict]]:
+async def _run_manager(
+    source: AudioSource,
+    *,
+    wait_for: Callable[[dict[str, list[dict]]], bool] | None,
+    timeout: float,
+    settle_seconds: float = 0.0,
+    run_seconds: float | None = None,
+) -> dict[str, list[dict]]:
     with tempfile.TemporaryDirectory() as tmp:
         storage = Storage(Path(tmp) / "verify_watchdog.db")
         try:
@@ -181,7 +194,12 @@ async def _run_manager(source: AudioSource, *, wait_for: Callable[[dict[str, lis
             collector = asyncio.create_task(collect())
             await manager.start()
             try:
-                await _wait_for(lambda: wait_for(collected), timeout=timeout, label="scenario completion")
+                if run_seconds is not None:
+                    await asyncio.sleep(run_seconds)
+                elif wait_for is not None:
+                    await _wait_for(lambda: wait_for(collected), timeout=timeout, label="scenario completion")
+                if settle_seconds > 0:
+                    await asyncio.sleep(settle_seconds)
             finally:
                 await manager.stop()
                 try:
@@ -220,24 +238,31 @@ async def test_chunk_pause_recovery() -> tuple[bool, str]:
 async def test_all_silent() -> tuple[bool, str]:
     collected = await _run_manager(
         _AllSilentSource(),
-        wait_for=lambda events: _error_count(events, "audio_all_silent") >= 1,
+        wait_for=None,
         timeout=1.5,
+        run_seconds=1.6,
     )
-    ok = _error_count(collected, "audio_all_silent") == 1
-    detail = f"all_silent={_error_count(collected, 'audio_all_silent')}"
+    ok = (
+        _error_count(collected, "audio_all_silent") == 1
+        and sum(1 for payload in collected.get("error", []) if payload.get("code") == "audio_recovered" and payload.get("recovered_code") == "audio_all_silent") == 1
+    )
+    detail = f"all_silent={_error_count(collected, 'audio_all_silent')} recovered={_error_count(collected, 'audio_recovered')}"
     return ok, detail
 
 
 async def test_drop_burst() -> tuple[bool, str]:
     collected = await _run_manager(
         _DropBurstSource(),
-        wait_for=lambda events: _error_count(events, "audio_drops_sustained") >= 1,
+        wait_for=lambda events: _error_count(events, "audio_recovered") >= 1,
         timeout=1.5,
     )
-    ok = _error_count(collected, "audio_drops_sustained") == 1
+    ok = (
+        _error_count(collected, "audio_drops_sustained") == 1
+        and sum(1 for payload in collected.get("error", []) if payload.get("code") == "audio_recovered" and payload.get("recovered_code") == "audio_drops_sustained") == 1
+    )
     detail = (
         f"audio_drops_sustained={_error_count(collected, 'audio_drops_sustained')} "
-        f"audio_drop={_error_count(collected, 'audio_drop')}"
+        f"audio_drop={_error_count(collected, 'audio_drop')} recovered={_error_count(collected, 'audio_recovered')}"
     )
     return ok, detail
 

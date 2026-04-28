@@ -30,7 +30,7 @@ class SlowSummarizer:
         self._active = 0
         self._lock = asyncio.Lock()  # not used — peak tracked via simple int
 
-    def summarize(self, segments, *, kind, language, previous_summary=None):
+    def summarize(self, segments, *, kind, language, previous_summary=None, vocabulary=None):
         self._active += 1
         self.call_count += 1
         if self._active > self.concurrent_peak:

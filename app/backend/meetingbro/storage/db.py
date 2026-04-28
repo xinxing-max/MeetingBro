@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
   original_language TEXT NOT NULL,
   speaker_id TEXT,
   confidence REAL NOT NULL,
+    quality TEXT NOT NULL DEFAULT 'ok',
   translations TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
 );
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS notes (
   content TEXT NOT NULL,
   source_type TEXT,
   source_id TEXT,
+    time_seconds REAL,
   created_at TEXT NOT NULL
 );
 
@@ -92,6 +94,15 @@ class Storage:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            try:
+                self._conn.execute("ALTER TABLE transcript_segments ADD COLUMN quality TEXT NOT NULL DEFAULT 'ok'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                self._conn.execute("ALTER TABLE notes ADD COLUMN time_seconds REAL")
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
             self._conn.commit()
 
     def close(self) -> None:
@@ -122,13 +133,28 @@ class Storage:
             )
             self._conn.commit()
 
+    def get_meeting(self, meeting_id: str) -> Optional[dict[str, str | None]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, started_at, ended_at, preferred_summary_language FROM meetings WHERE id = ?",
+                (meeting_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "started_at": row[1],
+            "ended_at": row[2],
+            "preferred_summary_language": row[3],
+        }
+
     def insert_segment(self, seg: TranscriptSegment) -> None:
         with self._lock:
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO transcript_segments
-                  (id, meeting_id, start_time, end_time, text, original_language, speaker_id, confidence, translations, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    (id, meeting_id, start_time, end_time, text, original_language, speaker_id, confidence, quality, translations, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     seg.id,
@@ -139,6 +165,7 @@ class Storage:
                     seg.original_language,
                     seg.speaker_id,
                     seg.confidence,
+                    seg.quality,
                     json.dumps(dict(seg.translations)),
                     _iso(seg.created_at),
                 ),
@@ -157,7 +184,7 @@ class Storage:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT id, meeting_id, start_time, end_time, text, original_language, speaker_id, confidence, translations, created_at
+                SELECT id, meeting_id, start_time, end_time, text, original_language, speaker_id, confidence, quality, translations, created_at
                 FROM transcript_segments WHERE meeting_id = ? ORDER BY start_time ASC
                 """,
                 (meeting_id,),
@@ -172,8 +199,9 @@ class Storage:
                 original_language=r[5],
                 speaker_id=r[6],
                 confidence=r[7],
-                translations=json.loads(r[8] or "{}"),
-                created_at=datetime.fromisoformat(r[9]),
+                quality=r[8],
+                translations=json.loads(r[9] or "{}"),
+                created_at=datetime.fromisoformat(r[10]),
             )
             for r in rows
         ]
@@ -246,8 +274,8 @@ class Storage:
         with self._lock:
             self._conn.execute(
                 """
-                INSERT OR REPLACE INTO notes (id, meeting_id, content, source_type, source_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO notes (id, meeting_id, content, source_type, source_id, time_seconds, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     note.id,
@@ -255,6 +283,7 @@ class Storage:
                     note.content,
                     note.source_type,
                     note.source_id,
+                    note.time_seconds,
                     _iso(note.created_at),
                 ),
             )
@@ -263,7 +292,7 @@ class Storage:
     def list_notes(self, meeting_id: str) -> list[Note]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, meeting_id, content, source_type, source_id, created_at "
+                "SELECT id, meeting_id, content, source_type, source_id, time_seconds, created_at "
                 "FROM notes WHERE meeting_id = ? ORDER BY created_at ASC",
                 (meeting_id,),
             ).fetchall()
@@ -274,7 +303,8 @@ class Storage:
                 content=r[2],
                 source_type=r[3],
                 source_id=r[4],
-                created_at=datetime.fromisoformat(r[5]),
+                time_seconds=r[5],
+                created_at=datetime.fromisoformat(r[6]),
             )
             for r in rows
         ]

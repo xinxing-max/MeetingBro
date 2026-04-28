@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   Note,
+  ExportMeetingResponse,
   SessionEvent,
   SessionStatePayload,
   SessionState,
@@ -10,10 +11,15 @@ import type {
 } from "../types";
 
 const DEFAULT_WS = "ws://127.0.0.1:8765/ws/session";
+const VOCABULARY_STORAGE_KEY = "meetingbro.vocabulary";
 
 declare global {
   interface Window {
-    meetingbro?: { backendHttp: string; backendWs: string };
+    meetingbro?: {
+      backendHttp: string;
+      backendWs: string;
+      selectExportDirectory?: (suggestedName?: string) => Promise<string | null>;
+    };
   }
 }
 
@@ -21,6 +27,15 @@ export interface SaveNoteInput {
   content: string;
   source_type?: string;
   source_id?: string;
+}
+
+export interface ExportMeetingInput {
+  source?: string;
+  runtime_profile?: string;
+  summary_language?: string;
+  subtitle_language?: string;
+  export_root?: string;
+  export_dir?: string;
 }
 
 export interface SessionOptions {
@@ -46,6 +61,9 @@ export interface SessionView {
   notes: Note[];
   lastError: string | null;
   saveNote: (input: SaveNoteInput) => Promise<void>;
+  saveBookmark: (label?: string) => Promise<void>;
+  applyVocabulary: (value: string) => void;
+  exportMeeting: (input?: ExportMeetingInput) => Promise<ExportMeetingResponse | null>;
   stopSession: () => void;
 }
 
@@ -183,6 +201,8 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     const base = window.meetingbro?.backendWs ?? "ws://127.0.0.1:8765";
     const params = new URLSearchParams({ source, summary_language: summaryLanguage, runtime_profile: runtimeProfile });
     if (speechLanguage !== "auto") params.set("forced_language", speechLanguage);
+    const vocabulary = window.localStorage.getItem(VOCABULARY_STORAGE_KEY)?.trim();
+    if (vocabulary) params.set("vocabulary_hint", vocabulary);
     const url = `${base}/ws/session?${params.toString()}`;
     const ws = new WebSocket(url.startsWith("ws") ? url : DEFAULT_WS);
     wsRef.current = ws;
@@ -322,6 +342,48 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     [meetingId],
   );
 
+  const applyVocabulary = useCallback((value: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    ws.send(
+      JSON.stringify({
+        type: "update_settings",
+        payload: {
+          vocabulary_hint: value.trim(),
+        },
+      }),
+    );
+  }, []);
+
+  const saveBookmark = useCallback(
+    async (label = "") => saveNote({ content: label, source_type: "bookmark" }),
+    [saveNote],
+  );
+
+  const exportMeeting = useCallback(
+    async (input: ExportMeetingInput = {}) => {
+      if (!meetingId) {
+        setLastError("cannot export meeting — session not ready");
+        return null;
+      }
+      const base = window.meetingbro?.backendHttp ?? "http://127.0.0.1:8765";
+      const response = await fetch(`${base}/meetings/${meetingId}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      });
+      if (!response.ok) {
+        const message = `export failed (${response.status})`;
+        setLastError(message);
+        return null;
+      }
+      return await response.json() as ExportMeetingResponse;
+    },
+    [meetingId],
+  );
+
   return {
     connected,
     state,
@@ -336,6 +398,9 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     notes,
     lastError,
     saveNote,
+    saveBookmark,
+    applyVocabulary,
+    exportMeeting,
     stopSession,
   };
 }

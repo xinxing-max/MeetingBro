@@ -111,6 +111,13 @@ def _json_list(content: str) -> list[dict[str, Any]] | None:
     return [item for item in value if isinstance(item, dict)]
 
 
+def _bookmark_lines(notes: list[Note]) -> list[str]:
+    bookmarks = sorted((note for note in notes if note.source_type == "bookmark" and note.time_seconds is not None), key=lambda note: note.time_seconds or 0.0)
+    if not bookmarks:
+        return []
+    return [f"- [{_format_seconds(note.time_seconds or 0.0)}] {note.content.strip() or '(no label)'}" for note in bookmarks]
+
+
 def _write_summary(
     path: Path,
     *,
@@ -135,6 +142,9 @@ def _write_summary(
         f"- Ended: {_display_time(meeting.get('ended_at'))}",
         "",
     ]
+    bookmark_lines = _bookmark_lines(notes)
+    if bookmark_lines:
+        lines.extend(["## Bookmarks", *bookmark_lines, ""])
 
     for title, summary_type in sections:
         snap = latest.get(summary_type)
@@ -228,6 +238,11 @@ def export_meeting(
         "started_at": meeting.get("started_at"),
         "ended_at": meeting.get("ended_at"),
         "preferred_summary_language": meeting.get("preferred_summary_language"),
+        "bookmarks": [
+            {"time_seconds": note.time_seconds, "content": note.content}
+            for note in sorted(notes, key=lambda note: note.time_seconds or 0.0)
+            if note.source_type == "bookmark" and note.time_seconds is not None
+        ],
         "segment_count": len(segments),
         "summary_count": len(snapshots),
         "notes_count": len(notes),

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, screen } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, screen } = require("electron");
 const path = require("node:path");
 
 const isDev = !app.isPackaged;
@@ -29,6 +29,20 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  ipcMain.handle("meetingbro:select-export-directory", async (_event, suggestedName) => {
+    const defaultName = suggestedName || `meetingbro_export_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}`;
+    const result = await dialog.showSaveDialog({
+      title: "Export meeting as folder",
+      buttonLabel: "Use This Folder",
+      defaultPath: path.join(app.getPath("documents"), defaultName),
+      properties: ["createDirectory", "showOverwriteConfirmation"],
+    });
+    if (result.canceled || !result.filePath) {
+      return null;
+    }
+    return result.filePath;
+  });
+
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

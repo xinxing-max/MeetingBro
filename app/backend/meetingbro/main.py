@@ -16,10 +16,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .asr.faster_whisper_adapter import FasterWhisperAdapter
 from .audio import AudioSource, MicrophoneSource, MixedAudioSource, SystemAudioLoopbackSource, WavFileSource
+from .exporter import export_meeting
 from .llm.openai_compatible import _load_dotenv_if_present
 from .schemas import (
     CreateNoteRequest,
     ErrorPayload,
+    ExportMeetingRequest,
+    ExportMeetingResponse,
     LanguageCode,
     Note,
     SessionStatePayload,
@@ -38,6 +41,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "meetingbro.db"
+DEFAULT_EXPORT_ROOT = PROJECT_ROOT / "exports"
 
 
 def _recommended_asr_executor_workers() -> int:
@@ -261,6 +265,30 @@ async def list_summaries(
     return storage.list_snapshots(meeting_id, summary_type=summary_type)  # type: ignore[arg-type]
 
 
+@app.post("/meetings/{meeting_id}/export", response_model=ExportMeetingResponse)
+async def export_meeting_endpoint(
+    meeting_id: str,
+    req: ExportMeetingRequest | None = None,
+) -> ExportMeetingResponse:
+    storage: Storage = app.state.storage
+    req_data = req.model_dump(exclude_none=True) if req is not None else {}
+    requested_export_root = req_data.pop("export_root", None)
+    requested_export_dir = req_data.pop("export_dir", None)
+    export_root = Path(requested_export_root or os.environ.get("MEETINGBRO_EXPORT_ROOT", str(DEFAULT_EXPORT_ROOT)))
+    try:
+        return export_meeting(
+            storage,
+            meeting_id=meeting_id,
+            export_root=export_root,
+            export_dir=Path(requested_export_dir) if requested_export_dir else None,
+            client_metadata=req_data,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="meeting not found")
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"export failed: {exc}")
+
+
 def _build_audio_source(source: str, *, chunk_seconds: Optional[float] = None) -> AudioSource:
     """Build an AudioSource from a URI-like spec.
 
@@ -310,6 +338,7 @@ async def session_ws(
     source: str = Query(default="mic"),
     summary_language: str = Query(default="en"),
     forced_language: Optional[str] = Query(default=None),
+    vocabulary_hint: Optional[str] = Query(default=None),
     runtime_profile: Optional[str] = Query(default=None),
 ) -> None:
     await ws.accept()
@@ -348,7 +377,7 @@ async def session_ws(
         asr_accumulation_seconds=float(profile_settings["asr_accumulation_seconds"]),
         silence_rms_threshold=_env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.002),
         asr_overlap_seconds=_env_float("MEETINGBRO_ASR_OVERLAP_SECONDS", 0.0),
-        vocabulary_hint=os.environ.get("MEETINGBRO_VOCABULARY_HINT") or None,
+        vocabulary_hint=vocabulary_hint or os.environ.get("MEETINGBRO_VOCABULARY_HINT") or None,
         suspicious_segment_no_speech_prob=_env_float(
             "MEETINGBRO_SUSPICIOUS_SEGMENT_NO_SPEECH_PROB",
             0.6,
@@ -437,7 +466,7 @@ async def session_ws(
             if data.get("type") == "save_note":
                 payload = data.get("payload") or {}
                 content = (payload.get("content") or "").strip()
-                if content:
+                if content or payload.get("source_type") == "bookmark":
                     note = manager.save_note(
                         content=content,
                         source_type=payload.get("source_type"),
@@ -466,6 +495,9 @@ async def session_ws(
                     live_translation_language = None
                 elif live_translation_language not in (None, "zh", "en", "de"):
                     live_translation_language = manager._cfg.live_translation_language
+                next_vocabulary_hint = payload.get("vocabulary_hint", manager._cfg.vocabulary_hint)
+                if next_vocabulary_hint is not None:
+                    next_vocabulary_hint = str(next_vocabulary_hint).strip() or None
                 next_source = payload.get("source")
                 next_profile = normalize_runtime_profile(payload.get("runtime_profile") or manager._cfg.runtime_profile)
                 next_profile_settings = _runtime_settings_from_profile(next_profile)
@@ -495,6 +527,7 @@ async def session_ws(
                     forced_language=forced_language,
                     summary_language=summary_lang,
                     live_translation_language=live_translation_language,
+                    vocabulary_hint=next_vocabulary_hint,
                     runtime_profile=next_profile,
                     runtime_settings={
                         **next_profile_settings,

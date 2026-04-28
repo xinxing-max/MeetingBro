@@ -45,6 +45,7 @@ export interface Note {
   content: string;
   source_type: string | null;
   source_id: string | null;
+  time_seconds?: number | null;
   created_at: string;
 }
 
