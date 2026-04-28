@@ -109,6 +109,7 @@ class HeuristicSummarizer(Summarizer):
         kind: SummaryKind,
         language: LanguageCode,
         previous_summary: str | None = None,
+        vocabulary: str | None = None,
     ) -> str:
         if not segments:
             return ""
@@ -180,3 +181,18 @@ class HeuristicSummarizer(Summarizer):
         if kind in {"cumulative_meeting_summary", "final_summary"} and previous_summary:
             parts.append(f"(Compressed meeting memory: {previous_summary[:240]})")
         return "\n".join(parts)
+
+    def finalize_meeting(
+        self,
+        segments: Sequence[TranscriptSegment],
+        *,
+        language: LanguageCode,
+        vocabulary: str | None = None,
+        meeting_memory: str | None = None,
+    ) -> dict:
+        del meeting_memory
+        return {
+            "chapters": [],
+            "action_items": [],
+            "final_summary": self.summarize(segments, kind="final_summary", language=language, vocabulary=vocabulary),
+        }

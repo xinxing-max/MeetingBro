@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
 import logging
 import re
 import time
@@ -12,7 +13,7 @@ from typing import AsyncIterator, Optional
 
 import numpy as np
 
-from ..asr.base import ASRAdapter
+from ..asr.base import ASRAdapter, ASRSegment
 from ..audio.capture import AudioChunk, AudioSource
 from ..audio.mixed import MixedAudioSource
 from ..audio.enhancement import AdaptiveNoiseReducer, AudioConditioner
@@ -283,6 +284,7 @@ class SessionManager:
         forced_language: Optional[str],
         summary_language: Optional[LanguageCode] = None,
         live_translation_language: Optional[LanguageCode] = None,
+        vocabulary_hint: Optional[str] = None,
         runtime_profile: Optional[str] = None,
         runtime_settings: Optional[dict[str, object]] = None,
     ) -> None:
@@ -336,6 +338,14 @@ class SessionManager:
             logger.info(
                 "updated live_translation_language=%s for meeting_id=%s",
                 live_translation_language or "off",
+                self._state.meeting_id,
+            )
+
+        if vocabulary_hint != self._cfg.vocabulary_hint:
+            self._cfg.vocabulary_hint = vocabulary_hint
+            logger.info(
+                "updated vocabulary_hint=%s for meeting_id=%s",
+                "set" if vocabulary_hint else "cleared",
                 self._state.meeting_id,
             )
             if live_translation_language is not None:
@@ -520,10 +530,25 @@ class SessionManager:
             original_language=right.original_language,
             speaker_id=right.speaker_id or left.speaker_id,
             confidence=max(left.confidence, right.confidence),
+            quality=self._merge_quality(left.quality, right.quality),
             translations=dict(left.translations),
             created_at=right.created_at,
             emitted_at_elapsed_seconds=right.emitted_at_elapsed_seconds,
         )
+
+    def _compute_quality(self, asr_seg: ASRSegment) -> str:
+        suspicious_count = int((asr_seg.no_speech_prob or 0.0) >= self._cfg.suspicious_segment_no_speech_prob)
+        suspicious_count += int(asr_seg.avg_logprob is not None and asr_seg.avg_logprob <= self._cfg.suspicious_segment_avg_logprob)
+        suspicious_count += int((asr_seg.compression_ratio or 0.0) >= self._cfg.suspicious_segment_compression_ratio)
+        if suspicious_count >= 3:
+            return "low"
+        if suspicious_count >= 1:
+            return "uncertain"
+        return "ok"
+
+    def _merge_quality(self, left: str, right: str) -> str:
+        rank = {"ok": 0, "uncertain": 1, "low": 2}
+        return left if rank[left] >= rank[right] else right
 
     def _is_redundant_preview_candidate(self, seg: TranscriptSegment) -> bool:
         if not self._state.last_emitted_text:
@@ -603,8 +628,7 @@ class SessionManager:
     ) -> None:
         payload = {
             "code": code,
-            "message": message,
-            "status": status,
+            "message": f"[{status}] {message}",
         }
         if recovered_code is not None:
             payload["recovered_code"] = recovered_code
@@ -631,16 +655,15 @@ class SessionManager:
         self._state.watchdog_active_episodes.discard(code)
 
     def _record_audio_drops(self, now: float, drops: int) -> int:
+        cutoff = now - self._cfg.watchdog_drop_burst_window_seconds
+        self._state.watchdog_drop_history = [
+            item for item in self._state.watchdog_drop_history if item[0] >= cutoff
+        ]
         if drops > 0:
             prev_bucket = self._audio_drop_total // 10
             self._audio_drop_total += drops
             self._state.watchdog_drop_history.append((now, drops))
             return prev_bucket
-
-        cutoff = now - self._cfg.watchdog_drop_burst_window_seconds
-        self._state.watchdog_drop_history = [
-            item for item in self._state.watchdog_drop_history if item[0] >= cutoff
-        ]
         return self._audio_drop_total // 10
 
     def _active_transcript_item_count(self) -> int:
@@ -664,6 +687,7 @@ class SessionManager:
                 ),
             )
 
+        # audio_drop and audio_drops_sustained are intentionally separate signals — do not collapse
         drop_total = sum(count for _, count in self._state.watchdog_drop_history)
         if drop_total > self._cfg.watchdog_drop_burst_count:
             await self._arm_watchdog_episode(
@@ -1003,6 +1027,7 @@ class SessionManager:
                         text=asr_seg.text,
                         original_language=asr_seg.language,
                         confidence=asr_seg.confidence,
+                        quality=self._compute_quality(asr_seg),
                         created_at=datetime.now(tz=timezone.utc),
                         emitted_at_elapsed_seconds=max(
                             self._state.elapsed_seconds,
@@ -1110,6 +1135,10 @@ class SessionManager:
                         chunk_rms = float(np.sqrt(np.mean(raw_chunk.samples ** 2)))
                         if chunk_rms >= self._cfg.silence_rms_threshold:
                             self._state.last_voiced_chunk_wall_time = now
+                            await self._recover_watchdog_episode(
+                                "audio_all_silent",
+                                "audio levels recovered above silence threshold",
+                            )
 
                         energy_chunk = noise_reducer.process(raw_chunk)
                         prepared_chunk = pre_vad_conditioner.process(energy_chunk)
@@ -1210,6 +1239,7 @@ class SessionManager:
                             text=asr_seg.text,
                             original_language=asr_seg.language,
                             confidence=asr_seg.confidence,
+                            quality=self._compute_quality(asr_seg),
                             created_at=datetime.now(tz=timezone.utc),
                             emitted_at_elapsed_seconds=max(
                                 self._state.elapsed_seconds,
@@ -1900,6 +1930,7 @@ class SessionManager:
                 kind=kind,  # type: ignore[arg-type]
                 language=self._cfg.summary_language,
                 previous_summary=previous_summary,
+                vocabulary=self._cfg.vocabulary_hint,
             ),
         )
         if not content:
@@ -2021,10 +2052,78 @@ class SessionManager:
             return
         end = max(s.end_time for s in self._state.segments)
         compressed_context = self._state.latest_meeting_memory or self._state.latest_cumulative_text
-        await self._build_and_emit_snapshot(
-            summary_type="final_summary",
-            segments=self._summary_context_segments(),
-            time_start=0.0,
-            time_end=end,
-            previous_summary=compressed_context,
-        )
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                self._summary_executor,
+                lambda: self._cfg.summarizer.finalize_meeting(
+                    self._state.segments,
+                    language=self._cfg.summary_language,
+                    vocabulary=self._cfg.vocabulary_hint,
+                    meeting_memory=self._state.latest_meeting_memory,
+                ),
+            )
+            if not isinstance(result, dict):
+                raise ValueError("finalize_meeting returned non-dict payload")
+        except Exception as exc:
+            logger.warning("finalize_meeting failed, falling back to legacy final_summary: %s", exc)
+            await self._emit("error", ErrorPayload(code="finalize_failed", message=str(exc)))
+            await self._build_and_emit_snapshot(
+                summary_type="final_summary",
+                segments=self._summary_context_segments(),
+                time_start=0.0,
+                time_end=end,
+                previous_summary=compressed_context,
+            )
+            return
+        chapters = []
+        for item in result.get("chapters") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = max(0.0, min(float(item.get("time_start", 0.0) or 0.0), end))
+                finish = max(start, min(float(item.get("time_end", end) or end), end))
+            except (TypeError, ValueError):
+                start, finish = 0.0, end
+            chapters.append({
+                "title": str(item.get("title") or "Untitled chapter").strip(),
+                "time_start": start,
+                "time_end": finish,
+                "summary": str(item.get("summary") or "").strip(),
+            })
+        action_items = []
+        for item in result.get("action_items") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            assignee = item.get("assignee")
+            due = item.get("due")
+            action_items.append({
+                "text": text,
+                "assignee": None if assignee in (None, "") else str(assignee),
+                "due": None if due in (None, "") else str(due),
+            })
+        source_segment_ids = [s.id for s in self._state.segments]
+        for kind, content in (
+            ("final_summary", str(result.get("final_summary") or "").strip()),
+            ("chapter_list", json.dumps(chapters, ensure_ascii=False)),
+            ("action_item_list", json.dumps(action_items, ensure_ascii=False)),
+        ):
+            if kind == "final_summary" and not content:
+                continue
+            snap = SummarySnapshot(
+                id=str(uuid.uuid4()),
+                meeting_id=self._state.meeting_id,
+                summary_type=kind,  # type: ignore[arg-type]
+                time_start=0.0,
+                time_end=end,
+                language=self._cfg.summary_language,
+                content=content,
+                source_segment_ids=source_segment_ids,
+                is_latest=True,
+                created_at=datetime.now(tz=timezone.utc),
+            )
+            self._cfg.storage.insert_snapshot(snap)
+            await self._emit("summary_snapshot", snap)

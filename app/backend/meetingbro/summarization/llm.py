@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from typing import Sequence
 
 from ..llm import OpenAICompatibleClient
@@ -49,6 +51,16 @@ _PROMPTS = {
         "Be faithful to the provided context; do not invent content."
     ),
 }
+
+_FINALIZE_PROMPT = (
+    "You are finalizing a meeting in {language}. Given the full transcript and known vocabulary, "
+    "output ONLY valid JSON with the exact shape: "
+    '{{"chapters":[{{"title":"<<8 words","time_start":0,"time_end":0,"summary":"<<3 sentences"}}],'
+    '"action_items":[{{"text":"...","assignee":"<name or null>","due":"<date or null>"}}],'
+    '"final_summary":"5-10 sentences in {language} covering decisions, key points, open questions"}}. '
+    "Do NOT invent content. Use the vocabulary list as exact spellings of names/terms. "
+    "The transcript may mix Chinese, English, German."
+)
 
 _LANG_NAMES = {"en": "English", "zh": "Chinese", "de": "German"}
 
@@ -104,6 +116,7 @@ class LLMSummarizer(Summarizer):
         kind: SummaryKind,
         language: LanguageCode,
         previous_summary: str | None = None,
+        vocabulary: str | None = None,
     ) -> str:
         if not segments:
             return ""
@@ -114,6 +127,7 @@ class LLMSummarizer(Summarizer):
                 kind=kind,
                 language=language,
                 previous_summary=previous_summary,
+                vocabulary=vocabulary,
             )
 
         transcript_text = "\n".join(
@@ -133,6 +147,11 @@ class LLMSummarizer(Summarizer):
                 else "Recent transcript tail"
             )
             user_content = f"{previous_label}:\n{previous_summary}\n\n{new_label}:\n{transcript_text}"
+        if vocabulary and vocabulary.strip():
+            user_content = (
+                "Known names / terms (use these exact spellings if they appear): "
+                f"{vocabulary.strip()}\n\n{user_content}"
+            )
 
         try:
             if provider == "openai_compatible":
@@ -171,4 +190,72 @@ class LLMSummarizer(Summarizer):
                 kind=kind,
                 language=language,
                 previous_summary=previous_summary,
+                vocabulary=vocabulary,
             )
+
+    def finalize_meeting(
+        self,
+        segments: Sequence[TranscriptSegment],
+        *,
+        language: LanguageCode,
+        vocabulary: str | None = None,
+        meeting_memory: str | None = None,
+    ) -> dict:
+        if not segments:
+            return {"chapters": [], "action_items": [], "final_summary": ""}
+        provider = self._ensure_client()
+        if provider is None:
+            return self._fallback.finalize_meeting(
+                segments,
+                language=language,
+                vocabulary=vocabulary,
+                meeting_memory=meeting_memory,
+            )
+        transcript_text = "\n".join(
+            f"[{int(s.start_time // 60):02d}:{int(s.start_time % 60):02d}-{int(s.end_time // 60):02d}:{int(s.end_time % 60):02d}] {(s.speaker_id or 'Speaker')}: {s.text}"
+            for s in segments if s.text.strip()
+        )
+        if len(transcript_text) > 30000:
+            transcript_text = transcript_text[:13000] + "\n[...truncated for length...]\n" + transcript_text[-13000:]
+        user_content = (
+            f"Known vocabulary: {vocabulary.strip() if vocabulary and vocabulary.strip() else '(none provided)'}\n\n"
+            "Compressed meeting memory (durable context):\n"
+            f"{meeting_memory.strip() if meeting_memory and meeting_memory.strip() else '(empty)'}\n\n"
+            f"Full transcript:\n{transcript_text}"
+        )
+        system_prompt = _FINALIZE_PROMPT.format(language=_LANG_NAMES.get(language, language))
+        if provider == "openai_compatible":
+            assert self._compatible_client is not None
+            raw = self._compatible_client.chat(system=system_prompt, user=user_content, max_tokens=1400, temperature=0.1)
+        elif provider == "anthropic":
+            assert self._anthropic_client is not None
+            msg = self._anthropic_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1400,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            raw = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+        else:
+            assert self._openai_client is not None
+            resp = self._openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        payload = match.group(0) if match else raw
+        result = json.loads(payload)
+        if not isinstance(result, dict) or not isinstance(result.get("chapters"), list) or not isinstance(result.get("action_items"), list):
+            raise ValueError("finalize_meeting returned invalid JSON shape")
+        final_summary = result.get("final_summary")
+        if not isinstance(final_summary, str) or not final_summary.strip():
+            raise ValueError("finalize_meeting returned empty final_summary")
+        return {
+            "chapters": result["chapters"],
+            "action_items": result["action_items"],
+            "final_summary": final_summary.strip(),
+        }

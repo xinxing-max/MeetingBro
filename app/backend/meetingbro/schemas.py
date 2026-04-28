@@ -16,6 +16,8 @@ SummaryType = Literal[
     "time_window_summary",
     "speaker_summary",
     "final_summary",
+    "chapter_list",
+    "action_item_list",
 ]
 
 SessionState = Literal["starting", "running", "paused", "ended"]
@@ -30,6 +32,7 @@ class TranscriptSegment(BaseModel):
     original_language: OriginalLanguage
     speaker_id: Optional[str] = None
     confidence: float = Field(ge=0.0, le=1.0)
+    quality: Literal["ok", "uncertain", "low"] = "ok"
     translations: dict[LanguageCode, str] = Field(default_factory=dict)
     created_at: datetime
     emitted_at_elapsed_seconds: Optional[float] = None
@@ -121,3 +124,18 @@ class CreateNoteRequest(BaseModel):
     content: str
     source_type: Optional[str] = None
     source_id: Optional[str] = None
+
+
+class ExportMeetingRequest(BaseModel):
+    source: Optional[str] = None
+    runtime_profile: Optional[str] = None
+    summary_language: Optional[LanguageCode] = None
+    subtitle_language: Optional[str] = None
+    export_root: Optional[str] = None
+    export_dir: Optional[str] = None
+
+
+class ExportMeetingResponse(BaseModel):
+    meeting_id: str
+    export_dir: str
+    files: list[str]
