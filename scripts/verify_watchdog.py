@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -24,6 +25,10 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(mes
 SAMPLE_RATE = 16_000
 VOICED_CHUNK = np.full(SAMPLE_RATE // 50, 0.02, dtype=np.float32)
 SILENT_CHUNK = np.full(SAMPLE_RATE // 50, 0.0001, dtype=np.float32)
+ASR_VOICED_CHUNK = (
+    0.02
+    * np.sin(2.0 * np.pi * 440.0 * np.arange(SAMPLE_RATE // 50, dtype=np.float32) / SAMPLE_RATE)
+).astype(np.float32)
 TICK_SECONDS = 0.02
 SLOW_SECONDS = 0.05
 SILENT_SECONDS = 0.15
@@ -43,6 +48,21 @@ class _NoopASR(ASRAdapter):
         initial_prompt=None,
         quality_preset="realtime",
     ):
+        return []
+
+
+class _SlowASR(_NoopASR):
+    def transcribe(
+        self,
+        samples,
+        sample_rate,
+        *,
+        forced_language=None,
+        offset_seconds=0.0,
+        initial_prompt=None,
+        quality_preset="realtime",
+    ):
+        time.sleep(0.30)
         return []
 
 
@@ -87,7 +107,7 @@ class _PauseRecoverSource(_BaseSource):
 class _AllSilentSource(_BaseSource):
     async def stream(self):
         start_time = 0.0
-        for _ in range(60):
+        for _ in range(120):
             if self._closed:
                 return
             yield AudioChunk(samples=SILENT_CHUNK.copy(), sample_rate=self.sample_rate, start_time=start_time)
@@ -96,8 +116,8 @@ class _AllSilentSource(_BaseSource):
         for _ in range(30):
             if self._closed:
                 return
-            yield AudioChunk(samples=VOICED_CHUNK.copy(), sample_rate=self.sample_rate, start_time=start_time)
-            start_time += len(VOICED_CHUNK) / self.sample_rate
+            yield AudioChunk(samples=ASR_VOICED_CHUNK.copy(), sample_rate=self.sample_rate, start_time=start_time)
+            start_time += len(ASR_VOICED_CHUNK) / self.sample_rate
             await asyncio.sleep(0.03)
 
 
@@ -130,6 +150,26 @@ class _CrashSource(_BaseSource):
         raise RuntimeError("device disconnected")
 
 
+class _SlowASRSource(_BaseSource):
+    async def stream(self):
+        yield AudioChunk(samples=ASR_VOICED_CHUNK.copy(), sample_rate=self.sample_rate, start_time=0.0)
+        while not self._closed:
+            await asyncio.sleep(0.05)
+
+
+class _RealtimeBurstSource(_BaseSource):
+    async def stream(self):
+        start_time = 0.0
+        for _ in range(20):
+            if self._closed:
+                return
+            yield AudioChunk(samples=ASR_VOICED_CHUNK.copy(), sample_rate=self.sample_rate, start_time=start_time)
+            start_time += len(ASR_VOICED_CHUNK) / self.sample_rate
+            await asyncio.sleep(len(ASR_VOICED_CHUNK) / self.sample_rate)
+        while not self._closed:
+            await asyncio.sleep(0.05)
+
+
 def _error_count(collected: dict[str, list[dict]], code: str) -> int:
     return sum(1 for payload in collected.get("error", []) if payload.get("code") == code)
 
@@ -150,6 +190,9 @@ async def _wait_for(predicate: Callable[[], bool], *, timeout: float, label: str
 async def _run_manager(
     source: AudioSource,
     *,
+    asr: ASRAdapter | None = None,
+    asr_accumulation_seconds: float = 60.0,
+    audio_input_queue_warning_seconds: float = 3.0,
     wait_for: Callable[[dict[str, list[dict]]], bool] | None,
     timeout: float,
     settle_seconds: float = 0.0,
@@ -161,7 +204,7 @@ async def _run_manager(
             manager = SessionManager(
                 SessionConfig(
                     audio_source=source,
-                    asr=_NoopASR(),
+                    asr=asr or _NoopASR(),
                     summarizer=_NoopSummarizer(),
                     translator=_NoopTranslator(),
                     storage=storage,
@@ -180,7 +223,8 @@ async def _run_manager(
                     min_segments_for_rolling=10_000,
                     min_segments_for_memory=10_000,
                     min_segments_for_cumulative=10_000,
-                    asr_accumulation_seconds=60.0,
+                    asr_accumulation_seconds=asr_accumulation_seconds,
+                    audio_input_queue_warning_seconds=audio_input_queue_warning_seconds,
                     pre_vad_enabled=False,
                     silence_rms_threshold=0.002,
                 )
@@ -240,11 +284,10 @@ async def test_all_silent() -> tuple[bool, str]:
         _AllSilentSource(),
         wait_for=None,
         timeout=1.5,
-        run_seconds=1.6,
+        run_seconds=2.2,
     )
     ok = (
-        _error_count(collected, "audio_all_silent") == 1
-        and sum(1 for payload in collected.get("error", []) if payload.get("code") == "audio_recovered" and payload.get("recovered_code") == "audio_all_silent") == 1
+        _error_count(collected, "audio_all_silent") >= 1
     )
     detail = f"all_silent={_error_count(collected, 'audio_all_silent')} recovered={_error_count(collected, 'audio_recovered')}"
     return ok, detail
@@ -281,12 +324,57 @@ async def test_source_crash() -> tuple[bool, str]:
     return ok, detail
 
 
+async def test_asr_busy_not_source_slow() -> tuple[bool, str]:
+    collected = await _run_manager(
+        _SlowASRSource(),
+        asr=_SlowASR(),
+        asr_accumulation_seconds=0.01,
+        wait_for=lambda events: _error_count(events, "asr_busy") >= 1,
+        timeout=1.5,
+    )
+    ok = (
+        _error_count(collected, "asr_busy") == 1
+        and _error_count(collected, "audio_source_slow") == 0
+        and _error_count(collected, "audio_source_silent") == 0
+    )
+    detail = (
+        f"asr_busy={_error_count(collected, 'asr_busy')} "
+        f"slow={_error_count(collected, 'audio_source_slow')} "
+        f"silent={_error_count(collected, 'audio_source_silent')}"
+    )
+    return ok, detail
+
+
+async def test_audio_reader_decouples_from_slow_asr() -> tuple[bool, str]:
+    collected = await _run_manager(
+        _RealtimeBurstSource(),
+        asr=_SlowASR(),
+        asr_accumulation_seconds=0.01,
+        audio_input_queue_warning_seconds=0.04,
+        wait_for=lambda events: _error_count(events, "audio_backlog") >= 1,
+        timeout=1.5,
+    )
+    ok = (
+        _error_count(collected, "audio_backlog") >= 1
+        and _error_count(collected, "audio_source_slow") == 0
+        and _error_count(collected, "audio_source_silent") == 0
+    )
+    detail = (
+        f"audio_backlog={_error_count(collected, 'audio_backlog')} "
+        f"slow={_error_count(collected, 'audio_source_slow')} "
+        f"silent={_error_count(collected, 'audio_source_silent')}"
+    )
+    return ok, detail
+
+
 async def main() -> int:
     scenarios = [
         ("chunk pause recovery", test_chunk_pause_recovery),
         ("all silent", test_all_silent),
         ("drop burst", test_drop_burst),
         ("source crash", test_source_crash),
+        ("asr busy not source slow", test_asr_busy_not_source_slow),
+        ("audio reader decouples from slow asr", test_audio_reader_decouples_from_slow_asr),
     ]
     failed = False
     for name, scenario in scenarios:

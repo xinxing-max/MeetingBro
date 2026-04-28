@@ -30,6 +30,66 @@ html, body, #root {
   color: var(--text);
 }
 
+.app button {
+  position: relative;
+  transition:
+    transform 140ms ease,
+    box-shadow 180ms ease,
+    filter 180ms ease,
+    background-color 180ms ease,
+    border-color 180ms ease,
+    opacity 180ms ease;
+}
+
+.app button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.12);
+}
+
+.app button:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.1);
+}
+
+.app button:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 3px rgba(255, 255, 255, 0.9),
+    0 0 0 6px rgba(37, 99, 235, 0.25);
+}
+
+.app button:disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+  filter: saturate(0.7);
+}
+
+.button-busy {
+  padding-right: 34px;
+}
+
+.button-busy::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  width: 12px;
+  height: 12px;
+  margin-top: -6px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.42);
+  border-top-color: rgba(255, 255, 255, 0.96);
+  animation: button-spin 760ms linear infinite;
+}
+
+@keyframes button-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .app-header {
   display: flex;
   justify-content: space-between;
@@ -72,6 +132,32 @@ html, body, #root {
   background: #b91c1c;
 }
 
+.pause-btn,
+.resume-btn {
+  font-size: 12px;
+  padding: 5px 12px;
+  border: none;
+  border-radius: 999px;
+  color: #fff;
+  cursor: pointer;
+}
+
+.pause-btn {
+  background: #d97706;
+}
+
+.pause-btn:hover {
+  background: #b45309;
+}
+
+.resume-btn {
+  background: #2563eb;
+}
+
+.resume-btn:hover {
+  background: #1d4ed8;
+}
+
 .start-btn {
   font-size: 12px;
   padding: 5px 12px;
@@ -112,6 +198,78 @@ html, body, #root {
   background: #fef2f2;
   color: #991b1b;
   font-size: 13px;
+}
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(15, 23, 42, 0.28);
+  backdrop-filter: blur(6px);
+  z-index: 20;
+}
+
+.confirm-dialog {
+  width: min(100%, 460px);
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--surface-strong);
+  box-shadow: 0 24px 64px rgba(15, 23, 42, 0.18);
+}
+
+.confirm-dialog h3 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.confirm-dialog p {
+  margin: 0 0 10px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.confirm-status {
+  margin: 14px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #475569;
+}
+
+.confirm-status.is-busy,
+.action-feedback.is-busy {
+  color: #1d4ed8;
+}
+
+.confirm-status.is-success,
+.action-feedback.is-success {
+  color: #166534;
+}
+
+.danger-action-btn {
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 8px 14px;
+  border: none;
+  border-radius: 999px;
+  background: #dc2626;
+  color: #fff;
+  cursor: pointer;
+}
+
+.danger-action-btn:hover {
+  background: #b91c1c;
 }
 
 .startup-settings {
@@ -236,6 +394,13 @@ html, body, #root {
   font-size: 11px;
   color: #b45309;
   font-variant-numeric: tabular-nums;
+}
+
+.bookmark-feedback {
+  margin: 6px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: #0f766e;
 }
 
 .delay-pill {
@@ -579,6 +744,25 @@ html, body, #root {
   animation: preview-fade 1.2s ease-in-out infinite alternate;
 }
 
+.transcript-body .bookmark-marker {
+  margin: 8px 0;
+  border: 1px solid rgba(245, 158, 11, 0.22);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(255, 247, 237, 0.96), rgba(255, 251, 235, 0.88));
+}
+
+.transcript-body .bookmark-marker .ts {
+  color: #b45309;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.transcript-body .bookmark-marker .segment-text span:first-child {
+  color: #7c2d12;
+  font-weight: 600;
+}
+
 .transcript-body .preview-segment .ts {
   color: #9a3412;
   font-weight: 600;
@@ -674,6 +858,11 @@ html, body, #root {
   margin: 4px 0 0;
   font-size: 12px;
   line-height: 1.4;
+}
+
+.action-feedback {
+  margin-top: 10px !important;
+  font-weight: 600;
 }
 
 .export-target-row {
@@ -850,6 +1039,7 @@ html, body, #root {
   .panel footer { background: #0f0f11; border-top-color: #1f1f22; }
   .panel footer button { background: #18181b; color: #e5e7eb; border-color: #27272a; }
   .panel footer button:hover:not(:disabled) { background: #27272a; }
+  .bookmark-feedback { color: #5eead4; }
   .muted, .subtitle, .range, .ts { color: #9ca3af; }
   .summary-meta, .history-label { color: #71717a; }
   .transcript-lag-meta { color: #fbbf24; }
@@ -883,6 +1073,12 @@ html, body, #root {
   .transcript-body .preview-segment {
     background: linear-gradient(90deg, rgba(251, 191, 36, 0.14), rgba(251, 191, 36, 0.04));
   }
+  .transcript-body .bookmark-marker {
+    border-color: rgba(245, 158, 11, 0.28);
+    background: linear-gradient(180deg, rgba(69, 26, 3, 0.44), rgba(120, 53, 15, 0.2));
+  }
+  .transcript-body .bookmark-marker .ts { color: #fbbf24; }
+  .transcript-body .bookmark-marker .segment-text span:first-child { color: #fde68a; }
   .transcript-body .preview-segment .ts { color: #fbbf24; }
   .transcript-body .preview-segment span:last-child { color: #d4d4d8; }
   .jump-latest-btn {

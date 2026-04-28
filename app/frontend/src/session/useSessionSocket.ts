@@ -66,6 +66,9 @@ export interface SessionView {
   saveBookmark: (label?: string) => Promise<void>;
   applyVocabulary: (value: string) => void;
   exportMeeting: (input?: ExportMeetingInput) => Promise<ExportMeetingResponse | null>;
+  requestSummary: (summaryType: Extract<SummaryType, "rolling_summary" | "cumulative_meeting_summary">) => void;
+  pauseSession: () => void;
+  resumeSession: () => void;
   stopSession: () => void;
 }
 
@@ -323,6 +326,20 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     }
   }, []);
 
+  const pauseSession = useCallback(() => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "pause" }));
+    }
+  }, []);
+
+  const resumeSession = useCallback(() => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "resume" }));
+    }
+  }, []);
+
   const saveNote = useCallback(
     async (input: SaveNoteInput) => {
       const ws = wsRef.current;
@@ -355,6 +372,20 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
         payload: {
           vocabulary_hint: value.trim(),
         },
+      }),
+    );
+  }, []);
+
+  const requestSummary = useCallback((summaryType: Extract<SummaryType, "rolling_summary" | "cumulative_meeting_summary">) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setLastError("cannot refresh summary — session not ready");
+      return;
+    }
+    ws.send(
+      JSON.stringify({
+        type: "request_summary",
+        payload: { summary_type: summaryType },
       }),
     );
   }, []);
@@ -411,6 +442,9 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     saveBookmark,
     applyVocabulary,
     exportMeeting,
+    requestSummary,
+    pauseSession,
+    resumeSession,
     stopSession,
   };
 }

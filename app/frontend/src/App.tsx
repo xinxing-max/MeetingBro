@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ExportMeetingResponse, SummarySnapshot } from "./types";
 import { useSessionSocket } from "./session/useSessionSocket";
+import type { ExportMeetingInput } from "./session/useSessionSocket";
 
 const VOCABULARY_STORAGE_KEY = "meetingbro.vocabulary";
 
@@ -195,9 +196,12 @@ interface SummaryPanelProps {
   accent: string;
   className?: string;
   onSaveToNotes: (snapshot: SummarySnapshot) => Promise<void>;
+  onRefresh?: () => void;
+  refreshDisabled?: boolean;
+  refreshBusy?: boolean;
 }
 
-function SummaryPanel({ title, subtitle, snapshot, history, sessionStartedAt, accent, className, onSaveToNotes }: SummaryPanelProps) {
+function SummaryPanel({ title, subtitle, snapshot, history, sessionStartedAt, accent, className, onSaveToNotes, onRefresh, refreshDisabled = false, refreshBusy = false }: SummaryPanelProps) {
   const displayedHistory = history.length > 0 ? history : snapshot ? [snapshot] : [];
   const latestSnapshot = displayedHistory.at(-1) ?? snapshot;
   const range = latestSnapshot
@@ -277,6 +281,9 @@ function SummaryPanel({ title, subtitle, snapshot, history, sessionStartedAt, ac
         )}
       </div>
       <footer>
+        <button onClick={onRefresh} disabled={!onRefresh || refreshDisabled} className={refreshBusy ? "button-busy" : ""} aria-busy={refreshBusy}>
+          {refreshBusy ? "Refreshing…" : "Refresh"}
+        </button>
         <button onClick={onCopy} disabled={!latestSnapshot}>Copy Latest</button>
         <button onClick={onExpand} disabled={!latestSnapshot}>Expand</button>
         <button onClick={onSave} disabled={!latestSnapshot}>Save Latest</button>
@@ -296,20 +303,96 @@ export default function App() {
   const [lastExport, setLastExport] = useState<ExportMeetingResponse | null>(null);
   const [exportRoot, setExportRoot] = useState<string>("");
   const [exporting, setExporting] = useState(false);
+  const [exportIntent, setExportIntent] = useState<"manual" | "restart" | null>(null);
+  const [actionFeedback, setActionFeedback] = useState<string | null>(null);
+  const [bookmarkFeedback, setBookmarkFeedback] = useState<string | null>(null);
+  const [refreshingSummary, setRefreshingSummary] = useState<"rolling_summary" | "cumulative_meeting_summary" | null>(null);
+  const [refreshBaselineId, setRefreshBaselineId] = useState<string | null>(null);
   const [bilingualExport, setBilingualExport] = useState(false);
-  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, stopSession } =
+  const [restartPromptOpen, setRestartPromptOpen] = useState(false);
+  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, requestSummary, pauseSession, resumeSession, stopSession } =
     useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage, runtimeProfile });
 
   const rolling = latestByType.rolling_summary;
   const cumulative = latestByType.cumulative_meeting_summary;
   const chapterSnapshot = latestByType.chapter_list;
   const actionItemSnapshot = latestByType.action_item_list;
+  const hasRetainedMeetingData = !sessionEnabled && !!meetingId && (
+    segments.length > 0 ||
+    notes.length > 0 ||
+    Object.keys(latestByType).length > 0
+  );
 
   useEffect(() => {
     setVocabulary(window.localStorage.getItem(VOCABULARY_STORAGE_KEY) ?? "");
   }, []);
 
+  useEffect(() => {
+    if (!actionFeedback) {
+      return;
+    }
+    const timer = window.setTimeout(() => setActionFeedback(null), 3200);
+    return () => window.clearTimeout(timer);
+  }, [actionFeedback]);
+
+  useEffect(() => {
+    if (!bookmarkFeedback) {
+      return;
+    }
+    const timer = window.setTimeout(() => setBookmarkFeedback(null), 2200);
+    return () => window.clearTimeout(timer);
+  }, [bookmarkFeedback]);
+
+  useEffect(() => {
+    if (!refreshingSummary) {
+      return;
+    }
+    const latest = latestByType[refreshingSummary];
+    if (!latest || latest.id === refreshBaselineId) {
+      return;
+    }
+    setRefreshingSummary((current) => current === refreshingSummary ? null : current);
+    setRefreshBaselineId(null);
+  }, [latestByType, refreshBaselineId, refreshingSummary]);
+
   const visibleSegments = useMemo(() => segments.slice(-200), [segments]);
+  const visibleBookmarks = useMemo(() => {
+    if (visibleSegments.length === 0) {
+      return [];
+    }
+    const firstVisibleStart = visibleSegments[0].start_time;
+    const lastVisibleEnd = visibleSegments[visibleSegments.length - 1].end_time;
+    const latestTimelineSeconds = Math.max(lastVisibleEnd, elapsedSeconds || 0);
+    return notes
+      .filter((note) => note.source_type === "bookmark" && note.time_seconds != null)
+      .filter((note) => (note.time_seconds ?? 0) >= firstVisibleStart && (note.time_seconds ?? 0) <= latestTimelineSeconds)
+      .sort((left, right) => (left.time_seconds ?? 0) - (right.time_seconds ?? 0));
+  }, [elapsedSeconds, notes, visibleSegments]);
+  const transcriptTimelineItems = useMemo(() => {
+    const items: Array<
+      | { type: "segment"; segment: typeof visibleSegments[number] }
+      | { type: "bookmark"; note: typeof notes[number] }
+    > = [];
+    let bookmarkIndex = 0;
+
+    for (const segment of visibleSegments) {
+      while (
+        bookmarkIndex < visibleBookmarks.length &&
+        (visibleBookmarks[bookmarkIndex].time_seconds ?? 0) <= segment.end_time
+      ) {
+        items.push({ type: "bookmark", note: visibleBookmarks[bookmarkIndex] });
+        bookmarkIndex += 1;
+      }
+      items.push({ type: "segment", segment });
+    }
+
+    while (bookmarkIndex < visibleBookmarks.length) {
+      items.push({ type: "bookmark", note: visibleBookmarks[bookmarkIndex] });
+      bookmarkIndex += 1;
+    }
+
+    return items;
+  }, [notes, visibleBookmarks, visibleSegments]);
   const chapters = useMemo(() => chapterSnapshot ? parseSnapshotList(chapterSnapshot.content) : [], [chapterSnapshot]);
   const actionItems = useMemo(() => actionItemSnapshot ? parseSnapshotList(actionItemSnapshot.content) : [], [actionItemSnapshot]);
   const latestSegment = segments.at(-1);
@@ -387,6 +470,13 @@ export default function App() {
   const summaryPendingCount = sessionStats?.summary_pending_count ?? 0;
   const translationTrimTotal = sessionStats?.translation_backlog_trim_total ?? 0;
   const audioDropTotal = sessionStats?.audio_drop_total ?? 0;
+  const audioInputBacklogSeconds = sessionStats?.audio_input_backlog_seconds ?? 0;
+  const audioInputQueueDropTotal = sessionStats?.audio_input_queue_drop_total ?? 0;
+  const fastPreviewEnabled = sessionStats?.fast_preview_enabled ?? false;
+  const fastPreviewAttempts = sessionStats?.fast_preview_attempts ?? 0;
+  const fastPreviewEmitted = sessionStats?.fast_preview_emitted ?? 0;
+  const fastPreviewSkipped = sessionStats?.fast_preview_skipped ?? 0;
+  const fastPreviewRtf = sessionStats?.fast_preview_realtime_factor ?? null;
   const delayTone = getDelayTone(transcriptLagSeconds);
   const activeSource = sessionStats?.source ?? source;
   const mixedMicGain = sessionStats?.mixed_microphone_gain ?? null;
@@ -457,15 +547,23 @@ export default function App() {
     const advice: SystemAdvice[] = [];
     const realtimeGap = transcriptLagSeconds ?? 0;
     const rtf = asrRealtimeFactor ?? 0;
+    const asrBusy = lastError?.includes("ASR has been processing") ?? false;
 
-    if (asrSafeguardActive || rtf >= 1.0 || backpressureAgeSeconds != null) {
+    if (asrBusy) {
+      advice.push({
+        severity: "warn",
+        title: "ASR is currently busy",
+        detail: lastError ?? "The backend is still processing the current audio window.",
+        action: "Use Low Latency mode, switch to a smaller Whisper model, or turn subtitles off if lag continues.",
+      });
+    } else if (asrSafeguardActive || rtf >= 1.0 || backpressureAgeSeconds != null) {
       advice.push({
         severity: asrSafeguardActive || rtf >= 1.2 ? "danger" : "warn",
         title: "ASR is close to falling behind",
         detail: asrSafeguardActive
           ? (sessionStats?.asr_safeguard_reason ?? "The backend activated realtime protection.")
           : `Last ASR realtime factor is ${formatRtf(asrRealtimeFactor)}.`,
-        action: "Try Robust Meeting mode, use a smaller Whisper model, or temporarily turn subtitles off.",
+        action: "Use Low Latency mode, switch to a smaller Whisper model, turn subtitles off, or disable Fast Preview.",
       });
     } else if (realtimeGap >= 4.0 && activeRuntimeProfile !== "low_latency") {
       advice.push({
@@ -512,6 +610,24 @@ export default function App() {
       });
     }
 
+    if (audioInputBacklogSeconds >= 2.0 || audioInputQueueDropTotal > 0) {
+      advice.push({
+        severity: audioInputBacklogSeconds >= 5.0 || audioInputQueueDropTotal > 0 ? "warn" : "ok",
+        title: "Audio input is buffered",
+        detail: `Backlog ${formatLagSeconds(audioInputBacklogSeconds)}, queue drops ${audioInputQueueDropTotal}.`,
+        action: "Use Low Latency mode, a smaller Whisper model, or disable Fast Preview until backlog stays near 0s.",
+      });
+    }
+
+    if (fastPreviewEnabled && fastPreviewAttempts > 0 && fastPreviewEmitted === 0) {
+      advice.push({
+        severity: "warn",
+        title: "Fast preview has not emitted text yet",
+        detail: `Preview attempts ${fastPreviewAttempts}, skipped ${fastPreviewSkipped}.`,
+        action: "This can happen on silence or if ASR is busy; if speech is present, try a smaller preview model later.",
+      });
+    }
+
     if (
       speechLanguage === "auto" &&
       recentSpeechLanguages.size >= 2 &&
@@ -542,8 +658,15 @@ export default function App() {
     asrRealtimeFactor,
     asrSafeguardActive,
     audioDropTotal,
+    audioInputBacklogSeconds,
+    audioInputQueueDropTotal,
     backpressureAgeSeconds,
+    fastPreviewAttempts,
+    fastPreviewEmitted,
+    fastPreviewEnabled,
+    fastPreviewSkipped,
     languageLockEnabled,
+    lastError,
     mixedGainHint,
     mixedGainTone,
     recentSpeechLanguages,
@@ -616,23 +739,29 @@ export default function App() {
     });
   };
 
+  const currentExportInput = (): ExportMeetingInput => ({
+    source: activeSource,
+    runtime_profile: activeRuntimeProfile,
+    summary_language: summaryLanguage,
+    subtitle_language: subtitleLanguage,
+    export_dir: exportRoot.trim() || undefined,
+    bilingual: bilingualExport,
+    target_language: bilingualExport ? ((summaryLanguage === "zh" || summaryLanguage === "en" || summaryLanguage === "de") ? summaryLanguage : undefined) : undefined,
+  });
+
   const handleExportMeeting = async () => {
+    setExportIntent("manual");
+    setActionFeedback(null);
     setExporting(true);
     try {
-      const result = await exportMeeting({
-        source: activeSource,
-        runtime_profile: activeRuntimeProfile,
-        summary_language: summaryLanguage,
-        subtitle_language: subtitleLanguage,
-        export_dir: exportRoot.trim() || undefined,
-        bilingual: bilingualExport,
-        target_language: bilingualExport ? ((summaryLanguage === "zh" || summaryLanguage === "en" || summaryLanguage === "de") ? summaryLanguage : undefined) : undefined,
-      });
+      const result = await exportMeeting(currentExportInput());
       if (result) {
         setLastExport(result);
+        setActionFeedback(`Export ready in ${result.export_dir}`);
       }
     } finally {
       setExporting(false);
+      setExportIntent(null);
     }
   };
 
@@ -658,12 +787,58 @@ export default function App() {
     window.localStorage.setItem(VOCABULARY_STORAGE_KEY, vocabulary);
     applyVocabulary(vocabulary);
   };
+
+  const handleStartSession = () => {
+    if (hasRetainedMeetingData) {
+      setRestartPromptOpen(true);
+      return;
+    }
+    setLastExport(null);
+    setSessionEnabled(true);
+  };
+
+  const handleRestartWithoutSave = () => {
+    setRestartPromptOpen(false);
+    setLastExport(null);
+    setActionFeedback(null);
+    setSessionEnabled(true);
+  };
+
+  const handleSaveAndRestart = async () => {
+    setExportIntent("restart");
+    setActionFeedback(null);
+    setExporting(true);
+    try {
+      const result = await exportMeeting(currentExportInput());
+      if (!result) {
+        return;
+      }
+      setLastExport(result);
+      setActionFeedback(`Saved to ${result.export_dir}. Starting a new meeting…`);
+      setRestartPromptOpen(false);
+      setSessionEnabled(true);
+    } finally {
+      setExporting(false);
+      setExportIntent(null);
+    }
+  };
+
   const handleBookmark = async () => {
     const label = window.prompt("Bookmark label (optional)", "");
     if (label === null) {
       return;
     }
     await saveBookmark(label);
+    setBookmarkFeedback(
+      label.trim()
+        ? `Bookmark saved at ${formatElapsedSeconds(audioClockSeconds ?? elapsedSeconds)} · ${label.trim()}`
+        : `Bookmark saved at ${formatElapsedSeconds(audioClockSeconds ?? elapsedSeconds)}`,
+    );
+  };
+  const handleRefreshSummary = (summaryType: "rolling_summary" | "cumulative_meeting_summary") => {
+    setRefreshBaselineId(latestByType[summaryType]?.id ?? null);
+    setRefreshingSummary(summaryType);
+    requestSummary(summaryType);
   };
   const vocabularyHint = sessionEnabled
     ? "Add keywords for better recognition. Save anytime, even during a meeting."
@@ -673,6 +848,8 @@ export default function App() {
     ? "session stopped — press Start to begin capture"
     : state === "starting"
       ? "connecting to the live session…"
+      : state === "paused"
+        ? "session paused — press Resume to continue capture"
       : activeSource === "loopback" || activeSource === "system"
         ? "listening to system audio only — play meeting audio or switch to System + Microphone"
         : activeSource === "mic"
@@ -724,17 +901,26 @@ export default function App() {
             <option value="de">Subtitles: Deutsch</option>
           </select>
           {!sessionEnabled ? (
-            <button className="start-btn" onClick={() => setSessionEnabled(true)}>Start</button>
+            <button className="start-btn" onClick={handleStartSession}>Start</button>
           ) : (
-            <button
-              className="stop-btn"
-              onClick={() => {
-                stopSession();
-                setSessionEnabled(false);
-              }}
-            >
-              Stop
-            </button>
+            <>
+              {state === "paused" ? (
+                <button className="resume-btn" onClick={resumeSession}>Resume</button>
+              ) : (
+                <button className="pause-btn" onClick={pauseSession} disabled={state !== "running"}>
+                  Pause
+                </button>
+              )}
+              <button
+                className="stop-btn"
+                onClick={() => {
+                  stopSession();
+                  setSessionEnabled(false);
+                }}
+              >
+                Stop
+              </button>
+            </>
           )}
           <span className={connected ? "dot ok" : "dot bad"} />
           {connected ? "connected" : "disconnected"}
@@ -771,6 +957,7 @@ export default function App() {
                 {committedLagSeconds != null ? ` · commit delay ${formatLagSeconds(committedLagSeconds)}` : ""}
                 {elapsedSeconds > 0 ? " · backend clock" : " · frontend estimate"} · latest span {latestSegmentRange}{previewSegment ? " · previewing" : ""}
               </p>
+              {bookmarkFeedback && <p className="bookmark-feedback">{bookmarkFeedback}</p>}
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <button type="button" className="secondary-action-btn" onClick={handleBookmark} disabled={!connected || state !== "running"}>
@@ -794,7 +981,19 @@ export default function App() {
             {visibleSegments.length === 0 && (
               <div className="muted">{transcriptEmptyMessage}</div>
             )}
-            {visibleSegments.map((s) => {
+            {transcriptTimelineItems.map((item) => {
+              if (item.type === "bookmark") {
+                return (
+                  <div key={item.note.id} className="segment bookmark-marker">
+                    <span className="ts">bookmark · {formatElapsedSeconds(item.note.time_seconds)}</span>
+                    <div className="segment-text">
+                      <span>{item.note.content.trim() || "Important moment"}</span>
+                    </div>
+                  </div>
+                );
+              }
+
+              const s = item.segment;
               const confidenceTone = getConfidenceTone(s.confidence);
               const confidenceLabel = getConfidenceLabel(s.confidence);
               const qualityStyle = s.quality === "low"
@@ -861,6 +1060,9 @@ export default function App() {
           accent="#2563eb"
           className="summary-panel rolling-panel"
           onSaveToNotes={handleSaveToNotes}
+          onRefresh={() => handleRefreshSummary("rolling_summary")}
+          refreshDisabled={!connected || state !== "running" || segments.length === 0}
+          refreshBusy={refreshingSummary === "rolling_summary"}
         />
 
         <SummaryPanel
@@ -872,6 +1074,9 @@ export default function App() {
           accent="#0f766e"
           className="summary-panel cumulative-panel"
           onSaveToNotes={handleSaveToNotes}
+          onRefresh={() => handleRefreshSummary("cumulative_meeting_summary")}
+          refreshDisabled={!connected || state !== "running" || segments.length === 0}
+          refreshBusy={refreshingSummary === "cumulative_meeting_summary"}
         />
 
         <section className="panel diagnostics">
@@ -966,6 +1171,13 @@ export default function App() {
                 audio {formatLagSeconds(asrAudioSeconds)} ? ASR {formatLagSeconds(asrWallSeconds)}
               </span>
             </div>
+            <div className={`diagnostic-card delay-card delay-${fastPreviewRtf != null && fastPreviewRtf > 0.8 ? "warn" : "ok"}`}>
+              <span className="diagnostic-label">Fast Preview</span>
+              <strong className="diagnostic-value">{fastPreviewEnabled ? formatRtf(fastPreviewRtf) : "off"}</strong>
+              <span className="diagnostic-note">
+                emitted {fastPreviewEmitted} · skipped {fastPreviewSkipped}
+              </span>
+            </div>
             <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : "ok"}`}>
               <span className="diagnostic-label">Realtime Safeguard</span>
               <strong className="diagnostic-value">{asrSafeguardActive ? "active" : "clear"}</strong>
@@ -988,6 +1200,11 @@ export default function App() {
               <span className="diagnostic-note">
                 translations {translationPendingCount} ? summaries {summaryPendingCount} ? trims {translationTrimTotal}
               </span>
+            </div>
+            <div className={`diagnostic-card delay-card delay-${audioInputBacklogSeconds >= 5 ? "warn" : "ok"}`}>
+              <span className="diagnostic-label">Audio Backlog</span>
+              <strong className="diagnostic-value">{formatLagSeconds(audioInputBacklogSeconds)}</strong>
+              <span className="diagnostic-note">input queue drops {audioInputQueueDropTotal}</span>
             </div>
             <div className="diagnostic-card">
               <span className="diagnostic-label">Audio Drops</span>
@@ -1028,7 +1245,7 @@ export default function App() {
                     aria-label="Export folder"
                   />
                   {window.meetingbro?.selectExportDirectory && (
-                    <button type="button" className="secondary-export-btn" onClick={handleChooseExportFolder}>
+                    <button type="button" className="secondary-export-btn" onClick={handleChooseExportFolder} disabled={exporting}>
                       Browse…
                     </button>
                   )}
@@ -1046,12 +1263,18 @@ export default function App() {
                     Latest export: <code>{lastExport.export_dir}</code>
                   </p>
                 )}
+                {(exporting || actionFeedback) && exportIntent !== "restart" && (
+                  <p className={`action-feedback ${exporting ? "is-busy" : "is-success"}`}>
+                    {exporting ? "Preparing transcript, summary, and metadata…" : actionFeedback}
+                  </p>
+                )}
               </div>
               <button
                 type="button"
-                className="primary-export-btn"
+                className={`primary-export-btn ${exporting && exportIntent === "manual" ? "button-busy" : ""}`.trim()}
                 onClick={handleExportMeeting}
                 disabled={!meetingId || exporting}
+                aria-busy={exporting && exportIntent === "manual"}
               >
                 {exporting ? "Exporting…" : "Export Meeting"}
               </button>
@@ -1116,6 +1339,36 @@ export default function App() {
           </div>
         </section>
       </main>
+
+      {restartPromptOpen && (
+        <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="restart-dialog-title">
+          <div className="confirm-dialog">
+            <h3 id="restart-dialog-title">Start a new meeting?</h3>
+            <p>
+              Starting again will clear the current transcript, summaries, bookmarks, and notes from the screen.
+            </p>
+            <p className="muted">
+              Save this meeting first if you want to keep an export copy before opening a new session.
+            </p>
+            <div className="confirm-actions">
+              <button type="button" className="secondary-action-btn" onClick={() => setRestartPromptOpen(false)} disabled={exporting}>
+                Cancel
+              </button>
+              <button type="button" className="danger-action-btn" onClick={handleRestartWithoutSave} disabled={exporting}>
+                Start Without Saving
+              </button>
+              <button type="button" className={`primary-export-btn ${exporting && exportIntent === "restart" ? "button-busy" : ""}`.trim()} onClick={handleSaveAndRestart} disabled={exporting} aria-busy={exporting && exportIntent === "restart"}>
+                {exporting ? "Saving…" : "Save and Start New"}
+              </button>
+            </div>
+            {(exporting || actionFeedback) && (
+              <p className={`confirm-status ${exporting ? "is-busy" : "is-success"}`}>
+                {exporting ? "Saving the current meeting export before opening a new session…" : actionFeedback}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

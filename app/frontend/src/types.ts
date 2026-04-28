@@ -85,6 +85,15 @@ export interface SessionStatePayload {
   translation_pending_count: number;
   translation_backlog_trim_total: number;
   audio_drop_total: number;
+  audio_input_backlog_seconds: number;
+  audio_input_queue_drop_total: number;
+  fast_preview_enabled: boolean;
+  fast_preview_attempts: number;
+  fast_preview_emitted: number;
+  fast_preview_skipped: number;
+  fast_preview_last_audio_seconds: number | null;
+  fast_preview_last_wall_seconds: number | null;
+  fast_preview_realtime_factor: number | null;
   mixed_microphone_gain: number | null;
   mixed_system_gain: number | null;
   mixed_effective_microphone_gain: number | null;

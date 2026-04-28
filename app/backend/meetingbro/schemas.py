@@ -99,6 +99,15 @@ class SessionStatePayload(BaseModel):
     translation_pending_count: int = 0
     translation_backlog_trim_total: int = 0
     audio_drop_total: int = 0
+    audio_input_backlog_seconds: float = 0.0
+    audio_input_queue_drop_total: int = 0
+    fast_preview_enabled: bool = False
+    fast_preview_attempts: int = 0
+    fast_preview_emitted: int = 0
+    fast_preview_skipped: int = 0
+    fast_preview_last_audio_seconds: Optional[float] = None
+    fast_preview_last_wall_seconds: Optional[float] = None
+    fast_preview_realtime_factor: Optional[float] = None
     mixed_microphone_gain: Optional[float] = None
     mixed_system_gain: Optional[float] = None
     mixed_effective_microphone_gain: Optional[float] = None

@@ -60,7 +60,7 @@ class SessionConfig:
     min_segments_for_rolling: int = 1
     min_segments_for_memory: int = 3
     min_segments_for_cumulative: int = 3
-    asr_accumulation_seconds: float = 2.5  # prefer fuller sentence context over low latency
+    asr_accumulation_seconds: float = 2.0  # was 2.5; benchmark showed equal char-count at lower latency
     asr_early_flush_enabled: bool = True
     asr_early_flush_min_seconds: float = 0.8
     silence_commit_min_confidence: float = 0.75
@@ -123,6 +123,14 @@ class SessionConfig:
     watchdog_all_silent_seconds: float = 45.0
     watchdog_drop_burst_count: int = 50
     watchdog_drop_burst_window_seconds: float = 30.0
+    audio_input_queue_max_seconds: float = 8.0
+    audio_input_queue_warning_seconds: float = 3.0
+    fast_preview_enabled: bool = True
+    fast_preview_interval_seconds: float = 0.8
+    fast_preview_window_seconds: float = 3.0
+    fast_preview_max_backlog_seconds: float = 0.5
+    fast_preview_max_asr_realtime_factor: float = 0.65
+    fast_preview_min_rms: float = 0.002
     # Executor sizing is not a user-facing tuning surface. Defaults are chosen
     # automatically in main.py and may be overridden only via hidden env vars.
     asr_executor_workers: int = 1
@@ -175,6 +183,9 @@ class _State:
     asr_last_audio_seconds: Optional[float] = None
     asr_last_wall_seconds: Optional[float] = None
     asr_realtime_factor: Optional[float] = None
+    asr_inflight_start_wall_time: Optional[float] = None
+    asr_inflight_audio_seconds: Optional[float] = None
+    asr_inflight_phase: Optional[str] = None
     asr_safeguard_reason: Optional[str] = None
     asr_safeguard_cooldown_windows: int = 0
     asr_safeguard_events: int = 0
@@ -183,6 +194,16 @@ class _State:
     weak_rescue_buffer_seconds: float = 0.0
     translation_backlog_trim_total: int = 0
     filler_filtered_total: int = 0
+    audio_input_backlog_seconds: float = 0.0
+    audio_input_queue_drop_total: int = 0
+    fast_preview_attempts: int = 0
+    fast_preview_emitted: int = 0
+    fast_preview_skipped: int = 0
+    fast_preview_last_audio_seconds: Optional[float] = None
+    fast_preview_last_wall_seconds: Optional[float] = None
+    fast_preview_realtime_factor: Optional[float] = None
+    fast_preview_inflight: bool = False
+    fast_preview_segment: Optional[TranscriptSegment] = None
     last_emitted_end_time: Optional[float] = None
     first_chunk_wall_time: Optional[float] = None
     last_chunk_wall_time: Optional[float] = None
@@ -209,6 +230,8 @@ class SessionManager:
         self._event_queue: asyncio.Queue[SessionEvent] = asyncio.Queue(maxsize=1024)
         self._state = _State(meeting_id=str(uuid.uuid4()))
         self._stopped = asyncio.Event()
+        self._pause_gate = asyncio.Event()
+        self._pause_gate.set()
         self._task: Optional[asyncio.Task[None]] = None
         self._watchdog_task: Optional[asyncio.Task[None]] = None
         self._summary_tasks: set[asyncio.Task[None]] = set()
@@ -239,6 +262,9 @@ class SessionManager:
     @property
     def meeting_id(self) -> str:
         return self._state.meeting_id
+
+    def _active_state_name(self) -> str:
+        return "running" if self._pause_gate.is_set() else "paused"
 
     def _session_state_payload(self, *, state: str) -> SessionStatePayload:
         self._prune_background_task_lists()
@@ -279,6 +305,15 @@ class SessionManager:
             translation_pending_count=sum(1 for task in self._translation_task_order if not task.done()),
             translation_backlog_trim_total=self._state.translation_backlog_trim_total,
             audio_drop_total=self._audio_drop_total,
+            audio_input_backlog_seconds=self._state.audio_input_backlog_seconds,
+            audio_input_queue_drop_total=self._state.audio_input_queue_drop_total,
+            fast_preview_enabled=self._cfg.fast_preview_enabled,
+            fast_preview_attempts=self._state.fast_preview_attempts,
+            fast_preview_emitted=self._state.fast_preview_emitted,
+            fast_preview_skipped=self._state.fast_preview_skipped,
+            fast_preview_last_audio_seconds=self._state.fast_preview_last_audio_seconds,
+            fast_preview_last_wall_seconds=self._state.fast_preview_last_wall_seconds,
+            fast_preview_realtime_factor=self._state.fast_preview_realtime_factor,
             mixed_microphone_gain=mixed_microphone_gain,
             mixed_system_gain=mixed_system_gain,
             mixed_effective_microphone_gain=mixed_effective_microphone_gain,
@@ -359,7 +394,7 @@ class SessionManager:
                 self._backfill_live_translations()
 
         if runtime_changed or translation_changed:
-            asyncio.create_task(self._emit("session_state", self._session_state_payload(state="running")))
+            asyncio.create_task(self._emit("session_state", self._session_state_payload(state=self._active_state_name())))
 
     def update_audio_source(
         self,
@@ -376,12 +411,46 @@ class SessionManager:
         self._audio_source_generation += 1
         self._reset_watchdog_tracking()
         self._clear_preview_candidate()
+        self._state.fast_preview_segment = None
         self._state.pending_segments.clear()
         self._state.last_emitted_text = ""
         self._state.repetition_streak = 0
         logger.info("updated audio source=%s for meeting_id=%s", source_name, self._state.meeting_id)
         asyncio.create_task(self._aclose_specific_source(previous_source))
-        asyncio.create_task(self._emit("session_state", self._session_state_payload(state="running")))
+        asyncio.create_task(self._emit("session_state", self._session_state_payload(state=self._active_state_name())))
+
+    async def pause(self) -> None:
+        if self._stopped.is_set() or not self._pause_gate.is_set():
+            return
+        self._pause_gate.clear()
+        self._state.pending_segments.clear()
+        self._state.fast_preview_segment = None
+        self._clear_preview_candidate()
+        await self._emit_transcript_preview()
+        await self._emit(
+            "session_state",
+            self._session_state_payload(state="paused"),
+        )
+
+    async def resume(self) -> None:
+        if self._stopped.is_set() or self._pause_gate.is_set():
+            return
+        self._pause_gate.set()
+        await self._emit(
+            "session_state",
+            self._session_state_payload(state="running"),
+        )
+
+    async def request_summary(self, summary_type: str) -> None:
+        if self._stopped.is_set():
+            return
+        if summary_type == "rolling_summary":
+            await self._emit_rolling(force=True)
+            return
+        if summary_type == "cumulative_meeting_summary":
+            await self._emit_memory(force=True)
+            await self._emit_cumulative(force=True)
+            return
 
     async def events(self) -> AsyncIterator[SessionEvent]:
         while not (self._stopped.is_set() and self._event_queue.empty()):
@@ -582,6 +651,7 @@ class SessionManager:
         return normalized in self._cfg.filler_tokens.get(language, [])
 
     async def _queue_preview_candidate(self, seg: TranscriptSegment) -> None:
+        self._state.fast_preview_segment = None
         self._state.preview_candidate_segment = seg
         self._state.preview_candidate_confirmations = 1
         await self._emit_transcript_preview(seg)
@@ -725,10 +795,60 @@ class SessionManager:
                 "audio drop rate returned to normal",
             )
 
+        asr_inflight_start = self._state.asr_inflight_start_wall_time
+        if asr_inflight_start is not None:
+            asr_busy_seconds = now - asr_inflight_start
+            if asr_busy_seconds >= self._cfg.watchdog_no_chunk_warning_seconds:
+                phase = self._state.asr_inflight_phase or "realtime"
+                audio_seconds = self._state.asr_inflight_audio_seconds
+                audio_detail = (
+                    f" for {audio_seconds:.1f}s audio"
+                    if audio_seconds is not None
+                    else ""
+                )
+                await self._arm_watchdog_episode(
+                    code="asr_busy",
+                    status="warning",
+                    message=(
+                        f"ASR has been processing {phase}{audio_detail} "
+                        f"for {asr_busy_seconds:.1f}s; realtime transcription may lag"
+                    ),
+                )
+        else:
+            await self._recover_watchdog_episode(
+                "asr_busy",
+                "ASR processing returned to realtime cadence",
+            )
+
+        backlog_seconds = self._state.audio_input_backlog_seconds
+        if backlog_seconds >= self._cfg.audio_input_queue_warning_seconds:
+            await self._arm_watchdog_episode(
+                code="audio_backlog",
+                status="warning",
+                message=(
+                    f"audio input backlog is {backlog_seconds:.1f}s; "
+                    "ASR is consuming slower than capture"
+                ),
+            )
+        else:
+            await self._recover_watchdog_episode(
+                "audio_backlog",
+                "audio input backlog returned to normal",
+            )
+
         last_chunk = self._state.last_chunk_wall_time
         if last_chunk is not None:
             no_chunk_seconds = now - last_chunk
-            if no_chunk_seconds >= self._cfg.watchdog_no_chunk_error_seconds:
+            if asr_inflight_start is not None:
+                await self._recover_watchdog_episode(
+                    "audio_source_silent",
+                    "audio source wait is caused by ASR processing",
+                )
+                await self._recover_watchdog_episode(
+                    "audio_source_slow",
+                    "audio source wait is caused by ASR processing",
+                )
+            elif no_chunk_seconds >= self._cfg.watchdog_no_chunk_error_seconds:
                 self._clear_watchdog_episode("audio_source_slow")
                 await self._arm_watchdog_episode(
                     code="audio_source_silent",
@@ -790,6 +910,8 @@ class SessionManager:
                     return
                 except asyncio.TimeoutError:
                     pass
+                if not self._pause_gate.is_set():
+                    continue
                 await self._check_audio_health()
         except asyncio.CancelledError:
             raise
@@ -809,14 +931,18 @@ class SessionManager:
             # Overlap tail: last N samples from the previous ASR window, prepended to
             # the next window so words at chunk boundaries are not truncated.
             overlap_buf: np.ndarray = np.zeros(0, dtype=np.float32)
-            pre_vad = PreVadSegmenter(
-                sample_rate=source.sample_rate,
-                enabled=self._cfg.pre_vad_enabled,
-                detector_threshold=self._cfg.pre_vad_threshold,
-                detector_energy_rms_threshold=self._cfg.pre_vad_energy_rms_threshold,
-                trailing_silence_seconds=self._cfg.pre_vad_trailing_silence_seconds,
-                max_segment_seconds=self._cfg.pre_vad_max_segment_seconds,
-            )
+
+            def make_pre_vad_segmenter() -> PreVadSegmenter:
+                return PreVadSegmenter(
+                    sample_rate=source.sample_rate,
+                    enabled=self._cfg.pre_vad_enabled,
+                    detector_threshold=self._cfg.pre_vad_threshold,
+                    detector_energy_rms_threshold=self._cfg.pre_vad_energy_rms_threshold,
+                    trailing_silence_seconds=self._cfg.pre_vad_trailing_silence_seconds,
+                    max_segment_seconds=self._cfg.pre_vad_max_segment_seconds,
+                )
+
+            pre_vad = make_pre_vad_segmenter()
             noise_reducer = AdaptiveNoiseReducer(
                 sample_rate=source.sample_rate,
                 enabled=self._cfg.denoise_enabled,
@@ -842,6 +968,61 @@ class SessionManager:
             weak_rescue_start_time: Optional[float] = None
             weak_rescue_duration: float = 0.0
             weak_rescue_last_attempt_end: float = -1_000_000.0
+            recent_audio_chunks: list[AudioChunk] = []
+            recent_audio_duration = 0.0
+            recent_audio_max_seconds = max(
+                self._cfg.fast_preview_window_seconds + 2.0,
+                self._cfg.fast_preview_window_seconds * 2.0,
+            )
+
+            def append_recent_audio(chunk: AudioChunk) -> None:
+                nonlocal recent_audio_duration
+                if not self._cfg.fast_preview_enabled:
+                    return
+                samples = chunk.samples.astype(np.float32, copy=False).copy()
+                recent_audio_chunks.append(
+                    AudioChunk(
+                        samples=samples,
+                        sample_rate=chunk.sample_rate,
+                        start_time=chunk.start_time,
+                    )
+                )
+                recent_audio_duration += len(samples) / chunk.sample_rate
+                while recent_audio_chunks and recent_audio_duration > recent_audio_max_seconds:
+                    old = recent_audio_chunks.pop(0)
+                    recent_audio_duration = max(
+                        0.0,
+                        recent_audio_duration - len(old.samples) / old.sample_rate,
+                    )
+
+            def snapshot_recent_audio() -> tuple[np.ndarray, int, float] | None:
+                if not recent_audio_chunks:
+                    return None
+                sample_rate = recent_audio_chunks[-1].sample_rate
+                target_frames = max(1, int(self._cfg.fast_preview_window_seconds * sample_rate))
+                selected: list[AudioChunk] = []
+                frame_count = 0
+                for chunk in reversed(recent_audio_chunks):
+                    if chunk.sample_rate != sample_rate:
+                        break
+                    selected.append(chunk)
+                    frame_count += len(chunk.samples)
+                    if frame_count >= target_frames:
+                        break
+                if not selected:
+                    return None
+                selected.reverse()
+                samples = np.concatenate([chunk.samples for chunk in selected]).astype(np.float32, copy=False)
+                if len(samples) > target_frames:
+                    samples = samples[-target_frames:]
+                    buf_start = selected[-1].start_time + (
+                        len(selected[-1].samples) - min(len(selected[-1].samples), len(samples))
+                    ) / sample_rate
+                    total_selected_frames = sum(len(chunk.samples) for chunk in selected)
+                    buf_start = selected[0].start_time + max(0, total_selected_frames - len(samples)) / sample_rate
+                else:
+                    buf_start = selected[0].start_time
+                return samples.copy(), sample_rate, buf_start
 
             def clear_weak_rescue_buffer() -> None:
                 nonlocal weak_rescue_start_time, weak_rescue_duration
@@ -849,6 +1030,19 @@ class SessionManager:
                 weak_rescue_start_time = None
                 weak_rescue_duration = 0.0
                 self._state.weak_rescue_buffer_seconds = 0.0
+
+            def drop_live_buffers() -> None:
+                nonlocal accum_duration, accum_start_time, overlap_buf, pre_vad, recent_audio_duration
+                accum_samples.clear()
+                accum_chunk_rms.clear()
+                accum_duration = 0.0
+                accum_start_time = 0.0
+                overlap_buf = np.zeros(0, dtype=np.float32)
+                pre_vad = make_pre_vad_segmenter()
+                clear_weak_rescue_buffer()
+                recent_audio_chunks.clear()
+                recent_audio_duration = 0.0
+                self._state.fast_preview_segment = None
 
             async def maybe_rescue_weak_speech(
                 *,
@@ -1144,42 +1338,124 @@ class SessionManager:
                 self._schedule_summary(self._maybe_emit_memory())
                 self._schedule_summary(self._maybe_emit_cumulative())
 
-            try:
+            queue_chunk_seconds = max(0.05, self._cfg.audio_chunk_seconds)
+            audio_queue_maxsize = max(
+                1,
+                int(self._cfg.audio_input_queue_max_seconds / queue_chunk_seconds),
+            )
+            audio_queue: asyncio.Queue[AudioChunk | None] = asyncio.Queue(maxsize=audio_queue_maxsize)
+            self._state.audio_input_backlog_seconds = 0.0
+
+            async def enqueue_end_sentinel() -> None:
+                while audio_queue.full():
+                    dropped = audio_queue.get_nowait()
+                    if dropped is not None:
+                        dropped_seconds = len(dropped.samples) / dropped.sample_rate
+                        self._state.audio_input_backlog_seconds = max(
+                            0.0,
+                            self._state.audio_input_backlog_seconds - dropped_seconds,
+                        )
+                        self._state.audio_input_queue_drop_total += 1
+                await audio_queue.put(None)
+
+            async def fast_preview_loop() -> None:
+                if not self._cfg.fast_preview_enabled:
+                    return
+                interval = max(0.2, self._cfg.fast_preview_interval_seconds)
+                try:
+                    while not self._stopped.is_set():
+                        try:
+                            await asyncio.wait_for(self._stopped.wait(), timeout=interval)
+                            return
+                        except asyncio.TimeoutError:
+                            pass
+                        if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
+                            return
+                        if not self._pause_gate.is_set():
+                            self._state.fast_preview_segment = None
+                            await self._emit_transcript_preview()
+                            continue
+                        if self._state.pending_segments or self._state.preview_candidate_segment is not None:
+                            continue
+                        if self._state.fast_preview_inflight or self._state.asr_inflight_start_wall_time is not None:
+                            self._state.fast_preview_skipped += 1
+                            continue
+                        if self._state.audio_input_backlog_seconds > self._cfg.fast_preview_max_backlog_seconds:
+                            self._state.fast_preview_skipped += 1
+                            continue
+                        rtf = self._state.asr_realtime_factor
+                        if rtf is not None and rtf > self._cfg.fast_preview_max_asr_realtime_factor:
+                            self._state.fast_preview_skipped += 1
+                            continue
+
+                        snap = snapshot_recent_audio()
+                        if snap is None:
+                            continue
+                        samples, sample_rate, buf_start = snap
+                        rms = float(np.sqrt(np.mean(samples ** 2))) if samples.size else 0.0
+                        if rms < self._cfg.fast_preview_min_rms:
+                            self._state.fast_preview_segment = None
+                            await self._emit_transcript_preview()
+                            continue
+
+                        conditioned = audio_conditioner.process_samples(samples)
+                        prompt = self._cfg.vocabulary_hint or None
+                        effective_lang = self._cfg.forced_language or (
+                            self._state.locked_language if self._cfg.language_lock_enabled else None
+                        )
+                        try:
+                            seg = await self._transcribe_fast_preview_window(
+                                loop,
+                                conditioned,
+                                sample_rate,
+                                buf_start=buf_start,
+                                prompt=prompt,
+                                forced_language=effective_lang,
+                            )
+                        except Exception as exc:
+                            self._state.fast_preview_skipped += 1
+                            logger.debug("fast preview ASR skipped: %s", exc)
+                            continue
+                        if seg is not None:
+                            self._state.fast_preview_segment = seg
+                            await self._emit_transcript_preview(seg)
+                except asyncio.CancelledError:
+                    raise
+
+            async def read_audio_source() -> None:
                 try:
                     async for raw_chunk in source.stream():
                         if self._stopped.is_set():
                             break
                         if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
-                            source_switched = True
                             break
 
                         now = time.monotonic()
                         if self._state.first_chunk_wall_time is None:
                             self._state.first_chunk_wall_time = now
                         self._state.last_chunk_wall_time = now
-                        chunk_rms = float(np.sqrt(np.mean(raw_chunk.samples ** 2)))
+                        chunk_rms = float(np.sqrt(np.mean(raw_chunk.samples ** 2))) if raw_chunk.samples.size else 0.0
                         if chunk_rms >= self._cfg.silence_rms_threshold:
                             self._state.last_voiced_chunk_wall_time = now
                             await self._recover_watchdog_episode(
                                 "audio_all_silent",
                                 "audio levels recovered above silence threshold",
                             )
+                        append_recent_audio(raw_chunk)
 
-                        energy_chunk = noise_reducer.process(raw_chunk)
-                        prepared_chunk = pre_vad_conditioner.process(energy_chunk)
-                        pre_vad.set_trailing_silence_seconds(
-                            self._resolve_pre_vad_trailing_silence_seconds()
-                        )
-                        vad_chunks = pre_vad.push(prepared_chunk)
-                        if vad_chunks:
-                            clear_weak_rescue_buffer()
-                        else:
-                            await maybe_rescue_weak_speech(
-                                energy_chunk=energy_chunk,
-                                prepared_chunk=prepared_chunk,
+                        chunk_seconds = len(raw_chunk.samples) / raw_chunk.sample_rate
+                        while audio_queue.full():
+                            dropped = audio_queue.get_nowait()
+                            if dropped is None:
+                                continue
+                            dropped_seconds = len(dropped.samples) / dropped.sample_rate
+                            self._state.audio_input_backlog_seconds = max(
+                                0.0,
+                                self._state.audio_input_backlog_seconds - dropped_seconds,
                             )
-                        for chunk in vad_chunks:
-                            await consume_asr_chunk(chunk)
+                            self._state.audio_input_queue_drop_total += 1
+                        await audio_queue.put(raw_chunk)
+                        self._state.audio_input_backlog_seconds += chunk_seconds
                 except Exception as exc:
                     if not self._stopped.is_set():
                         logger.exception("audio source stream crashed")
@@ -1188,12 +1464,64 @@ class SessionManager:
                             message=f"audio source raised: {exc}",
                             status="error",
                         )
+                finally:
+                    await enqueue_end_sentinel()
+
+            reader_task = asyncio.create_task(read_audio_source())
+            preview_task = asyncio.create_task(fast_preview_loop())
+
+            try:
+                while not self._stopped.is_set():
+                    raw_chunk = await audio_queue.get()
+                    if raw_chunk is None:
+                        break
+                    chunk_seconds = len(raw_chunk.samples) / raw_chunk.sample_rate
+                    self._state.audio_input_backlog_seconds = max(
+                        0.0,
+                        self._state.audio_input_backlog_seconds - chunk_seconds,
+                    )
+                    if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
+                        source_switched = True
+                        break
+                    if not self._pause_gate.is_set():
+                        drop_live_buffers()
+                        continue
+
+                    energy_chunk = noise_reducer.process(raw_chunk)
+                    prepared_chunk = pre_vad_conditioner.process(energy_chunk)
+                    pre_vad.set_trailing_silence_seconds(
+                        self._resolve_pre_vad_trailing_silence_seconds()
+                    )
+                    vad_chunks = pre_vad.push(prepared_chunk)
+                    if vad_chunks:
+                        clear_weak_rescue_buffer()
+                    else:
+                        await maybe_rescue_weak_speech(
+                            energy_chunk=energy_chunk,
+                            prepared_chunk=prepared_chunk,
+                        )
+                    for chunk in vad_chunks:
+                        await consume_asr_chunk(chunk)
+
+                if not reader_task.done():
+                    reader_task.cancel()
+                    try:
+                        await reader_task
+                    except asyncio.CancelledError:
+                        pass
+                if not preview_task.done():
+                    preview_task.cancel()
+                    try:
+                        await preview_task
+                    except asyncio.CancelledError:
+                        pass
 
                 if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
                     source_switched = True
 
                 if source_switched:
                     self._clear_preview_candidate()
+                    self._state.fast_preview_segment = None
                     self._state.pending_segments.clear()
                     await self._emit_transcript_preview(None)
                     continue
@@ -1303,8 +1631,21 @@ class SessionManager:
                 await self._emit_final()
                 break
             except Exception as exc:
+                if "reader_task" in locals() and not reader_task.done():
+                    reader_task.cancel()
+                    try:
+                        await reader_task
+                    except asyncio.CancelledError:
+                        pass
+                if "preview_task" in locals() and not preview_task.done():
+                    preview_task.cancel()
+                    try:
+                        await preview_task
+                    except asyncio.CancelledError:
+                        pass
                 if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
                     self._clear_preview_candidate()
+                    self._state.fast_preview_segment = None
                     self._state.pending_segments.clear()
                     await self._emit_transcript_preview(None)
                     continue
@@ -1451,7 +1792,7 @@ class SessionManager:
         self._state.last_progress_emit_second = current_second
         await self._emit(
             "session_state",
-            self._session_state_payload(state="running"),
+            self._session_state_payload(state=self._active_state_name()),
         )
 
     def _asr_accumulation_hard_cap_seconds(self) -> float:
@@ -1607,32 +1948,12 @@ class SessionManager:
         forced_language: Optional[str],
     ):
         audio_seconds = len(samples) / sample_rate
-        start = time.perf_counter()
-        segments = await loop.run_in_executor(
-            self._asr_executor,
-            lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
-                m,
-                sr,
-                forced_language=fl,
-                offset_seconds=0.0,
-                initial_prompt=p,
-                quality_preset="realtime",
-            ),
-        )
-        realtime_wall = time.perf_counter() - start
-        self._record_asr_timing(
-            audio_seconds=audio_seconds,
-            wall_seconds=realtime_wall,
-            phase="realtime",
-        )
-        if (
-            self._cfg.asr_retry_enabled
-            and not self._asr_safeguard_active()
-            and any(self._classify_asr_segment(seg) == "retry" for seg in segments)
-        ):
-            logger.info("retrying ASR window with higher-quality preset")
-            retry_start = time.perf_counter()
-            retry_segments = await loop.run_in_executor(
+        try:
+            self._state.asr_inflight_start_wall_time = time.monotonic()
+            self._state.asr_inflight_audio_seconds = audio_seconds
+            self._state.asr_inflight_phase = "realtime"
+            start = time.perf_counter()
+            segments = await loop.run_in_executor(
                 self._asr_executor,
                 lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
                     m,
@@ -1640,18 +1961,136 @@ class SessionManager:
                     forced_language=fl,
                     offset_seconds=0.0,
                     initial_prompt=p,
-                    quality_preset="retry",
+                    quality_preset="realtime",
                 ),
             )
-            retry_wall = time.perf_counter() - retry_start
+            realtime_wall = time.perf_counter() - start
             self._record_asr_timing(
                 audio_seconds=audio_seconds,
-                wall_seconds=realtime_wall + retry_wall,
-                phase="retry",
+                wall_seconds=realtime_wall,
+                phase="realtime",
             )
-            self._log_retry_outcome(segments, retry_segments)
-            return retry_segments
-        return segments
+            if (
+                self._cfg.asr_retry_enabled
+                and not self._asr_safeguard_active()
+                and any(self._classify_asr_segment(seg) == "retry" for seg in segments)
+            ):
+                logger.info("retrying ASR window with higher-quality preset")
+                self._state.asr_inflight_start_wall_time = time.monotonic()
+                self._state.asr_inflight_phase = "retry"
+                retry_start = time.perf_counter()
+                retry_segments = await loop.run_in_executor(
+                    self._asr_executor,
+                    lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
+                        m,
+                        sr,
+                        forced_language=fl,
+                        offset_seconds=0.0,
+                        initial_prompt=p,
+                        quality_preset="retry",
+                    ),
+                )
+                retry_wall = time.perf_counter() - retry_start
+                self._record_asr_timing(
+                    audio_seconds=audio_seconds,
+                    wall_seconds=realtime_wall + retry_wall,
+                    phase="retry",
+                )
+                self._log_retry_outcome(segments, retry_segments)
+                return retry_segments
+            return segments
+        finally:
+            self._state.asr_inflight_start_wall_time = None
+            self._state.asr_inflight_audio_seconds = None
+            self._state.asr_inflight_phase = None
+
+    async def _transcribe_fast_preview_window(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        samples: np.ndarray,
+        sample_rate: int,
+        *,
+        buf_start: float,
+        prompt: Optional[str],
+        forced_language: Optional[str],
+    ) -> Optional[TranscriptSegment]:
+        audio_seconds = len(samples) / sample_rate
+        if audio_seconds <= 0.0:
+            return None
+
+        self._state.fast_preview_attempts += 1
+        self._state.fast_preview_inflight = True
+        start = time.perf_counter()
+        try:
+            segments = await loop.run_in_executor(
+                self._asr_executor,
+                lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(
+                    m,
+                    sr,
+                    forced_language=fl,
+                    offset_seconds=0.0,
+                    initial_prompt=p,
+                    quality_preset="realtime",
+                ),
+            )
+        finally:
+            wall = time.perf_counter() - start
+            self._state.fast_preview_last_audio_seconds = audio_seconds
+            self._state.fast_preview_last_wall_seconds = wall
+            self._state.fast_preview_realtime_factor = wall / max(audio_seconds, 1e-6)
+            self._state.fast_preview_inflight = False
+
+        last_committed_rel = None
+        if self._state.last_emitted_end_time is not None:
+            last_committed_rel = max(0.0, self._state.last_emitted_end_time - buf_start)
+
+        usable: list[ASRSegment] = []
+        for asr_seg in segments:
+            if last_committed_rel is not None and asr_seg.end_time <= last_committed_rel + 0.1:
+                continue
+            if not asr_seg.text.strip():
+                continue
+            if self._is_pure_filler(asr_seg.text, asr_seg.language):
+                continue
+            if self._classify_asr_segment(asr_seg) == "drop":
+                continue
+            usable.append(asr_seg)
+
+        if not usable:
+            self._state.fast_preview_skipped += 1
+            return None
+
+        first = usable[0]
+        last = usable[-1]
+        language = last.language
+        text = ""
+        for asr_seg in usable:
+            text = self._join_segment_text(text, asr_seg.text.strip(), asr_seg.language)
+        if not text.strip():
+            self._state.fast_preview_skipped += 1
+            return None
+
+        quality = "ok"
+        for asr_seg in usable:
+            quality = self._merge_quality(quality, self._compute_quality(asr_seg))
+
+        seg = TranscriptSegment(
+            id=f"preview-{uuid.uuid4()}",
+            meeting_id=self._state.meeting_id,
+            start_time=buf_start + first.start_time,
+            end_time=buf_start + last.end_time,
+            text=text,
+            original_language=language,
+            confidence=min(s.confidence for s in usable),
+            quality=quality,
+            created_at=datetime.now(tz=timezone.utc),
+            emitted_at_elapsed_seconds=max(
+                self._state.elapsed_seconds,
+                buf_start + last.end_time,
+            ),
+        )
+        self._state.fast_preview_emitted += 1
+        return seg
 
     def _classify_asr_segment(self, seg) -> str:
         text = seg.text.strip()
@@ -1774,7 +2213,9 @@ class SessionManager:
         pending = self._latest_pending_segment()
         if pending is not None:
             return pending
-        return self._state.preview_candidate_segment
+        if self._state.preview_candidate_segment is not None:
+            return self._state.preview_candidate_segment
+        return self._state.fast_preview_segment
 
     def _can_merge_pending_segment(self, seg: TranscriptSegment) -> bool:
         pending = self._latest_pending_segment()
@@ -1821,6 +2262,11 @@ class SessionManager:
         self._cfg.storage.insert_segment(seg)
         self._state.last_emitted_text = seg.text.strip()
         self._state.last_emitted_end_time = seg.end_time
+        if (
+            self._state.fast_preview_segment is not None
+            and self._state.fast_preview_segment.end_time <= seg.end_time + 0.1
+        ):
+            self._state.fast_preview_segment = None
         await self._emit("transcript_segment", seg)
         if self._cfg.live_translation_language is not None:
             self._schedule_translation(seg, self._cfg.live_translation_language)
@@ -1981,11 +2427,14 @@ class SessionManager:
         return snap
 
     async def _maybe_emit_rolling(self) -> None:
+        await self._emit_rolling(force=False)
+
+    async def _emit_rolling(self, *, force: bool) -> None:
         if self._state.rolling_in_flight:
             return
         now = self._state.elapsed_seconds
         due = (now - self._state.last_rolling_at) >= self._cfg.rolling_interval_seconds
-        if not due:
+        if not due and not force:
             return
         window_segments = self._segments_in_window(self._cfg.rolling_window_seconds)
         if len(window_segments) < self._cfg.min_segments_for_rolling:
@@ -2042,11 +2491,14 @@ class SessionManager:
             self._state.memory_in_flight = False
 
     async def _maybe_emit_cumulative(self) -> None:
+        await self._emit_cumulative(force=False)
+
+    async def _emit_cumulative(self, *, force: bool) -> None:
         if self._state.cumulative_in_flight:
             return
         now = self._state.elapsed_seconds
         due = (now - self._state.last_cumulative_at) >= self._cfg.cumulative_interval_seconds
-        if not due:
+        if not due and not force:
             return
         context_segments = self._summary_context_segments()
         if len(context_segments) < self._cfg.min_segments_for_cumulative:

@@ -436,6 +436,14 @@ async def session_ws(
         live_translation_backfill_limit=_env_int("MEETINGBRO_LIVE_TRANSLATION_BACKFILL_LIMIT", 20),
         live_translation_max_pending=_env_int("MEETINGBRO_LIVE_TRANSLATION_MAX_PENDING", 12),
         live_translation_safeguard_max_pending=_env_int("MEETINGBRO_LIVE_TRANSLATION_SAFEGUARD_MAX_PENDING", 4),
+        audio_input_queue_max_seconds=_env_float("MEETINGBRO_AUDIO_INPUT_QUEUE_MAX_SECONDS", 8.0),
+        audio_input_queue_warning_seconds=_env_float("MEETINGBRO_AUDIO_INPUT_QUEUE_WARNING_SECONDS", 3.0),
+        fast_preview_enabled=_env_bool("MEETINGBRO_FAST_PREVIEW_ENABLED", True),
+        fast_preview_interval_seconds=_env_float("MEETINGBRO_FAST_PREVIEW_INTERVAL_SECONDS", 0.8),
+        fast_preview_window_seconds=_env_float("MEETINGBRO_FAST_PREVIEW_WINDOW_SECONDS", 3.0),
+        fast_preview_max_backlog_seconds=_env_float("MEETINGBRO_FAST_PREVIEW_MAX_BACKLOG_SECONDS", 0.5),
+        fast_preview_max_asr_realtime_factor=_env_float("MEETINGBRO_FAST_PREVIEW_MAX_ASR_RTF", 0.65),
+        fast_preview_min_rms=_env_float("MEETINGBRO_FAST_PREVIEW_MIN_RMS", 0.002),
         asr_executor_workers=_env_int(
             "MEETINGBRO_ASR_EXECUTOR_WORKERS",
             _recommended_asr_executor_workers(),
@@ -540,6 +548,15 @@ async def session_ws(
                         "audio_chunk_seconds": next_chunk_seconds,
                     },
                 )
+            elif data.get("type") == "pause":
+                await manager.pause()
+            elif data.get("type") == "resume":
+                await manager.resume()
+            elif data.get("type") == "request_summary":
+                payload = data.get("payload") or {}
+                summary_type = payload.get("summary_type")
+                if summary_type in {"rolling_summary", "cumulative_meeting_summary"}:
+                    await manager.request_summary(summary_type)
             elif data.get("type") == "stop":
                 break
     except WebSocketDisconnect:
