@@ -128,6 +128,12 @@ class SessionConfig:
     asr_executor_workers: int = 1
     summary_executor_workers: int = 1
     translation_executor_workers: int = 1
+    filler_filter_enabled: bool = True
+    filler_tokens: dict[str, list[str]] = field(default_factory=lambda: {
+        "zh": ["嗯", "嗯嗯", "嗯嗯嗯", "呃", "呃呃", "哦", "哦哦", "噢", "唔"],
+        "en": ["um", "uh", "er", "ah", "hmm", "mm", "mhm", "mmhm", "mm-hmm"],
+        "de": ["äh", "ähm", "hm", "hmm", "öh", "öhm"],
+    })
 
 
 @dataclass
@@ -176,6 +182,7 @@ class _State:
     weak_rescue_emitted: int = 0
     weak_rescue_buffer_seconds: float = 0.0
     translation_backlog_trim_total: int = 0
+    filler_filtered_total: int = 0
     last_emitted_end_time: Optional[float] = None
     first_chunk_wall_time: Optional[float] = None
     last_chunk_wall_time: Optional[float] = None
@@ -560,6 +567,19 @@ class SessionManager:
         if last_end is None:
             return False
         return seg.start_time <= last_end + 1.0
+
+    def _is_pure_filler(self, text: str, language: str) -> bool:
+        if not self._cfg.filler_filter_enabled:
+            return False
+        if not text:
+            return False
+        normalized = text.strip().lower()
+        for ch in '.,!?;:。，！？、；：…—–"\'(){}[]':
+            normalized = normalized.replace(ch, "")
+        normalized = normalized.strip()
+        if not normalized:
+            return True
+        return normalized in self._cfg.filler_tokens.get(language, [])
 
     async def _queue_preview_candidate(self, seg: TranscriptSegment) -> None:
         self._state.preview_candidate_segment = seg
@@ -997,6 +1017,10 @@ class SessionManager:
                 for asr_seg in segments:
                     if asr_seg.start_time < overlap_duration:
                         continue
+                    if self._is_pure_filler(asr_seg.text, asr_seg.language):
+                        self._state.filler_filtered_total += 1
+                        logger.debug("filler segment dropped: %r (lang=%s)", asr_seg.text, asr_seg.language)
+                        continue
                     if self._classify_asr_segment(asr_seg) != "keep":
                         continue
     
@@ -1215,6 +1239,10 @@ class SessionManager:
                             segments = []
                     for asr_seg in segments:
                         if asr_seg.start_time < overlap_duration:
+                            continue
+                        if self._is_pure_filler(asr_seg.text, asr_seg.language):
+                            self._state.filler_filtered_total += 1
+                            logger.debug("filler segment dropped: %r (lang=%s)", asr_seg.text, asr_seg.language)
                             continue
                         if self._classify_asr_segment(asr_seg) != "keep":
                             continue
