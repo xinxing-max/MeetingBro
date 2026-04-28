@@ -27,6 +27,7 @@ from .schemas import (
     TranscriptSegment,
 )
 from .session.manager import SessionConfig, SessionManager
+from .session.profiles import DEFAULT_RUNTIME_PROFILE, normalize_runtime_profile, runtime_profile_defaults
 from .storage.db import Storage
 from .summarization.llm import LLMSummarizer
 from .translation.llm import LLMTranslator
@@ -89,6 +90,57 @@ def _env_bool(name: str, default: bool) -> bool:
         return False
     logger.warning("invalid %s=%r, using default %s", name, value, default)
     return default
+
+
+def _profile_value(profile: dict[str, object], key: str, env_name: str, default: object) -> object:
+    if env_name in os.environ:
+        return os.environ[env_name]
+    return profile.get(key, default)
+
+
+def _profile_float(profile: dict[str, object], key: str, env_name: str, default: float) -> float:
+    value = _profile_value(profile, key, env_name, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("invalid %s/%s=%r, using default %.3f", key, env_name, value, default)
+        return default
+
+
+def _profile_bool(profile: dict[str, object], key: str, env_name: str, default: bool) -> bool:
+    value = _profile_value(profile, key, env_name, default)
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("invalid %s/%s=%r, using default %s", key, env_name, value, default)
+    return default
+
+
+def _runtime_settings_from_profile(profile_name: str) -> dict[str, object]:
+    profile = runtime_profile_defaults(profile_name)
+    return {
+        "asr_accumulation_seconds": _profile_float(profile, "asr_accumulation_seconds", "MEETINGBRO_ASR_ACCUM_SECONDS", 1.5),
+        "asr_early_flush_enabled": _profile_bool(profile, "asr_early_flush_enabled", "MEETINGBRO_ASR_EARLY_FLUSH_ENABLED", True),
+        "asr_early_flush_min_seconds": _profile_float(profile, "asr_early_flush_min_seconds", "MEETINGBRO_ASR_EARLY_FLUSH_MIN_SECONDS", 0.8),
+        "silence_commit_min_confidence": _profile_float(profile, "silence_commit_min_confidence", "MEETINGBRO_SILENCE_COMMIT_MIN_CONFIDENCE", 0.75),
+        "silence_commit_min_duration_seconds": _profile_float(profile, "silence_commit_min_duration_seconds", "MEETINGBRO_SILENCE_COMMIT_MIN_DURATION_SECONDS", 0.6),
+        "pre_vad_enabled": _profile_bool(profile, "pre_vad_enabled", "MEETINGBRO_PRE_VAD_ENABLED", True),
+        "pre_vad_trailing_silence_seconds": _profile_float(profile, "pre_vad_trailing_silence_seconds", "MEETINGBRO_PRE_VAD_TRAILING_SILENCE_SECONDS", 0.45),
+        "pre_vad_adaptive_trailing_silence_enabled": _profile_bool(profile, "pre_vad_adaptive_trailing_silence_enabled", "MEETINGBRO_PRE_VAD_ADAPTIVE_TRAILING_SILENCE_ENABLED", True),
+        "pre_vad_adaptive_fast_trailing_silence_seconds": _profile_float(profile, "pre_vad_adaptive_fast_trailing_silence_seconds", "MEETINGBRO_PRE_VAD_ADAPTIVE_FAST_TRAILING_SILENCE_SECONDS", 0.30),
+        "language_lock_enabled": _profile_bool(profile, "language_lock_enabled", "MEETINGBRO_LANGUAGE_LOCK_ENABLED", False),
+        "weak_speech_rescue_enabled": _profile_bool(profile, "weak_speech_rescue_enabled", "MEETINGBRO_WEAK_SPEECH_RESCUE_ENABLED", True),
+        "weak_speech_rescue_fast_window_seconds": _profile_float(profile, "weak_speech_rescue_fast_window_seconds", "MEETINGBRO_WEAK_SPEECH_RESCUE_FAST_WINDOW_SECONDS", 2.5),
+    }
+
+
+def _chunk_seconds_for_profile(profile_name: str) -> float:
+    profile = runtime_profile_defaults(profile_name)
+    return _profile_float(profile, "chunk_seconds", "MEETINGBRO_CHUNK_SECONDS", 0.5)
 
 
 @asynccontextmanager
@@ -209,7 +261,7 @@ async def list_summaries(
     return storage.list_snapshots(meeting_id, summary_type=summary_type)  # type: ignore[arg-type]
 
 
-def _build_audio_source(source: str) -> AudioSource:
+def _build_audio_source(source: str, *, chunk_seconds: Optional[float] = None) -> AudioSource:
     """Build an AudioSource from a URI-like spec.
 
     - "mic" or empty: microphone capture (offline / in-person mode).
@@ -218,7 +270,7 @@ def _build_audio_source(source: str) -> AudioSource:
     - "mixed": microphone + system loopback mixed together.
     - "file:<path>": replay a WAV file for the E2E vertical-slice test.
     """
-    chunk_seconds = _env_float("MEETINGBRO_CHUNK_SECONDS", 0.5)
+    chunk_seconds = chunk_seconds if chunk_seconds is not None else _env_float("MEETINGBRO_CHUNK_SECONDS", 0.5)
     if not source or source == "mic":
         return MicrophoneSource(sample_rate=16_000, chunk_seconds=chunk_seconds)
     if source in ("loopback", "system"):
@@ -258,13 +310,17 @@ async def session_ws(
     source: str = Query(default="mic"),
     summary_language: str = Query(default="en"),
     forced_language: Optional[str] = Query(default=None),
+    runtime_profile: Optional[str] = Query(default=None),
 ) -> None:
     await ws.accept()
 
     summary_lang: LanguageCode = summary_language if summary_language in ("zh", "en", "de") else "en"  # type: ignore[assignment]
+    profile_name = normalize_runtime_profile(runtime_profile or os.environ.get("MEETINGBRO_RUNTIME_PROFILE"))
+    profile_settings = _runtime_settings_from_profile(profile_name)
+    chunk_seconds = _chunk_seconds_for_profile(profile_name)
 
     try:
-        audio_source = _build_audio_source(source)
+        audio_source = _build_audio_source(source, chunk_seconds=chunk_seconds)
     except Exception as exc:
         await ws.send_text(
             json.dumps(
@@ -280,6 +336,8 @@ async def session_ws(
     config = SessionConfig(
         audio_source=audio_source,
         audio_source_name=source,
+        audio_chunk_seconds=chunk_seconds,
+        runtime_profile=profile_name,
         asr=app.state.asr,
         summarizer=LLMSummarizer(),
         translator=LLMTranslator(),
@@ -287,7 +345,7 @@ async def session_ws(
         forced_language=forced_language,
         summary_language=summary_lang,
         live_translation_language=None,
-        asr_accumulation_seconds=_env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 1.5),
+        asr_accumulation_seconds=float(profile_settings["asr_accumulation_seconds"]),
         silence_rms_threshold=_env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.002),
         asr_overlap_seconds=_env_float("MEETINGBRO_ASR_OVERLAP_SECONDS", 0.0),
         vocabulary_hint=os.environ.get("MEETINGBRO_VOCABULARY_HINT") or None,
@@ -307,6 +365,10 @@ async def session_ws(
         asr_safeguard_enabled=_env_bool("MEETINGBRO_ASR_SAFEGUARD_ENABLED", True),
         asr_safeguard_rtf_threshold=_env_float("MEETINGBRO_ASR_SAFEGUARD_RTF_THRESHOLD", 0.9),
         asr_safeguard_cooldown_windows=_env_int("MEETINGBRO_ASR_SAFEGUARD_COOLDOWN_WINDOWS", 5),
+        asr_early_flush_enabled=bool(profile_settings["asr_early_flush_enabled"]),
+        asr_early_flush_min_seconds=float(profile_settings["asr_early_flush_min_seconds"]),
+        silence_commit_min_confidence=float(profile_settings["silence_commit_min_confidence"]),
+        silence_commit_min_duration_seconds=float(profile_settings["silence_commit_min_duration_seconds"]),
         denoise_enabled=_env_bool("MEETINGBRO_DENOISE_ENABLED", False),
         denoise_strength=_env_float("MEETINGBRO_DENOISE_STRENGTH", 1.1),
         denoise_noise_update_rms_threshold=_env_float(
@@ -318,21 +380,24 @@ async def session_ws(
         audio_conditioning_min_rms=_env_float("MEETINGBRO_AUDIO_CONDITIONING_MIN_RMS", 0.003),
         audio_conditioning_max_gain=_env_float("MEETINGBRO_AUDIO_CONDITIONING_MAX_GAIN", 2.5),
         audio_conditioning_peak_limit=_env_float("MEETINGBRO_AUDIO_CONDITIONING_PEAK_LIMIT", 0.98),
-        pre_vad_enabled=_env_bool("MEETINGBRO_PRE_VAD_ENABLED", True),
+        pre_vad_enabled=bool(profile_settings["pre_vad_enabled"]),
         pre_vad_conditioning_enabled=_env_bool("MEETINGBRO_PRE_VAD_CONDITIONING_ENABLED", True),
         pre_vad_conditioning_target_rms=_env_float("MEETINGBRO_PRE_VAD_CONDITIONING_TARGET_RMS", 0.03),
         pre_vad_conditioning_min_rms=_env_float("MEETINGBRO_PRE_VAD_CONDITIONING_MIN_RMS", 0.001),
         pre_vad_conditioning_max_gain=_env_float("MEETINGBRO_PRE_VAD_CONDITIONING_MAX_GAIN", 4.0),
         pre_vad_threshold=_env_float("MEETINGBRO_PRE_VAD_THRESHOLD", 0.38),
         pre_vad_energy_rms_threshold=_env_float("MEETINGBRO_PRE_VAD_ENERGY_RMS_THRESHOLD", 0.005),
-        pre_vad_trailing_silence_seconds=_env_float("MEETINGBRO_PRE_VAD_TRAILING_SILENCE_SECONDS", 0.45),
+        pre_vad_trailing_silence_seconds=float(profile_settings["pre_vad_trailing_silence_seconds"]),
+        pre_vad_adaptive_trailing_silence_enabled=bool(profile_settings["pre_vad_adaptive_trailing_silence_enabled"]),
+        pre_vad_adaptive_fast_trailing_silence_seconds=float(profile_settings["pre_vad_adaptive_fast_trailing_silence_seconds"]),
         pre_vad_max_segment_seconds=_env_float("MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS", 8.0),
-        weak_speech_rescue_enabled=_env_bool("MEETINGBRO_WEAK_SPEECH_RESCUE_ENABLED", True),
+        weak_speech_rescue_enabled=bool(profile_settings["weak_speech_rescue_enabled"]),
         weak_speech_rescue_rms_min=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MIN", 0.0008),
         weak_speech_rescue_rms_max=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MAX", 0.02),
+        weak_speech_rescue_fast_window_seconds=float(profile_settings["weak_speech_rescue_fast_window_seconds"]),
         weak_speech_rescue_window_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_WINDOW_SECONDS", 6.0),
         weak_speech_rescue_cooldown_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_COOLDOWN_SECONDS", 8.0),
-        language_lock_enabled=_env_bool("MEETINGBRO_LANGUAGE_LOCK_ENABLED", False),
+        language_lock_enabled=bool(profile_settings["language_lock_enabled"]),
         live_translation_backfill_limit=_env_int("MEETINGBRO_LIVE_TRANSLATION_BACKFILL_LIMIT", 20),
         live_translation_max_pending=_env_int("MEETINGBRO_LIVE_TRANSLATION_MAX_PENDING", 12),
         live_translation_safeguard_max_pending=_env_int("MEETINGBRO_LIVE_TRANSLATION_SAFEGUARD_MAX_PENDING", 4),
@@ -351,7 +416,14 @@ async def session_ws(
     )
     manager = SessionManager(config)
     await manager.start()
-    logger.info("session ws accepted meeting_id=%s source=%s", manager.meeting_id, source)
+    logger.info(
+        "session ws accepted meeting_id=%s source=%s profile=%s chunk=%.2fs accum=%.2fs",
+        manager.meeting_id,
+        source,
+        profile_name,
+        chunk_seconds,
+        config.asr_accumulation_seconds,
+    )
 
     forward_task = asyncio.create_task(_forward_events(manager, ws))
 
@@ -395,9 +467,14 @@ async def session_ws(
                 elif live_translation_language not in (None, "zh", "en", "de"):
                     live_translation_language = manager._cfg.live_translation_language
                 next_source = payload.get("source")
-                if next_source and next_source != source:
+                next_profile = normalize_runtime_profile(payload.get("runtime_profile") or manager._cfg.runtime_profile)
+                next_profile_settings = _runtime_settings_from_profile(next_profile)
+                next_chunk_seconds = _chunk_seconds_for_profile(next_profile)
+                profile_changed = next_profile != manager._cfg.runtime_profile
+                chunk_changed = abs(next_chunk_seconds - manager._cfg.audio_chunk_seconds) > 1e-6
+                if next_source and (next_source != source or (profile_changed and chunk_changed)):
                     try:
-                        next_audio_source = _build_audio_source(next_source)
+                        next_audio_source = _build_audio_source(next_source, chunk_seconds=next_chunk_seconds)
                     except Exception as exc:
                         await ws.send_text(
                             json.dumps(
@@ -408,12 +485,21 @@ async def session_ws(
                             )
                         )
                     else:
-                        manager.update_audio_source(next_audio_source, source_name=next_source)
+                        manager.update_audio_source(
+                            next_audio_source,
+                            source_name=next_source,
+                            chunk_seconds=next_chunk_seconds,
+                        )
                         source = next_source
                 manager.update_runtime_settings(
                     forced_language=forced_language,
                     summary_language=summary_lang,
                     live_translation_language=live_translation_language,
+                    runtime_profile=next_profile,
+                    runtime_settings={
+                        **next_profile_settings,
+                        "audio_chunk_seconds": next_chunk_seconds,
+                    },
                 )
             elif data.get("type") == "stop":
                 break

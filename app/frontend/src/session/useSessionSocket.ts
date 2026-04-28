@@ -29,6 +29,7 @@ export interface SessionOptions {
   summaryLanguage?: string;  // "en" | "zh" | "de"
   speechLanguage?: string;   // "auto" | "en" | "zh" | "de"
   subtitleLanguage?: string; // "off" | "en" | "zh" | "de"
+  runtimeProfile?: string;   // "balanced" | "low_latency" | "robust" | "multilingual" | "single_language"
 }
 
 export interface SessionView {
@@ -72,6 +73,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
   const summaryLanguage = options.summaryLanguage ?? "en";
   const speechLanguage = options.speechLanguage ?? "auto";
   const subtitleLanguage = options.subtitleLanguage ?? "off";
+  const runtimeProfile = options.runtimeProfile ?? "balanced";
 
   useEffect(() => {
     previewSegmentRef.current = previewSegment;
@@ -179,7 +181,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     setState("starting");
 
     const base = window.meetingbro?.backendWs ?? "ws://127.0.0.1:8765";
-    const params = new URLSearchParams({ source, summary_language: summaryLanguage });
+    const params = new URLSearchParams({ source, summary_language: summaryLanguage, runtime_profile: runtimeProfile });
     if (speechLanguage !== "auto") params.set("forced_language", speechLanguage);
     const url = `${base}/ws/session?${params.toString()}`;
     const ws = new WebSocket(url.startsWith("ws") ? url : DEFAULT_WS);
@@ -286,10 +288,11 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
           summary_language: summaryLanguage,
           forced_language: speechLanguage,
           subtitle_language: subtitleLanguage,
+          runtime_profile: runtimeProfile,
         },
       }),
     );
-  }, [connected, enabled, source, speechLanguage, subtitleLanguage, summaryLanguage]);
+  }, [connected, enabled, source, speechLanguage, subtitleLanguage, summaryLanguage, runtimeProfile]);
 
   const stopSession = useCallback(() => {
     const ws = wsRef.current;

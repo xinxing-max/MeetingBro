@@ -52,6 +52,10 @@ export interface SessionStatePayload {
   meeting_id: string;
   elapsed_seconds: number;
   source: string;
+  runtime_profile: string;
+  audio_chunk_seconds: number | null;
+  asr_accumulation_seconds: number | null;
+  language_lock_enabled: boolean;
   live_translation_language: LanguageCode | null;
   retry_windows_total: number;
   retry_windows_improved: number;

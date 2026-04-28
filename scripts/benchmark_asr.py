@@ -31,12 +31,14 @@ from meetingbro.asr.faster_whisper_adapter import FasterWhisperAdapter  # noqa: 
 from meetingbro.audio.capture import WavFileSource  # noqa: E402
 from meetingbro.llm.openai_compatible import _load_dotenv_if_present  # noqa: E402
 from meetingbro.session.manager import SessionConfig, SessionManager  # noqa: E402
+from meetingbro.session.profiles import RUNTIME_PROFILE_PRESETS  # noqa: E402
 from meetingbro.storage.db import Storage  # noqa: E402
 from meetingbro.summarization.base import Summarizer  # noqa: E402
 from meetingbro.translation.base import Translator  # noqa: E402
 
 
 PROFILE_PRESETS: dict[str, dict[str, Any]] = {
+    **{name: dict(values) for name, values in RUNTIME_PROFILE_PRESETS.items()},
     "legacy": {
         "chunk_seconds": 5.0,
         "asr_accumulation_seconds": 2.5,
@@ -68,14 +70,7 @@ PROFILE_PRESETS: dict[str, dict[str, Any]] = {
         "language_lock_enabled": False,
     },
     "full_current": {
-        "chunk_seconds": 0.5,
-        "asr_accumulation_seconds": 1.5,
-        "pre_vad_enabled": True,
-        "asr_early_flush_enabled": True,
-        "silence_commit_min_confidence": 0.75,
-        "silence_commit_min_duration_seconds": 0.6,
-        "pre_vad_adaptive_trailing_silence_enabled": True,
-        "language_lock_enabled": False,
+        **RUNTIME_PROFILE_PRESETS["balanced"],
     },
 }
 
@@ -202,7 +197,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--profiles",
         type=_parse_profiles,
         default=["full_current"],
-        help="Comma-separated named config profiles to compare. Default: full_current",
+        help="Comma-separated named config profiles to compare. Default: full_current (alias of balanced)",
     )
     parser.add_argument("--keywords", nargs="*", default=[], help="Expected keywords for rough recall.")
     parser.add_argument("--json-out", default=None, help="Optional JSON report path.")
@@ -232,6 +227,8 @@ async def _run_one(path: Path, args: argparse.Namespace, *, profile_name: str, o
             )
             cfg = SessionConfig(
                 audio_source=WavFileSource(path, sample_rate=16_000, chunk_seconds=chunk_seconds, realtime=False),
+                audio_chunk_seconds=chunk_seconds,
+                runtime_profile=profile_name,
                 asr=asr,
                 summarizer=NoopSummarizer(),
                 translator=NoopTranslator(),

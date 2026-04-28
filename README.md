@@ -162,14 +162,25 @@ $env:MEETINGBRO_WHISPER_SIZE="small"
 
 ## ASR performance / robustness tuning
 
-The default path is conservative: local Whisper on CPU, pre-ASR VAD enabled,
-light audio conditioning enabled, and language lock disabled so mixed
-Chinese/English/German meetings can be auto-detected segment by segment.
+The default runtime mode is **Balanced**: local Whisper on CPU, pre-ASR VAD
+enabled, light audio conditioning enabled, early flush enabled, and language
+lock disabled so mixed Chinese/English/German meetings can be auto-detected
+segment by segment.
+
+Runtime modes are available in the UI and through the WebSocket
+`runtime_profile` parameter:
+
+- `balanced` — default real-meeting trade-off between latency and stability.
+- `low_latency` — faster first preview/commit; may fragment more on long/noisy audio.
+- `robust` — longer context and less aggressive commits for noisy/long meetings.
+- `multilingual` — balanced settings with language lock explicitly off.
+- `single_language` — balanced settings with language lock on for mostly one-language meetings.
 
 Useful local `.env` options:
 
 ```text
 # Faster or GPU-capable machines
+MEETINGBRO_RUNTIME_PROFILE=balanced
 MEETINGBRO_WHISPER_SIZE=medium
 MEETINGBRO_WHISPER_DEVICE=cpu
 MEETINGBRO_WHISPER_COMPUTE_TYPE=int8

@@ -111,6 +111,23 @@ function formatLanguageLabel(language: "zh" | "en" | "de" | null | undefined): s
   }
 }
 
+function formatRuntimeProfileLabel(profile: string | null | undefined): string {
+  switch (profile) {
+    case "low_latency":
+      return "Low Latency";
+    case "robust":
+      return "Robust Meeting";
+    case "multilingual":
+      return "Multilingual";
+    case "single_language":
+      return "Single Language";
+    case "balanced":
+      return "Balanced";
+    default:
+      return profile ?? "Balanced";
+  }
+}
+
 function getMixedGainHint(
   tone: "ok" | "warn" | "danger" | "unknown",
   activeSource: string | null | undefined,
@@ -238,9 +255,10 @@ export default function App() {
   const [speechLanguage, setSpeechLanguage] = useState("auto");
   const [summaryLanguage, setSummaryLanguage] = useState("en");
   const [subtitleLanguage, setSubtitleLanguage] = useState("off");
+  const [runtimeProfile, setRuntimeProfile] = useState("balanced");
   const [sessionEnabled, setSessionEnabled] = useState(false);
   const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, latestByType, historyByType, notes, lastError, saveNote, stopSession } =
-    useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage });
+    useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage, runtimeProfile });
 
   const rolling = latestByType.rolling_summary;
   const cumulative = latestByType.cumulative_meeting_summary;
@@ -310,6 +328,10 @@ export default function App() {
   const asrAudioSeconds = sessionStats?.asr_last_audio_seconds ?? null;
   const asrSafeguardActive = sessionStats?.asr_safeguard_active ?? false;
   const asrSafeguardEvents = sessionStats?.asr_safeguard_events ?? 0;
+  const activeRuntimeProfile = sessionStats?.runtime_profile ?? runtimeProfile;
+  const activeChunkSeconds = sessionStats?.audio_chunk_seconds ?? null;
+  const activeAccumSeconds = sessionStats?.asr_accumulation_seconds ?? null;
+  const languageLockEnabled = sessionStats?.language_lock_enabled ?? false;
   const weakRescueAttempts = sessionStats?.weak_rescue_attempts ?? 0;
   const weakRescueEmitted = sessionStats?.weak_rescue_emitted ?? 0;
   const weakRescueBufferSeconds = sessionStats?.weak_rescue_buffer_seconds ?? 0;
@@ -418,6 +440,13 @@ export default function App() {
     });
   };
 
+  const handleRuntimeProfileChange = (value: string) => {
+    setRuntimeProfile(value);
+    if (value === "multilingual") {
+      setSpeechLanguage("auto");
+    }
+  };
+
   const transcriptEmptyMessage = !sessionEnabled
     ? "session stopped — press Start to begin capture"
     : state === "starting"
@@ -447,6 +476,13 @@ export default function App() {
             <option value="mic">Microphone</option>
             <option value="loopback">System Audio (Loopback)</option>
             <option value="mixed">System Audio + Microphone</option>
+          </select>
+          <select value={runtimeProfile} onChange={(e) => handleRuntimeProfileChange(e.target.value)}>
+            <option value="balanced">Mode: Balanced</option>
+            <option value="low_latency">Mode: Low Latency</option>
+            <option value="robust">Mode: Robust Meeting</option>
+            <option value="multilingual">Mode: Multilingual</option>
+            <option value="single_language">Mode: Single Language</option>
           </select>
           <select value={speechLanguage} onChange={(e) => setSpeechLanguage(e.target.value)}>
             <option value="auto">Speech: Auto / Multilingual</option>
@@ -607,6 +643,13 @@ export default function App() {
                   : activeSource === "loopback" || activeSource === "system"
                     ? "capturing system output only"
                     : "capturing microphone only"}
+              </span>
+            </div>
+            <div className="diagnostic-card">
+              <span className="diagnostic-label">Runtime Mode</span>
+              <strong className="diagnostic-value">{formatRuntimeProfileLabel(activeRuntimeProfile)}</strong>
+              <span className="diagnostic-note">
+                chunk {formatLagSeconds(activeChunkSeconds)} · ASR window {formatLagSeconds(activeAccumSeconds)} · lock {languageLockEnabled ? "on" : "off"}
               </span>
             </div>
             <div className={`diagnostic-card gain-card gain-${mixedGainTone}`}>

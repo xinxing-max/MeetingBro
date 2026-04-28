@@ -45,6 +45,8 @@ class SessionConfig:
     translator: Translator
     storage: Storage
     audio_source_name: str = "mic"
+    audio_chunk_seconds: float = 0.5
+    runtime_profile: str = "balanced"
     diarizer: Optional[Diarizer] = None
     forced_language: Optional[str] = None  # None => auto-detect
     summary_language: LanguageCode = "en"
@@ -246,6 +248,10 @@ class SessionManager:
             meeting_id=self._state.meeting_id,
             elapsed_seconds=self._state.elapsed_seconds,
             source=self._cfg.audio_source_name,
+            runtime_profile=self._cfg.runtime_profile,
+            audio_chunk_seconds=self._cfg.audio_chunk_seconds,
+            asr_accumulation_seconds=self._cfg.asr_accumulation_seconds,
+            language_lock_enabled=self._cfg.language_lock_enabled,
             live_translation_language=self._cfg.live_translation_language,
             retry_windows_total=self._state.retry_windows_total,
             retry_windows_improved=self._state.retry_windows_improved,
@@ -277,7 +283,37 @@ class SessionManager:
         forced_language: Optional[str],
         summary_language: Optional[LanguageCode] = None,
         live_translation_language: Optional[LanguageCode] = None,
+        runtime_profile: Optional[str] = None,
+        runtime_settings: Optional[dict[str, object]] = None,
     ) -> None:
+        runtime_changed = False
+        if runtime_profile is not None and runtime_profile != self._cfg.runtime_profile:
+            self._cfg.runtime_profile = runtime_profile
+            runtime_changed = True
+
+        if runtime_settings:
+            language_lock_before = self._cfg.language_lock_enabled
+            for key, value in runtime_settings.items():
+                if hasattr(self._cfg, key):
+                    current = getattr(self._cfg, key)
+                    if current != value:
+                        setattr(self._cfg, key, value)
+                        runtime_changed = True
+            if self._cfg.language_lock_enabled != language_lock_before:
+                self._state.locked_language = None
+                self._state.language_votes.clear()
+                self._state.language_dissent_streak = 0
+
+        if runtime_changed:
+            logger.info(
+                "updated runtime_profile=%s chunk=%.2fs accum=%.2fs language_lock=%s for meeting_id=%s",
+                self._cfg.runtime_profile,
+                self._cfg.audio_chunk_seconds,
+                self._cfg.asr_accumulation_seconds,
+                self._cfg.language_lock_enabled,
+                self._state.meeting_id,
+            )
+
         forced_changed = forced_language != self._cfg.forced_language
         if forced_changed:
             self._cfg.forced_language = forced_language
@@ -294,7 +330,8 @@ class SessionManager:
             )
             logger.info("updated summary_language=%s for meeting_id=%s", summary_language, self._state.meeting_id)
 
-        if live_translation_language != self._cfg.live_translation_language:
+        translation_changed = live_translation_language != self._cfg.live_translation_language
+        if translation_changed:
             self._cfg.live_translation_language = live_translation_language
             logger.info(
                 "updated live_translation_language=%s for meeting_id=%s",
@@ -303,12 +340,22 @@ class SessionManager:
             )
             if live_translation_language is not None:
                 self._backfill_live_translations()
+
+        if runtime_changed or translation_changed:
             asyncio.create_task(self._emit("session_state", self._session_state_payload(state="running")))
 
-    def update_audio_source(self, audio_source: AudioSource, *, source_name: str) -> None:
+    def update_audio_source(
+        self,
+        audio_source: AudioSource,
+        *,
+        source_name: str,
+        chunk_seconds: Optional[float] = None,
+    ) -> None:
         previous_source = self._cfg.audio_source
         self._cfg.audio_source = audio_source
         self._cfg.audio_source_name = source_name
+        if chunk_seconds is not None:
+            self._cfg.audio_chunk_seconds = chunk_seconds
         self._audio_source_generation += 1
         self._reset_watchdog_tracking()
         self._clear_preview_candidate()

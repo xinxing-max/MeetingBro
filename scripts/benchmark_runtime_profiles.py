@@ -236,6 +236,8 @@ async def _run_profile(profile: _Profile) -> _ProfileResult:
             manager = SessionManager(
                 SessionConfig(
                     audio_source=source,
+                    audio_chunk_seconds=profile.chunk_seconds,
+                    runtime_profile=profile.name,
                     asr=asr,
                     summarizer=_NoopSummarizer(),
                     translator=_NoopTranslator(),

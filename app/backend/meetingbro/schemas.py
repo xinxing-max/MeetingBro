@@ -72,6 +72,10 @@ class SessionStatePayload(BaseModel):
     meeting_id: str
     elapsed_seconds: float = 0.0
     source: str = "mic"
+    runtime_profile: str = "balanced"
+    audio_chunk_seconds: Optional[float] = None
+    asr_accumulation_seconds: Optional[float] = None
+    language_lock_enabled: bool = False
     live_translation_language: Optional[LanguageCode] = None
     retry_windows_total: int = 0
     retry_windows_improved: int = 0
