@@ -26,6 +26,9 @@ exports/*
 !exports/.gitkeep
 .backup/
 
+# Local ASR / ML model artifacts (large, not source code)
+models/
+
 # Python package metadata
 *.egg-info/
 app/backend/*.egg-info/

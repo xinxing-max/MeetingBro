@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import difflib
 import json
 import logging
 import re
@@ -46,6 +47,8 @@ class SessionConfig:
     translator: Translator
     storage: Storage
     preview_asr: Optional[ASRAdapter] = None
+    preview_asr_backend_name: str = "unknown"
+    preview_stale_tolerance_seconds: float = 0.30
     audio_source_name: str = "mic"
     audio_chunk_seconds: float = 0.5
     runtime_profile: str = "balanced"
@@ -207,6 +210,12 @@ class _State:
     fast_preview_inflight: bool = False
     fast_preview_segment: Optional[TranscriptSegment] = None
     last_emitted_end_time: Optional[float] = None
+    preview_stale_suppressed: int = 0
+    preview_alignment_compared: int = 0
+    preview_alignment_similarity_sum: float = 0.0
+    preview_alignment_similarity_last: Optional[float] = None
+    # Ring buffer of recent preview segments for alignment diagnostics (memory-only).
+    recent_preview_segments: list = field(default_factory=list)
     first_chunk_wall_time: Optional[float] = None
     last_chunk_wall_time: Optional[float] = None
     last_voiced_chunk_wall_time: Optional[float] = None
@@ -325,6 +334,18 @@ class SessionManager:
             fast_preview_last_audio_seconds=self._state.fast_preview_last_audio_seconds,
             fast_preview_last_wall_seconds=self._state.fast_preview_last_wall_seconds,
             fast_preview_realtime_factor=self._state.fast_preview_realtime_factor,
+            preview_stale_suppressed=self._state.preview_stale_suppressed,
+            preview_alignment_compared=self._state.preview_alignment_compared,
+            preview_alignment_similarity_avg=(
+                round(
+                    self._state.preview_alignment_similarity_sum
+                    / self._state.preview_alignment_compared,
+                    4,
+                )
+                if self._state.preview_alignment_compared > 0
+                else None
+            ),
+            preview_alignment_similarity_last=self._state.preview_alignment_similarity_last,
             mixed_microphone_gain=mixed_microphone_gain,
             mixed_system_gain=mixed_system_gain,
             mixed_effective_microphone_gain=mixed_effective_microphone_gain,
@@ -2351,9 +2372,40 @@ class SessionManager:
             and self._state.fast_preview_segment.end_time <= seg.end_time + 0.1
         ):
             self._state.fast_preview_segment = None
+        # Alignment diagnostics: compare overlapping recent preview text with formal text.
+        self._run_alignment_diagnostics(seg)
         await self._emit("transcript_segment", seg)
         if self._cfg.live_translation_language is not None:
             self._schedule_translation(seg, self._cfg.live_translation_language)
+
+    def _run_alignment_diagnostics(self, formal: TranscriptSegment) -> None:
+        """Compare formally committed segment against overlapping recent preview segments."""
+        overlapping = [
+            p for p in self._state.recent_preview_segments
+            if p.start_time < formal.end_time and p.end_time > formal.start_time
+        ]
+        if not overlapping:
+            return
+        formal_text = formal.text.strip()
+        for preview in overlapping:
+            preview_text = preview.text.strip()
+            if not preview_text or not formal_text:
+                continue
+            ratio = difflib.SequenceMatcher(None, preview_text, formal_text).ratio()
+            self._state.preview_alignment_compared += 1
+            self._state.preview_alignment_similarity_sum += ratio
+            self._state.preview_alignment_similarity_last = ratio
+            logger.debug(
+                "preview alignment: preview=%r formal=%r similarity=%.3f",
+                preview_text[:60],
+                formal_text[:60],
+                ratio,
+            )
+        # Prune matched segments to avoid unbounded growth.
+        self._state.recent_preview_segments = [
+            p for p in self._state.recent_preview_segments
+            if p not in overlapping
+        ]
 
     async def _translate_segment(self, seg: TranscriptSegment, target_language: LanguageCode) -> None:
         if seg.original_language == target_language:
@@ -2393,9 +2445,37 @@ class SessionManager:
             self._translation_in_flight.discard(task_key)
 
     async def _emit_transcript_preview(self, segment: Optional[TranscriptSegment] = None) -> None:
+        backend = self._cfg.preview_asr_backend_name
+        is_experimental = backend == "qwen3"
+        quality_note = "experimental_fast_preview" if is_experimental else None
+        # Resolve which segment to show (explicit argument beats state lookup).
+        resolved = segment if segment is not None else self._latest_preview_segment()
+        # Stale-preview suppression: if the segment's time range is already fully
+        # covered by the committed formal transcript, suppress it and emit null.
+        if resolved is not None and self._state.last_emitted_end_time is not None:
+            if resolved.end_time <= self._state.last_emitted_end_time + self._cfg.preview_stale_tolerance_seconds:
+                self._state.preview_stale_suppressed += 1
+                logger.debug(
+                    "preview stale-suppressed: seg.end=%.3f formal_end=%.3f tol=%.3f",
+                    resolved.end_time,
+                    self._state.last_emitted_end_time,
+                    self._cfg.preview_stale_tolerance_seconds,
+                )
+                resolved = None
+        # Track non-null previews in a ring buffer for alignment diagnostics.
+        if resolved is not None:
+            self._state.recent_preview_segments.append(resolved)
+            # Keep at most 20 recent preview segments to bound memory.
+            if len(self._state.recent_preview_segments) > 20:
+                self._state.recent_preview_segments.pop(0)
         await self._emit(
             "transcript_preview",
-            TranscriptPreviewPayload(segment=segment if segment is not None else self._latest_preview_segment()),
+            TranscriptPreviewPayload(
+                segment=resolved,
+                preview_backend=backend,
+                preview_is_experimental=is_experimental,
+                preview_quality_note=quality_note,
+            ),
         )
 
     async def _emit_oldest_pending_segment(self) -> None:

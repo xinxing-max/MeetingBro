@@ -14,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from .asr.base import ASRAdapter
 from .asr.faster_whisper_adapter import FasterWhisperAdapter
 from .audio import AudioSource, MicrophoneSource, MixedAudioSource, SystemAudioLoopbackSource, WavFileSource
 from .exporter import export_meeting
@@ -151,7 +152,32 @@ def _chunk_seconds_for_profile(profile_name: str) -> float:
     return _profile_float(profile, "chunk_seconds", "MEETINGBRO_CHUNK_SECONDS", 0.5)
 
 
-def _build_preview_asr() -> FasterWhisperAdapter | None:
+def _build_preview_asr() -> ASRAdapter | None:
+    backend = os.environ.get("MEETINGBRO_PREVIEW_ASR_BACKEND", "").strip().lower()
+
+    if backend == "qwen3":
+        # Lazy import so that a missing sherpa-onnx never affects normal startup.
+        from .asr.qwen3_asr_adapter import Qwen3ASRAdapter
+
+        model_dir = os.environ.get("MEETINGBRO_PREVIEW_QWEN3_MODEL_DIR", "").strip()
+        if not model_dir:
+            raise RuntimeError(
+                "MEETINGBRO_PREVIEW_ASR_BACKEND=qwen3 requires "
+                "MEETINGBRO_PREVIEW_QWEN3_MODEL_DIR to be set."
+            )
+        return Qwen3ASRAdapter(
+            model_dir=model_dir,
+            num_threads=_env_int("MEETINGBRO_PREVIEW_QWEN3_NUM_THREADS", 2),
+            provider=os.environ.get("MEETINGBRO_PREVIEW_QWEN3_PROVIDER", "cpu"),
+            max_total_len=_env_int("MEETINGBRO_PREVIEW_QWEN3_MAX_TOTAL_LEN", 512),
+            max_new_tokens=_env_int("MEETINGBRO_PREVIEW_QWEN3_MAX_NEW_TOKENS", 256),
+            filter_language_script=_env_bool(
+                "MEETINGBRO_PREVIEW_QWEN3_FILTER_LANGUAGE_SCRIPT", True
+            ),
+            suppress_fillers=_env_bool("MEETINGBRO_PREVIEW_QWEN3_SUPPRESS_FILLERS", True),
+        )
+
+    # Default: dedicated faster-whisper model, or None → fall back to shared model.
     model_size = os.environ.get("MEETINGBRO_PREVIEW_WHISPER_SIZE", "").strip()
     if not model_size or model_size.lower() == "shared":
         return None
@@ -216,9 +242,17 @@ async def lifespan(app: FastAPI):
         language_detection_segments=_env_int("MEETINGBRO_WHISPER_LANGUAGE_DETECTION_SEGMENTS", 1),
     )
     preview_asr = _build_preview_asr()
+    _preview_backend_env = os.environ.get("MEETINGBRO_PREVIEW_ASR_BACKEND", "").strip().lower()
+    if _preview_backend_env == "qwen3":
+        _preview_asr_backend_name = "qwen3"
+    elif preview_asr is not None:
+        _preview_asr_backend_name = "faster_whisper"
+    else:
+        _preview_asr_backend_name = "shared"
     app.state.storage = storage
     app.state.asr = asr
     app.state.preview_asr = preview_asr
+    app.state.preview_asr_backend_name = _preview_asr_backend_name
     logger.info(
         "MeetingBro backend starting db=%s whisper_size=%s whisper_device=%s compute=%s beam=%d cpu_threads=%d whisper_workers=%d preview_backend=%s preview_device=%s preview_compute=%s preview_asr_workers=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f audio_conditioning=%s denoise=%s pre_vad=%s pre_vad_conditioning=%s pre_vad_threshold=%.2f pre_vad_energy_rms=%.4f pre_vad_max=%.1fs weak_rescue=%s weak_rescue_rms=%.4f..%.4f language_lock=%s asr_retry=%s asr_safeguard=%s safeguard_rtf=%.2f suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d translation_backfill=%d translation_max_pending=%d",
         storage._db_path,
@@ -439,6 +473,7 @@ async def session_ws(
         runtime_profile=profile_name,
         asr=app.state.asr,
         preview_asr=app.state.preview_asr,
+        preview_asr_backend_name=app.state.preview_asr_backend_name,
         summarizer=LLMSummarizer(),
         translator=LLMTranslator(),
         storage=app.state.storage,
@@ -509,6 +544,7 @@ async def session_ws(
         fast_preview_max_backlog_seconds=_env_float("MEETINGBRO_FAST_PREVIEW_MAX_BACKLOG_SECONDS", 0.5),
         fast_preview_max_asr_realtime_factor=_env_float("MEETINGBRO_FAST_PREVIEW_MAX_ASR_RTF", 0.65),
         fast_preview_min_rms=_env_float("MEETINGBRO_FAST_PREVIEW_MIN_RMS", 0.002),
+        preview_stale_tolerance_seconds=_env_float("MEETINGBRO_PREVIEW_STALE_TOLERANCE_SECONDS", 0.30),
         asr_executor_workers=_env_int(
             "MEETINGBRO_ASR_EXECUTOR_WORKERS",
             _recommended_asr_executor_workers(),

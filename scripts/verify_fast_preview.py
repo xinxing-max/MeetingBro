@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+
+# Ensure UTF-8 output on Windows consoles that default to cp1252.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+else:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import numpy as np
 
@@ -100,6 +109,7 @@ class _RealtimeSource(AudioSource):
 @dataclass
 class _CaseResult:
     previews: list[dict]
+    preview_payloads: list[dict]
     committed: list[dict]
     db_segments: int
     transcript_text: str
@@ -115,6 +125,7 @@ async def _run_case(
     shared_asr: _StaticASR,
     preview_asr: _StaticASR | None,
     formal_asr_rtf: float | None = None,
+    preview_asr_backend_name: str = "unknown",
 ) -> _CaseResult:
     with tempfile.TemporaryDirectory() as tmp:
         storage = Storage(Path(tmp) / "fast_preview.db")
@@ -124,6 +135,7 @@ async def _run_case(
                 audio_source=_RealtimeSource(),
                 asr=shared_asr,
                 preview_asr=preview_asr,
+                preview_asr_backend_name=preview_asr_backend_name,
                 summarizer=summarizer,
                 translator=_NoopTranslator(),
                 storage=storage,
@@ -169,14 +181,16 @@ async def _run_case(
         summary_text = (Path(export.export_dir) / "summary.md").read_text(encoding="utf-8")
         storage.close()
 
+    preview_payloads: list[dict] = collected.get("transcript_preview", [])
     previews = [
         payload.get("segment")
-        for payload in collected.get("transcript_preview", [])
+        for payload in preview_payloads
         if payload.get("segment") is not None
     ]
     committed = collected.get("transcript_segment", [])
     return _CaseResult(
         previews=previews,
+        preview_payloads=preview_payloads,
         committed=committed,
         db_segments=len(storage_segments),
         transcript_text=transcript_text,
@@ -283,6 +297,498 @@ async def main() -> int:
         print("FAIL: dedicated preview should be skipped when formal ASR RTF exceeds the preview threshold")
         return 1
     print("OK: fast preview stays temporary with dedicated backend and shared fallback, and skips on formal ASR overload")
+
+    # ------------------------------------------------------------------
+    # Qwen3 backend env-builder tests (no real model required)
+    # ------------------------------------------------------------------
+
+    import os as _os
+    from meetingbro.asr.qwen3_asr_adapter import Qwen3ASRAdapter  # noqa: E402
+
+    # (a) Selecting qwen3 without model dir raises RuntimeError.
+    _env_before = _os.environ.copy()
+    _os.environ["MEETINGBRO_PREVIEW_ASR_BACKEND"] = "qwen3"
+    _os.environ.pop("MEETINGBRO_PREVIEW_QWEN3_MODEL_DIR", None)
+    try:
+        from meetingbro.main import _build_preview_asr as _bpa
+        _bpa()
+        print("FAIL: qwen3 backend without model dir should raise RuntimeError")
+        return 1
+    except RuntimeError as _e:
+        if "MEETINGBRO_PREVIEW_QWEN3_MODEL_DIR" in str(_e):
+            print("OK: qwen3 backend without model dir raised expected RuntimeError")
+        else:
+            print(f"FAIL: unexpected RuntimeError message: {_e}")
+            return 1
+    finally:
+        _os.environ.clear()
+        _os.environ.update(_env_before)
+
+    # (b) Constructing Qwen3ASRAdapter with a non-existent model dir fails clearly.
+    try:
+        Qwen3ASRAdapter(model_dir="/nonexistent/path/does/not/exist")
+        print("FAIL: Qwen3ASRAdapter with missing model dir should raise RuntimeError")
+        return 1
+    except (RuntimeError, ImportError) as _e:
+        # RuntimeError = sherpa-onnx missing or model dir missing; both are fine.
+        print(f"OK: Qwen3ASRAdapter with bad model dir raised {type(_e).__name__}: {_e}")
+
+    # (c) Qwen3 adapter, when selected, plugs into preview path and stays temporary
+    #     (tested via the fake _StaticASR class which already models that).
+    #     The dedicated + fallback cases above already cover the "temporary-only"
+    #     contract.  Re-confirm here by passing a _StaticASR as preview_asr so we
+    #     exercise the same SessionManager code path that a real Qwen3ASRAdapter
+    #     would use.
+    qwen3_fake_preview = _StaticASR(text="qwen3 preview text")
+    qwen3_result = await _run_case(
+        shared_asr=_StaticASR(text=None),
+        preview_asr=qwen3_fake_preview,
+        preview_asr_backend_name="qwen3",
+    )
+    ok_qwen3_temporary = _is_temporary_only(qwen3_result, "qwen3 preview text")
+
+    # Verify preview payload metadata fields.
+    non_null_payloads = [p for p in qwen3_result.preview_payloads if p.get("segment") is not None]
+    ok_qwen3_meta = (
+        len(non_null_payloads) >= 1
+        and all(p.get("preview_backend") == "qwen3" for p in non_null_payloads)
+        and all(p.get("preview_is_experimental") is True for p in non_null_payloads)
+        and all(p.get("preview_quality_note") == "experimental_fast_preview" for p in non_null_payloads)
+    )
+    # Committed segments must NOT carry preview metadata.
+    ok_no_meta_in_committed = all(
+        "preview_backend" not in p and "preview_is_experimental" not in p
+        for p in qwen3_result.committed
+    )
+    print(
+        "qwen3-fake-backend:",
+        f"previews={len(qwen3_result.previews)}",
+        f"committed={len(qwen3_result.committed)}",
+        f"db_segments={qwen3_result.db_segments}",
+        f"preview_calls={qwen3_result.preview_calls}",
+        f"non_null_payloads={len(non_null_payloads)}",
+        f"meta_ok={ok_qwen3_meta}",
+    )
+    if not ok_qwen3_temporary:
+        print("FAIL: qwen3 preview should be temporary-only and not committed or persisted")
+        return 1
+    if not ok_qwen3_meta:
+        sample = non_null_payloads[0] if non_null_payloads else {}
+        print(f"FAIL: qwen3 preview payload missing or wrong metadata fields. Sample: {sample}")
+        return 1
+    if not ok_no_meta_in_committed:
+        print("FAIL: committed transcript_segment payloads should not contain preview metadata")
+        return 1
+    print("OK: qwen3 preview (via fake adapter) is temporary-only, not persisted, metadata correct")
+
+    # Verify that non-qwen3 (faster_whisper) preview is NOT marked experimental.
+    fw_fake_preview = _StaticASR(text="fw preview text")
+    fw_result = await _run_case(
+        shared_asr=_StaticASR(text=None),
+        preview_asr=fw_fake_preview,
+        preview_asr_backend_name="faster_whisper",
+    )
+    fw_non_null = [p for p in fw_result.preview_payloads if p.get("segment") is not None]
+    ok_fw_not_experimental = (
+        len(fw_non_null) >= 1
+        and all(p.get("preview_backend") == "faster_whisper" for p in fw_non_null)
+        and all(p.get("preview_is_experimental") is False for p in fw_non_null)
+    )
+    print(
+        "faster-whisper-preview-meta:",
+        f"non_null_payloads={len(fw_non_null)}",
+        f"not_experimental={ok_fw_not_experimental}",
+    )
+    if not ok_fw_not_experimental:
+        print("FAIL: faster_whisper preview payload should not be marked experimental")
+        return 1
+    print("OK: faster_whisper preview payload correctly not marked experimental")
+
+    # (d) Fallback works when Qwen3 adapter raises.
+    qwen3_fallback_shared = _StaticASR(text="qwen3 fallback shared")
+    qwen3_failing_preview = _StaticASR(error=RuntimeError("sherpa-onnx decode error"))
+    qwen3_fallback = await _run_case(
+        shared_asr=qwen3_fallback_shared,
+        preview_asr=qwen3_failing_preview,
+    )
+    ok_qwen3_fallback = (
+        _is_temporary_only(qwen3_fallback, "qwen3 fallback shared")
+        and qwen3_fallback.shared_calls >= 1
+        and qwen3_fallback.preview_calls >= 1
+    )
+    print(
+        "qwen3-fallback:",
+        f"previews={len(qwen3_fallback.previews)}",
+        f"committed={len(qwen3_fallback.committed)}",
+        f"db_segments={qwen3_fallback.db_segments}",
+        f"shared_calls={qwen3_fallback.shared_calls}",
+        f"preview_calls={qwen3_fallback.preview_calls}",
+    )
+    if not ok_qwen3_fallback:
+        print("FAIL: SessionManager should fall back to shared ASR when qwen3 adapter raises")
+        return 1
+    print("OK: SessionManager falls back to shared preview path when qwen3 adapter raises")
+
+    # ------------------------------------------------------------------
+    # Local unit tests for script filter and filler suppression
+    # (no SessionManager, no model required)
+    # ------------------------------------------------------------------
+
+    from meetingbro.asr.qwen3_asr_adapter import _wrong_script, _FILLER_SET, _is_garbage  # noqa: E402
+
+    _script_cases: list[tuple[str, str | None, bool, str]] = [
+        # (text, forced_language, expect_wrong, label)
+        # --- en: reject Arabic-dominant
+        ("مرحبا بالعالم كيف حال", "en", True, "en rejects Arabic-dominant"),
+        # --- en: reject CJK-dominant
+        ("你好世界今天天气真好", "en", True, "en rejects CJK-dominant"),
+        # --- en: allow Latin
+        ("Hello world, this is fine.", "en", False, "en allows Latin"),
+        # --- de: reject Arabic-dominant
+        ("مرحبا بالعالم كيف حال", "de", True, "de rejects Arabic-dominant"),
+        # --- de: reject CJK-dominant
+        ("你好世界今天天气真好", "de", True, "de rejects CJK-dominant"),
+        # --- de: allow Latin
+        ("Guten Morgen, wie geht es Ihnen?", "de", False, "de allows Latin"),
+        # --- zh: reject Arabic-dominant
+        ("مرحبا بالعالم كيف حال", "zh", True, "zh rejects Arabic-dominant"),
+        # --- zh: reject Cyrillic-dominant
+        ("Привет мир как дела", "zh", True, "zh rejects Cyrillic-dominant"),
+        # --- zh: reject pure Latin (no CJK at all)
+        ("hello world", "zh", True, "zh rejects pure Latin"),
+        # --- zh: allow CJK-heavy
+        ("你好世界今天天气真好", "zh", False, "zh allows CJK-heavy"),
+        # --- None: pass through (Arabic)
+        ("مرحبا بالعالم", None, False, "auto/None passes through Arabic"),
+        # --- None: pass through (CJK)
+        ("你好世界", None, False, "auto/None passes through CJK"),
+        # --- en: reject Cyrillic-dominant
+        ("Привет мир как дела сегодня", "en", True, "en rejects Cyrillic-dominant"),
+    ]
+
+    script_failures = 0
+    for text, lang, expect, label in _script_cases:
+        got = _wrong_script(text, lang)
+        status = "OK" if got == expect else "FAIL"
+        if got != expect:
+            script_failures += 1
+        print(f"  script-filter [{status}] {label}: wrong_script={got} (expected {expect})")
+
+    if script_failures:
+        print(f"FAIL: {script_failures} script-filter case(s) did not match expected result")
+        return 1
+    print("OK: all script-filter cases passed")
+
+    # Filler suppression checks.
+    _filler_cases: list[tuple[str, bool, str]] = [
+        ("嗯。", True, "Chinese filler '嗯。' should be in filler set"),
+        ("嗯", True, "Chinese filler '嗯' should be in filler set"),
+        ("啊", True, "Chinese filler '啊' should be in filler set"),
+        ("啊。", True, "Chinese filler '啊。' should be in filler set"),
+        ("um", True, "English filler 'um' should be in filler set"),
+        ("uh", True, "English filler 'uh' should be in filler set"),
+        ("ah", True, "English filler 'ah' should be in filler set"),
+        ("hello", False, "'hello' should NOT be in filler set"),
+        ("你好", False, "'你好' should NOT be in filler set"),
+    ]
+
+    filler_failures = 0
+    for text, expect_suppressed, label in _filler_cases:
+        got = text.lower() in _FILLER_SET
+        status = "OK" if got == expect_suppressed else "FAIL"
+        if got != expect_suppressed:
+            filler_failures += 1
+        print(f"  filler [{status}] {label}: in_set={got} (expected {expect_suppressed})")
+
+    if filler_failures:
+        print(f"FAIL: {filler_failures} filler suppression case(s) failed")
+        return 1
+    print("OK: all filler suppression cases passed")
+
+    # Garbage-filter checks.
+    _garbage_cases: list[tuple[str, bool, str]] = [
+        ("aaaaaaaaa", True, "single char repeated → garbage"),
+        ("........", True, "punctuation repeated → garbage"),
+        ("x", True, "single non-CJK char → garbage"),
+        ("hello hello hello hello", True, "word repeated 3+ times → garbage"),
+        ("你好", False, "valid CJK → not garbage"),
+        ("Hello, how are you?", False, "normal English → not garbage"),
+        ("Good morning everyone", False, "normal English phrase → not garbage"),
+        ("嗯嗯嗯嗯嗯嗯嗯", True, "CJK char repeated → garbage"),
+    ]
+
+    garbage_failures = 0
+    for text, expect_garbage, label in _garbage_cases:
+        got = _is_garbage(text)
+        status = "OK" if got == expect_garbage else "FAIL"
+        if got != expect_garbage:
+            garbage_failures += 1
+        print(f"  garbage [{status}] {label}: is_garbage={got} (expected {expect_garbage})")
+
+    if garbage_failures:
+        print(f"FAIL: {garbage_failures} garbage-filter case(s) failed")
+        return 1
+    print("OK: all garbage-filter cases passed")
+
+    # ------------------------------------------------------------------
+    # Qwen3ASRAdapter.transcribe() unit tests — fake recognizer, no model
+    # Verify: (1) confidence is 0.60, (2) _is_garbage is active in transcribe,
+    # (3) filler suppression fires before garbage check.
+    # ------------------------------------------------------------------
+
+    import types as _types  # noqa: F401
+    import numpy as _np_local
+
+    class _FakeResult:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class _FakeStream:
+        def __init__(self, text: str) -> None:
+            self.result = _FakeResult(text)
+
+        def accept_waveform(self, sr: int, samples) -> None:
+            pass
+
+    class _FakeRecognizer:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def create_stream(self) -> _FakeStream:
+            return _FakeStream(self._text)
+
+        def decode_stream(self, stream: _FakeStream) -> None:
+            pass
+
+    def _make_adapter(suppress_fillers: bool = True, filter_language_script: bool = True):
+        """Build a Qwen3ASRAdapter bypassing __init__ model-dir checks."""
+        adapter = object.__new__(Qwen3ASRAdapter)
+        adapter._suppress_fillers = suppress_fillers
+        adapter._filter_language_script = filter_language_script
+        adapter._recognizer = None  # replaced per-test below
+        return adapter
+
+    _samples_1s = _np_local.zeros(16_000, dtype=_np_local.float32)
+
+    # (1) confidence is 0.60 for normal speech text
+    _a1 = _make_adapter()
+    _a1._recognizer = _FakeRecognizer("Hello world how are you today")
+    _r1 = _a1.transcribe(_samples_1s, 16_000)
+    if not _r1:
+        print("FAIL: transcribe() returned empty for normal text (confidence test)")
+        return 1
+    _got_conf = _r1[0].confidence
+    if _got_conf != 0.60:
+        print(f"FAIL: expected confidence=0.60, got {_got_conf}")
+        return 1
+    print(f"OK: Qwen3ASRAdapter.transcribe() confidence={_got_conf} (expected 0.60)")
+
+    # (2) _is_garbage is active: single-char-repeated text returns []
+    _a2 = _make_adapter()
+    _a2._recognizer = _FakeRecognizer("aaaaaaaaaa")
+    _r2 = _a2.transcribe(_samples_1s, 16_000)
+    if _r2:
+        print(f"FAIL: garbage text 'aaaaaaaaaa' should be filtered, got {_r2}")
+        return 1
+    print("OK: garbage text 'aaaaaaaaaa' correctly filtered by _is_garbage inside transcribe()")
+
+    # (3) filler suppression fires before garbage check — 'um' returns []
+    _a3 = _make_adapter()
+    _a3._recognizer = _FakeRecognizer("um")
+    _r3 = _a3.transcribe(_samples_1s, 16_000)
+    if _r3:
+        print(f"FAIL: filler 'um' should be suppressed, got {_r3}")
+        return 1
+    print("OK: filler 'um' correctly suppressed inside transcribe()")
+
+    # (4) wrong-script filter fires: CJK text for en returns []
+    _a4 = _make_adapter()
+    _a4._recognizer = _FakeRecognizer("你好世界今天天气真好")
+    _r4 = _a4.transcribe(_samples_1s, 16_000, forced_language="en")
+    if _r4:
+        print(f"FAIL: CJK text for lang=en should be filtered by wrong-script, got {_r4}")
+        return 1
+    print("OK: CJK text for lang=en correctly filtered by wrong-script inside transcribe()")
+
+    print("OK: all Qwen3ASRAdapter.transcribe() unit tests passed")
+
+    # ------------------------------------------------------------------
+    # Stale-preview suppression + alignment diagnostics unit tests
+    # (direct calls to SessionManager internals; no audio loop needed)
+    # ------------------------------------------------------------------
+
+    import tempfile as _tempfile
+    from meetingbro.schemas import TranscriptSegment as _TS
+
+    def _make_segment(
+        *,
+        start_time: float,
+        end_time: float,
+        text: str = "dummy",
+        confidence: float = 0.92,
+        language: str = "en",
+    ) -> _TS:
+        return _TS(
+            id=str(uuid.uuid4()),
+            meeting_id="test-meeting",
+            start_time=start_time,
+            end_time=end_time,
+            text=text,
+            original_language=language,  # type: ignore[arg-type]
+            confidence=confidence,
+            created_at=datetime.now(),
+        )
+
+    def _make_manager() -> SessionManager:
+        with _tempfile.TemporaryDirectory() as _tmp:
+            _storage = Storage(Path(_tmp) / "diag.db")
+            _m = SessionManager(
+                SessionConfig(
+                    audio_source=_RealtimeSource(),
+                    asr=_StaticASR(text=None),
+                    summarizer=_CountingSummarizer(),
+                    translator=_NoopTranslator(),
+                    storage=_storage,
+                    forced_language="en",
+                    summary_language="en",
+                    asr_accumulation_seconds=60.0,
+                    pre_vad_enabled=False,
+                    silence_rms_threshold=1.0,
+                    rolling_interval_seconds=10_000,
+                    cumulative_interval_seconds=10_000,
+                    memory_interval_seconds=10_000,
+                    min_segments_for_rolling=10_000,
+                    min_segments_for_memory=10_000,
+                    min_segments_for_cumulative=10_000,
+                )
+            )
+            # Close storage before temp dir is deleted (Windows file-lock).
+            _storage.close()
+        return _m
+
+    # Test A: _run_alignment_diagnostics with overlapping preview + formal
+    _m_align = _make_manager()
+    _preview_seg = _make_segment(start_time=0.0, end_time=2.0, text="Hello world")
+    _formal_seg = _make_segment(start_time=0.5, end_time=2.5, text="Hello world today")
+    _m_align._state.recent_preview_segments.append(_preview_seg)
+    _m_align._run_alignment_diagnostics(_formal_seg)
+    _ok_align_compared = _m_align._state.preview_alignment_compared == 1
+    _ok_align_ratio = (
+        _m_align._state.preview_alignment_similarity_last is not None
+        and 0.0 < _m_align._state.preview_alignment_similarity_last <= 1.0
+    )
+    _ok_align_pruned = len(_m_align._state.recent_preview_segments) == 0
+    print(
+        "alignment-diagnostics:",
+        f"compared={_m_align._state.preview_alignment_compared}",
+        f"similarity_last={_m_align._state.preview_alignment_similarity_last:.3f}"
+        if _m_align._state.preview_alignment_similarity_last is not None else "similarity_last=None",
+        f"pruned_ok={_ok_align_pruned}",
+    )
+    if not _ok_align_compared:
+        print("FAIL: alignment compared counter should be 1 after overlapping formal/preview")
+        return 1
+    if not _ok_align_ratio:
+        print(f"FAIL: similarity_last should be (0,1], got {_m_align._state.preview_alignment_similarity_last}")
+        return 1
+    if not _ok_align_pruned:
+        print("FAIL: overlapping preview segment should be pruned from ring buffer after alignment")
+        return 1
+    print("OK: alignment diagnostics: counter incremented, ratio in range, overlapping segment pruned")
+
+    # Test B: non-overlapping preview is NOT compared and NOT pruned
+    _m_noalign = _make_manager()
+    _old_preview = _make_segment(start_time=0.0, end_time=1.0, text="Old preview")
+    _later_formal = _make_segment(start_time=5.0, end_time=7.0, text="Later formal")
+    _m_noalign._state.recent_preview_segments.append(_old_preview)
+    _m_noalign._run_alignment_diagnostics(_later_formal)
+    _ok_noalign_zero = _m_noalign._state.preview_alignment_compared == 0
+    _ok_noalign_kept = len(_m_noalign._state.recent_preview_segments) == 1
+    print(
+        "alignment-no-overlap:",
+        f"compared={_m_noalign._state.preview_alignment_compared}",
+        f"kept={_ok_noalign_kept}",
+    )
+    if not _ok_noalign_zero:
+        print("FAIL: alignment counter should remain 0 for non-overlapping segments")
+        return 1
+    if not _ok_noalign_kept:
+        print("FAIL: non-overlapping preview segment should NOT be pruned from ring buffer")
+        return 1
+    print("OK: alignment diagnostics: non-overlapping segment not compared and not pruned")
+
+    # Test C: stale suppression — preview segment end_time ≤ last_emitted_end_time + tolerance
+    _m_stale = _make_manager()
+    _stale_preview = _make_segment(start_time=0.0, end_time=2.0, text="stale preview")
+    _m_stale._state.last_emitted_end_time = 2.0  # formal has covered up to 2.0 s
+    # end_time=2.0 ≤ 2.0 + 0.30 → should be suppressed; emit with segment=null
+    await _m_stale._emit_transcript_preview(_stale_preview)
+    _ok_suppressed = _m_stale._state.preview_stale_suppressed == 1
+    # The null event must be in the queue (queue is non-empty because we awaited the put).
+    try:
+        _stale_event = _m_stale._event_queue.get_nowait()
+        _ok_null_emitted = (
+            _stale_event.type == "transcript_preview"
+            and _stale_event.payload.get("segment") is None
+        )
+    except Exception as _qex:
+        _ok_null_emitted = False
+        print(f"  (queue read error: {_qex})")
+    # Ring buffer must NOT have the stale segment (stale → resolved=None → not appended).
+    _ok_stale_not_in_ring = len(_m_stale._state.recent_preview_segments) == 0
+    print(
+        "stale-suppression:",
+        f"suppressed={_m_stale._state.preview_stale_suppressed}",
+        f"null_event_emitted={_ok_null_emitted}",
+        f"not_in_ring={_ok_stale_not_in_ring}",
+    )
+    if not _ok_suppressed:
+        print("FAIL: stale_suppressed counter should be 1 after suppressing stale preview")
+        return 1
+    if not _ok_null_emitted:
+        print("FAIL: suppressed preview should emit a null-segment transcript_preview event")
+        return 1
+    if not _ok_stale_not_in_ring:
+        print("FAIL: stale segment should NOT be added to ring buffer")
+        return 1
+    print("OK: stale preview correctly suppressed, null event emitted, counter incremented, not in ring")
+
+    # Test D: non-stale preview — end_time > last_emitted_end_time + tolerance → not suppressed
+    _m_nonstale = _make_manager()
+    _fresh_preview = _make_segment(start_time=3.0, end_time=5.0, text="fresh preview")
+    _m_nonstale._state.last_emitted_end_time = 2.0  # 5.0 > 2.0 + 0.30 → not stale
+    await _m_nonstale._emit_transcript_preview(_fresh_preview)
+    _ok_not_suppressed = _m_nonstale._state.preview_stale_suppressed == 0
+    try:
+        _fresh_event = _m_nonstale._event_queue.get_nowait()
+        _ok_nonnull = (
+            _fresh_event.type == "transcript_preview"
+            and _fresh_event.payload.get("segment") is not None
+        )
+    except Exception as _qex2:
+        _ok_nonnull = False
+        print(f"  (queue read error: {_qex2})")
+    _ok_added_to_ring = len(_m_nonstale._state.recent_preview_segments) == 1
+    print(
+        "fresh-preview-pass-through:",
+        f"suppressed={_m_nonstale._state.preview_stale_suppressed}",
+        f"nonnull={_ok_nonnull}",
+        f"ring_buffer_len={len(_m_nonstale._state.recent_preview_segments)}",
+    )
+    if not _ok_not_suppressed:
+        print("FAIL: fresh preview should NOT increment stale_suppressed counter")
+        return 1
+    if not _ok_nonnull:
+        print("FAIL: fresh preview should emit non-null segment event")
+        return 1
+    if not _ok_added_to_ring:
+        print("FAIL: fresh preview segment should be added to ring buffer")
+        return 1
+    print("OK: fresh preview passes through, non-null event emitted, added to ring buffer")
+
+    print("OK: all stale-suppression and alignment diagnostics unit tests passed")
+
+    print("ALL OK")
     return 0
 
 

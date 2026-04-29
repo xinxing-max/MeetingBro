@@ -108,6 +108,10 @@ class SessionStatePayload(BaseModel):
     fast_preview_last_audio_seconds: Optional[float] = None
     fast_preview_last_wall_seconds: Optional[float] = None
     fast_preview_realtime_factor: Optional[float] = None
+    preview_stale_suppressed: int = 0
+    preview_alignment_compared: int = 0
+    preview_alignment_similarity_avg: Optional[float] = None
+    preview_alignment_similarity_last: Optional[float] = None
     mixed_microphone_gain: Optional[float] = None
     mixed_system_gain: Optional[float] = None
     mixed_effective_microphone_gain: Optional[float] = None
@@ -116,6 +120,9 @@ class SessionStatePayload(BaseModel):
 
 class TranscriptPreviewPayload(BaseModel):
     segment: Optional[TranscriptSegment] = None
+    preview_backend: str = "unknown"
+    preview_is_experimental: bool = False
+    preview_quality_note: Optional[str] = None
 
 
 class TranscriptTranslationPayload(BaseModel):

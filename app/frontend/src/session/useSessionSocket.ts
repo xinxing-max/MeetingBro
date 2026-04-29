@@ -58,6 +58,7 @@ export interface SessionView {
   sessionStats: SessionStatePayload | null;
   segments: TranscriptSegment[];
   previewSegment: TranscriptSegment | null;
+  isExperimentalPreview: boolean;
   latestByType: Partial<Record<SummaryType, SummarySnapshot>>;
   historyByType: Partial<Record<SummaryType, SummarySnapshot[]>>;
   notes: Note[];
@@ -81,6 +82,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
   const [sessionStats, setSessionStats] = useState<SessionStatePayload | null>(null);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [previewSegment, setPreviewSegment] = useState<TranscriptSegment | null>(null);
+  const [isExperimentalPreview, setIsExperimentalPreview] = useState(false);
   const [latestByType, setLatestByType] = useState<SessionView["latestByType"]>({});
   const [historyByType, setHistoryByType] = useState<SessionView["historyByType"]>({});
   const [notes, setNotes] = useState<Note[]>([]);
@@ -135,6 +137,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
       if (nextPreview == null) {
         clearQueuedPreview();
         setPreviewSegment(null);
+        setIsExperimentalPreview(false);
         return;
       }
 
@@ -196,6 +199,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     clearQueuedPreview();
     clearPreviewHold();
     setPreviewSegment(null);
+    setIsExperimentalPreview(false);
     setLatestByType({});
     setHistoryByType({});
     setNotes([]);
@@ -234,6 +238,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
           case "transcript_segment":
             clearQueuedPreview();
             clearPreviewHold();
+            setIsExperimentalPreview(false);
             setPreviewSegment((prev) => {
               if (!prev) return prev;
               const matchesCommitted =
@@ -263,6 +268,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
             }));
             break;
           case "transcript_preview":
+            setIsExperimentalPreview(msg.payload.preview_is_experimental ?? false);
             schedulePreviewUpdate(msg.payload.segment);
             break;
           case "summary_snapshot":
@@ -434,6 +440,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     sessionStats,
     segments,
     previewSegment,
+    isExperimentalPreview,
     latestByType,
     historyByType,
     notes,

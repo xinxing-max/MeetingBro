@@ -310,7 +310,7 @@ export default function App() {
   const [refreshBaselineId, setRefreshBaselineId] = useState<string | null>(null);
   const [bilingualExport, setBilingualExport] = useState(false);
   const [restartPromptOpen, setRestartPromptOpen] = useState(false);
-  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, requestSummary, pauseSession, resumeSession, stopSession } =
+  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, isExperimentalPreview, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, requestSummary, pauseSession, resumeSession, stopSession } =
     useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage, runtimeProfile });
 
   const rolling = latestByType.rolling_summary;
@@ -477,6 +477,10 @@ export default function App() {
   const fastPreviewEmitted = sessionStats?.fast_preview_emitted ?? 0;
   const fastPreviewSkipped = sessionStats?.fast_preview_skipped ?? 0;
   const fastPreviewRtf = sessionStats?.fast_preview_realtime_factor ?? null;
+  const previewStaleSuppressed = sessionStats?.preview_stale_suppressed ?? 0;
+  const previewAlignmentCompared = sessionStats?.preview_alignment_compared ?? 0;
+  const previewAlignmentSimilarityAvg = sessionStats?.preview_alignment_similarity_avg ?? null;
+  const previewAlignmentSimilarityLast = sessionStats?.preview_alignment_similarity_last ?? null;
   const delayTone = getDelayTone(transcriptLagSeconds);
   const activeSource = sessionStats?.source ?? source;
   const mixedMicGain = sessionStats?.mixed_microphone_gain ?? null;
@@ -1031,7 +1035,15 @@ export default function App() {
             {previewSegment && (
               <div className="segment preview-segment">
                 <span className="ts">hearing…</span>
-                <span>{previewSegment.text}</span>
+                {isExperimentalPreview && (
+                  <span
+                    className="preview-experimental-badge"
+                    title="Fast experimental preview; final transcript may change"
+                  >
+                    Preview
+                  </span>
+                )}
+                <span className="preview-segment-text">{previewSegment.text}</span>
               </div>
             )}
             <div ref={transcriptBottomRef} className="transcript-bottom-anchor" />
@@ -1176,6 +1188,22 @@ export default function App() {
               <strong className="diagnostic-value">{fastPreviewEnabled ? formatRtf(fastPreviewRtf) : "off"}</strong>
               <span className="diagnostic-note">
                 emitted {fastPreviewEmitted} · skipped {fastPreviewSkipped}
+              </span>
+            </div>
+            <div className="diagnostic-card">
+              <span className="diagnostic-label">Preview Stale Suppressed</span>
+              <strong className="diagnostic-value">{previewStaleSuppressed}</strong>
+              <span className="diagnostic-note">previews dropped (covered by formal)</span>
+            </div>
+            <div className="diagnostic-card">
+              <span className="diagnostic-label">Preview Alignment</span>
+              <strong className="diagnostic-value">
+                {previewAlignmentCompared > 0
+                  ? `${(previewAlignmentSimilarityAvg ?? 0).toFixed(2)} avg`
+                  : "—"}
+              </strong>
+              <span className="diagnostic-note">
+                compared {previewAlignmentCompared} · last {previewAlignmentSimilarityLast != null ? previewAlignmentSimilarityLast.toFixed(2) : "—"}
               </span>
             </div>
             <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : "ok"}`}>

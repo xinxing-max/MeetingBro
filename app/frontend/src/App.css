@@ -768,9 +768,33 @@ html, body, #root {
   font-weight: 600;
 }
 
+.preview-experimental-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #92400e;
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-right: 6px;
+  vertical-align: middle;
+  cursor: default;
+}
+
 .transcript-body .preview-segment span:last-child {
   color: #4b5563;
   font-style: italic;
+}
+
+.transcript-body .preview-segment .preview-segment-text {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .transcript-bottom-anchor {
@@ -1072,6 +1096,11 @@ html, body, #root {
   }
   .transcript-body .preview-segment {
     background: linear-gradient(90deg, rgba(251, 191, 36, 0.14), rgba(251, 191, 36, 0.04));
+  }
+  .preview-experimental-badge {
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.18);
+    border-color: rgba(245, 158, 11, 0.4);
   }
   .transcript-body .bookmark-marker {
     border-color: rgba(245, 158, 11, 0.28);
