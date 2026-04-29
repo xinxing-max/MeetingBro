@@ -48,6 +48,7 @@ class SessionConfig:
     storage: Storage
     preview_asr: Optional[ASRAdapter] = None
     preview_asr_backend_name: str = "unknown"
+    preview_asr_fallback_on_error: bool = True
     preview_stale_tolerance_seconds: float = 0.30
     audio_source_name: str = "mic"
     audio_chunk_seconds: float = 0.5
@@ -610,8 +611,14 @@ class SessionManager:
         if self._preview_asr_disabled:
             return
         self._preview_asr_disabled = True
+        fallback_note = (
+            "falling back to shared preview path"
+            if self._cfg.preview_asr_fallback_on_error
+            else "skipping preview until session restart"
+        )
         logger.warning(
-            "dedicated preview ASR unavailable, falling back to shared preview path: %s",
+            "dedicated preview ASR unavailable, %s: %s",
+            fallback_note,
             exc,
         )
 
@@ -2164,6 +2171,13 @@ class SessionManager:
         prompt: Optional[str],
         forced_language: Optional[str],
     ) -> list[ASRSegment]:
+        if (
+            self._cfg.preview_asr is not None
+            and self._preview_asr_disabled
+            and not self._cfg.preview_asr_fallback_on_error
+        ):
+            return []
+
         executor = self._asr_executor
         adapter = self._cfg.asr
         if self._has_dedicated_preview_asr():
@@ -2184,6 +2198,8 @@ class SessionManager:
         except Exception as exc:
             if adapter is self._cfg.preview_asr and self._cfg.preview_asr is not None:
                 self._disable_dedicated_preview_asr(exc)
+                if not self._cfg.preview_asr_fallback_on_error:
+                    return []
                 return await loop.run_in_executor(
                     self._asr_executor,
                     lambda m=samples, sr=sample_rate, p=prompt, fl=forced_language: self._cfg.asr.transcribe(

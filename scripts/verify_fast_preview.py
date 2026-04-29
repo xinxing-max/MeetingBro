@@ -126,6 +126,7 @@ async def _run_case(
     preview_asr: _StaticASR | None,
     formal_asr_rtf: float | None = None,
     preview_asr_backend_name: str = "unknown",
+    preview_asr_fallback_on_error: bool = True,
 ) -> _CaseResult:
     with tempfile.TemporaryDirectory() as tmp:
         storage = Storage(Path(tmp) / "fast_preview.db")
@@ -136,6 +137,7 @@ async def _run_case(
                 asr=shared_asr,
                 preview_asr=preview_asr,
                 preview_asr_backend_name=preview_asr_backend_name,
+                preview_asr_fallback_on_error=preview_asr_fallback_on_error,
                 summarizer=summarizer,
                 translator=_NoopTranslator(),
                 storage=storage,
@@ -428,6 +430,37 @@ async def main() -> int:
         print("FAIL: SessionManager should fall back to shared ASR when qwen3 adapter raises")
         return 1
     print("OK: SessionManager falls back to shared preview path when qwen3 adapter raises")
+
+    # (e) Optional no-fallback mode: Qwen3 failures should not borrow the formal
+    # shared ASR path, preserving formal Whisper capacity under preview errors.
+    qwen3_no_fallback_shared = _StaticASR(text="should not be used")
+    qwen3_no_fallback_preview = _StaticASR(error=RuntimeError("qwen3 transient failure"))
+    qwen3_no_fallback = await _run_case(
+        shared_asr=qwen3_no_fallback_shared,
+        preview_asr=qwen3_no_fallback_preview,
+        preview_asr_backend_name="qwen3",
+        preview_asr_fallback_on_error=False,
+    )
+    ok_qwen3_no_fallback = (
+        len(qwen3_no_fallback.previews) == 0
+        and len(qwen3_no_fallback.committed) == 0
+        and qwen3_no_fallback.db_segments == 0
+        and qwen3_no_fallback.shared_calls == 0
+        and qwen3_no_fallback.preview_calls >= 1
+        and qwen3_no_fallback.summarizer_calls == 0
+    )
+    print(
+        "qwen3-no-fallback:",
+        f"previews={len(qwen3_no_fallback.previews)}",
+        f"committed={len(qwen3_no_fallback.committed)}",
+        f"db_segments={qwen3_no_fallback.db_segments}",
+        f"shared_calls={qwen3_no_fallback.shared_calls}",
+        f"preview_calls={qwen3_no_fallback.preview_calls}",
+    )
+    if not ok_qwen3_no_fallback:
+        print("FAIL: qwen3 no-fallback mode should skip preview without using shared ASR")
+        return 1
+    print("OK: qwen3 no-fallback mode skips preview without borrowing shared ASR")
 
     # ------------------------------------------------------------------
     # Local unit tests for script filter and filler suppression

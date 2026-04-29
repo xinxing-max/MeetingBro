@@ -291,6 +291,16 @@ class Qwen3ASRAdapter(ASRAdapter):
 
     # ------------------------------------------------------------------
 
+    def prewarm(self) -> None:
+        """Load the Qwen3 recognizer without running a decode.
+
+        This is intended for a background startup task so the first visible
+        preview window does not pay the model construction cost.
+        """
+        self._ensure_recognizer()
+
+    # ------------------------------------------------------------------
+
     def transcribe(
         self,
         samples: np.ndarray,

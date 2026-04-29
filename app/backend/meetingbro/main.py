@@ -253,6 +253,27 @@ async def lifespan(app: FastAPI):
     app.state.asr = asr
     app.state.preview_asr = preview_asr
     app.state.preview_asr_backend_name = _preview_asr_backend_name
+    if (
+        _preview_asr_backend_name == "qwen3"
+        and preview_asr is not None
+        and _env_bool("MEETINGBRO_PREVIEW_QWEN3_PREWARM", True)
+        and hasattr(preview_asr, "prewarm")
+    ):
+        loop = asyncio.get_running_loop()
+        prewarm_future = loop.run_in_executor(None, preview_asr.prewarm)  # type: ignore[attr-defined]
+
+        def _log_preview_prewarm_done(task) -> None:
+            try:
+                task.result()
+            except Exception as exc:
+                logger.warning("Qwen3 preview ASR prewarm failed: %s", exc)
+            else:
+                logger.info("Qwen3 preview ASR prewarm completed")
+
+        prewarm_future.add_done_callback(_log_preview_prewarm_done)
+        app.state.preview_asr_prewarm_future = prewarm_future
+    else:
+        app.state.preview_asr_prewarm_future = None
     logger.info(
         "MeetingBro backend starting db=%s whisper_size=%s whisper_device=%s compute=%s beam=%d cpu_threads=%d whisper_workers=%d preview_backend=%s preview_device=%s preview_compute=%s preview_asr_workers=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f audio_conditioning=%s denoise=%s pre_vad=%s pre_vad_conditioning=%s pre_vad_threshold=%.2f pre_vad_energy_rms=%.4f pre_vad_max=%.1fs weak_rescue=%s weak_rescue_rms=%.4f..%.4f language_lock=%s asr_retry=%s asr_safeguard=%s safeguard_rtf=%.2f suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d translation_backfill=%d translation_max_pending=%d",
         storage._db_path,
@@ -474,6 +495,10 @@ async def session_ws(
         asr=app.state.asr,
         preview_asr=app.state.preview_asr,
         preview_asr_backend_name=app.state.preview_asr_backend_name,
+        preview_asr_fallback_on_error=_env_bool(
+            "MEETINGBRO_PREVIEW_FALLBACK_ON_ERROR",
+            app.state.preview_asr_backend_name != "qwen3",
+        ),
         summarizer=LLMSummarizer(),
         translator=LLMTranslator(),
         storage=app.state.storage,
