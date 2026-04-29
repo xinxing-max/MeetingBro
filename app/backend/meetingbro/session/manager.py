@@ -29,6 +29,7 @@ from ..schemas import (
     SummarySnapshot,
     SummaryType,
     TranscriptPreviewPayload,
+    TranscriptSegmentRemovedPayload,
     TranscriptTranslationPayload,
     TranscriptSegment,
 )
@@ -62,9 +63,12 @@ class SessionConfig:
     memory_interval_seconds: float = 120.0  # cadence target for compressed meeting memory refresh
     cumulative_interval_seconds: float = 180.0  # cadence target for cumulative refresh
     summary_tail_seconds: float = 120.0  # recent raw transcript kept beside compressed memory
+    refinement_interval_seconds: float = 60.0  # cadence target for LLM transcript refinement snapshots
+    refinement_window_seconds: float = 120.0  # raw formal transcript window refined with Qwen preview hints
     min_segments_for_rolling: int = 1
     min_segments_for_memory: int = 3
     min_segments_for_cumulative: int = 3
+    min_segments_for_refinement: int = 2
     asr_accumulation_seconds: float = 2.0  # was 2.5; benchmark showed equal char-count at lower latency
     asr_early_flush_enabled: bool = True
     asr_early_flush_min_seconds: float = 0.8
@@ -102,7 +106,7 @@ class SessionConfig:
     pre_vad_conditioning_target_rms: float = 0.03
     pre_vad_conditioning_min_rms: float = 0.001
     pre_vad_conditioning_max_gain: float = 4.0
-    pre_vad_threshold: float = 0.38
+    pre_vad_threshold: float = 0.30
     pre_vad_energy_rms_threshold: float = 0.005
     pre_vad_trailing_silence_seconds: float = 0.45
     pre_vad_adaptive_trailing_silence_enabled: bool = True
@@ -131,11 +135,15 @@ class SessionConfig:
     audio_input_queue_max_seconds: float = 8.0
     audio_input_queue_warning_seconds: float = 3.0
     fast_preview_enabled: bool = True
-    fast_preview_interval_seconds: float = 0.8
+    fast_preview_interval_seconds: float = 0.5
     fast_preview_window_seconds: float = 3.0
     fast_preview_max_backlog_seconds: float = 0.5
     fast_preview_max_asr_realtime_factor: float = 0.65
     fast_preview_min_rms: float = 0.002
+    # How long (seconds) a Qwen preview may go uncovered by Whisper before it
+    # is promoted live as a formal segment.  This is the "no missed sentences"
+    # safety net for chatty meetings with no silence pauses.
+    qwen_orphan_max_age_seconds: float = 2.0
     # Executor sizing is not a user-facing tuning surface. Defaults are chosen
     # automatically in main.py and may be overridden only via hidden env vars.
     asr_executor_workers: int = 1
@@ -163,12 +171,14 @@ class _State:
     last_rolling_at: float = 0.0
     last_memory_at: float = 0.0
     last_cumulative_at: float = 0.0
+    last_refinement_at: float = 0.0
     latest_meeting_memory: Optional[str] = None
     latest_cumulative_text: Optional[str] = None
     last_memory_segment_index: int = 0
     memory_in_flight: bool = False
     rolling_in_flight: bool = False
     cumulative_in_flight: bool = False
+    refinement_in_flight: bool = False
     elapsed_seconds: float = 0.0
     speakers: dict[str, Speaker] = field(default_factory=dict)  # label -> Speaker
     # Repetition guard: count consecutive emissions with identical text so we can
@@ -210,13 +220,26 @@ class _State:
     fast_preview_realtime_factor: Optional[float] = None
     fast_preview_inflight: bool = False
     fast_preview_segment: Optional[TranscriptSegment] = None
+    preview_continued_during_formal: int = 0
     last_emitted_end_time: Optional[float] = None
     preview_stale_suppressed: int = 0
     preview_alignment_compared: int = 0
     preview_alignment_similarity_sum: float = 0.0
     preview_alignment_similarity_last: Optional[float] = None
+    preview_unconfirmed_after_formal: int = 0
+    preview_unconfirmed_last_text: Optional[str] = None
     # Ring buffer of recent preview segments for alignment diagnostics (memory-only).
     recent_preview_segments: list = field(default_factory=list)
+    # Qwen previews that Whisper passed over without coverage, queued for promotion.
+    qwen_orphan_queue: list = field(default_factory=list)
+    # Latest end_time (session-absolute seconds) covered by a Qwen promotion.
+    # Used to prevent Whisper from re-emitting speech already promoted by Qwen.
+    qwen_covered_until: Optional[float] = None
+    # Map of segment_id → (start_time, end_time) for Qwen-promoted draft segments.
+    # When Whisper commits a segment that overlaps a draft, the draft is removed
+    # from the DB and a transcript_segment_removed event is emitted so Whisper's
+    # higher-quality version takes its place in the frontend.
+    qwen_committed_drafts: dict = field(default_factory=dict)
     first_chunk_wall_time: Optional[float] = None
     last_chunk_wall_time: Optional[float] = None
     last_voiced_chunk_wall_time: Optional[float] = None
@@ -335,6 +358,7 @@ class SessionManager:
             fast_preview_last_audio_seconds=self._state.fast_preview_last_audio_seconds,
             fast_preview_last_wall_seconds=self._state.fast_preview_last_wall_seconds,
             fast_preview_realtime_factor=self._state.fast_preview_realtime_factor,
+            preview_continued_during_formal=self._state.preview_continued_during_formal,
             preview_stale_suppressed=self._state.preview_stale_suppressed,
             preview_alignment_compared=self._state.preview_alignment_compared,
             preview_alignment_similarity_avg=(
@@ -347,6 +371,8 @@ class SessionManager:
                 else None
             ),
             preview_alignment_similarity_last=self._state.preview_alignment_similarity_last,
+            preview_unconfirmed_after_formal=self._state.preview_unconfirmed_after_formal,
+            preview_unconfirmed_last_text=self._state.preview_unconfirmed_last_text,
             mixed_microphone_gain=mixed_microphone_gain,
             mixed_system_gain=mixed_system_gain,
             mixed_effective_microphone_gain=mixed_effective_microphone_gain,
@@ -484,6 +510,9 @@ class SessionManager:
             await self._emit_memory(force=True)
             await self._emit_cumulative(force=True)
             return
+        if summary_type == "refined_transcript":
+            await self._emit_refined_transcript(force=True)
+            return
 
     async def events(self) -> AsyncIterator[SessionEvent]:
         while not (self._stopped.is_set() and self._event_queue.empty()):
@@ -496,7 +525,37 @@ class SessionManager:
     # Event types that must never be dropped even when the queue is full.
     _CRITICAL_EVENT_TYPES = frozenset({
         "summary_snapshot", "error", "session_state", "speaker_update",
+        "transcript_segment", "transcript_segment_removed",
     })
+
+    def _drop_one_queued_noncritical_event(self) -> bool:
+        """Make room for a critical event without losing committed transcript.
+
+        If the queue is saturated by preview/diagnostic traffic, drop the oldest
+        non-critical event and keep the relative order of everything else.
+        """
+        buffered: list[SessionEvent] = []
+        dropped: Optional[SessionEvent] = None
+        while True:
+            try:
+                queued = self._event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if dropped is None and queued.type not in self._CRITICAL_EVENT_TYPES:
+                dropped = queued
+                continue
+            buffered.append(queued)
+        for queued in buffered:
+            self._event_queue.put_nowait(queued)
+        if dropped is None:
+            return False
+        self._queue_drop_count += 1
+        logger.debug(
+            "event queue full — dropped queued %s to make room for critical event (total drops: %d)",
+            dropped.type,
+            self._queue_drop_count,
+        )
+        return True
 
     async def _emit(self, event_type: str, payload_model) -> None:
         payload = (
@@ -505,22 +564,25 @@ class SessionManager:
             else dict(payload_model)
         )
         event = SessionEvent(type=event_type, payload=payload)
-        if self._event_queue.full() and event_type not in self._CRITICAL_EVENT_TYPES:
-            # Drop low-priority events (e.g. transcript_segment) to prevent OOM.
-            self._queue_drop_count += 1
-            logger.debug("event queue full — dropping %s (total drops: %d)", event_type, self._queue_drop_count)
-            if self._queue_drop_count % 50 == 0:
-                drop_notice = ErrorPayload(
-                    code="event_queue_drop",
-                    message=f"{self._queue_drop_count} events dropped (queue full); consumer may be too slow",
-                )
-                try:
-                    self._event_queue.put_nowait(
-                        SessionEvent(type="error", payload=drop_notice.model_dump(mode="json"))
+        if self._event_queue.full():
+            if event_type in self._CRITICAL_EVENT_TYPES:
+                self._drop_one_queued_noncritical_event()
+            else:
+                # Drop low-priority events (e.g. preview updates) to prevent OOM.
+                self._queue_drop_count += 1
+                logger.debug("event queue full — dropping %s (total drops: %d)", event_type, self._queue_drop_count)
+                if self._queue_drop_count % 50 == 0:
+                    drop_notice = ErrorPayload(
+                        code="event_queue_drop",
+                        message=f"{self._queue_drop_count} events dropped (queue full); consumer may be too slow",
                     )
-                except asyncio.QueueFull:
-                    pass  # critical slot also full; silent skip
-            return
+                    try:
+                        self._event_queue.put_nowait(
+                            SessionEvent(type="error", payload=drop_notice.model_dump(mode="json"))
+                        )
+                    except asyncio.QueueFull:
+                        pass  # critical slot also full; silent skip
+                return
         await self._event_queue.put(event)
 
     def save_note(self, content: str, source_type: Optional[str] = None, source_id: Optional[str] = None) -> Note:
@@ -605,6 +667,13 @@ class SessionManager:
             self._cfg.preview_asr is not None
             and self._preview_asr_executor is not None
             and not self._preview_asr_disabled
+        )
+
+    def _can_continue_preview_during_formal(self) -> bool:
+        """Allow only the isolated Qwen preview lane to keep updating during formal work."""
+        return (
+            self._cfg.preview_asr_backend_name == "qwen3"
+            and self._has_dedicated_preview_asr()
         )
 
     def _disable_dedicated_preview_asr(self, exc: Exception) -> None:
@@ -739,6 +808,186 @@ class SessionManager:
         preview = self._state.preview_candidate_segment
         if preview is not None and self._should_commit_on_silence(preview):
             await self._flush_preview_candidate()
+
+        await self._drain_qwen_orphan_queue()
+
+    def _build_whisper_prompt(self) -> Optional[str]:
+        """Combine static vocabulary hint with recent Qwen preview context.
+
+        Qwen's current preview is passed as Whisper's initial_prompt so Whisper
+        is biased toward the vocabulary and phrasing already heard — the main
+        "1+1>2" synergy between the two engines.  The combined string is capped
+        at 200 characters to stay well within Whisper's ~224-token prompt budget.
+
+        IMPORTANT: only the *current* rolling preview is included, never an
+        accumulating running transcript.  Accumulating context re-creates the
+        conditioning-loop hallucination this codebase explicitly defends against.
+        """
+        base = self._cfg.vocabulary_hint or ""
+        if self._has_dedicated_preview_asr():
+            preview = self._state.fast_preview_segment
+            if preview is not None:
+                qwen_ctx = preview.text.strip()
+                if qwen_ctx:
+                    combined = f"{base} {qwen_ctx}".strip() if base else qwen_ctx
+                    return combined[:200]
+        return base or None
+
+    async def _promote_time_stranded_previews(self) -> None:
+        """Live "no missed sentences" safety net: promote Qwen previews that are
+        older than ``qwen_orphan_max_age_seconds`` with no formal Whisper coverage.
+
+        Called from fast_preview_loop on every tick so stranded previews surface
+        within one interval of going stale, even in chatty meetings without
+        silence pauses (which is when ``_flush_silence_boundary_segments`` would
+        otherwise have triggered the drain).
+        """
+        if not self._has_dedicated_preview_asr():
+            return
+        if not self._state.recent_preview_segments:
+            return
+
+        now = self._state.elapsed_seconds
+        max_age = self._cfg.qwen_orphan_max_age_seconds
+        covered_until = max(
+            self._state.last_emitted_end_time or 0.0,
+            self._state.qwen_covered_until or 0.0,
+        )
+
+        to_promote = []
+        remaining = []
+        for preview in self._state.recent_preview_segments:
+            if (now - preview.end_time) >= max_age and preview.end_time > covered_until:
+                to_promote.append(preview)
+            else:
+                remaining.append(preview)
+
+        if not to_promote:
+            return
+
+        self._state.recent_preview_segments = remaining
+
+        # Deduplicate rolling-window snapshots: for overlapping previews keep
+        # the newest (highest end_time) — it has the most decoder context.
+        to_promote = sorted(to_promote, key=lambda s: s.end_time)
+        deduped: list[TranscriptSegment] = []
+        for seg in reversed(to_promote):
+            if not any(s.start_time < seg.end_time and s.end_time > seg.start_time for s in deduped):
+                deduped.append(seg)
+        deduped.reverse()
+
+        for orphan in deduped:
+            text = orphan.text.strip()
+            if not text:
+                continue
+            if len(re.sub(r"\s+", "", text)) < 2:
+                continue
+            if text == self._state.last_emitted_text:
+                continue
+            covered_until = max(
+                self._state.last_emitted_end_time or 0.0,
+                self._state.qwen_covered_until or 0.0,
+            )
+            if orphan.end_time <= covered_until + 0.1:
+                continue
+
+            promoted = TranscriptSegment(
+                id=str(uuid.uuid4()),
+                meeting_id=orphan.meeting_id,
+                start_time=orphan.start_time,
+                end_time=orphan.end_time,
+                text=orphan.text,
+                original_language=orphan.original_language,
+                speaker_id=orphan.speaker_id,
+                confidence=orphan.confidence,
+                quality="low",
+                created_at=datetime.now(tz=timezone.utc),
+                emitted_at_elapsed_seconds=orphan.emitted_at_elapsed_seconds,
+            )
+            logger.info(
+                "qwen_stranded_promoted [%.2f-%.2f] age=%.1fs text=%r",
+                orphan.start_time,
+                orphan.end_time,
+                now - orphan.end_time,
+                text[:80],
+            )
+            await self._persist_and_emit_segment(promoted, is_qwen_draft=True)
+            self._state.qwen_committed_drafts[promoted.id] = (promoted.start_time, promoted.end_time)
+            self._state.qwen_covered_until = max(
+                self._state.qwen_covered_until or 0.0,
+                orphan.end_time,
+            )
+
+    async def _drain_qwen_orphan_queue(self) -> None:
+        """Promote orphaned Qwen previews as low-quality formal segments.
+
+        Runs at silence boundaries and session end.  Only active when a
+        dedicated preview ASR (Qwen) is configured, so it never fires when
+        Whisper is both the preview and formal engine (same-model duplication
+        would be wrong).
+        """
+        if not self._state.qwen_orphan_queue:
+            return
+
+        # Sort chronologically and deduplicate: for overlapping rolling-window
+        # snapshots of the same speech, keep only the latest (highest end_time)
+        # for each time region — it has the most context from Qwen's decoder.
+        queue = sorted(self._state.qwen_orphan_queue, key=lambda s: s.end_time)
+        self._state.qwen_orphan_queue.clear()
+
+        deduped: list[TranscriptSegment] = []
+        for seg in reversed(queue):  # newest-first pass
+            if not any(
+                s.start_time < seg.end_time and s.end_time > seg.start_time
+                for s in deduped
+            ):
+                deduped.append(seg)
+        deduped.reverse()  # back to chronological order
+
+        for orphan in deduped:
+            text = orphan.text.strip()
+            if not text:
+                continue
+            dense = re.sub(r"\s+", "", text)
+            # Skip trivially short non-CJK (single letter, stray token).
+            if len(dense) < 2:
+                continue
+            if text == self._state.last_emitted_text:
+                continue
+            # Don't reach back before the formal timeline — only promote if
+            # the gap wasn't already closed by a formal segment committed after
+            # the orphan was queued.
+            if (
+                self._state.last_emitted_end_time is not None
+                and orphan.end_time <= self._state.last_emitted_end_time - 0.1
+            ):
+                continue
+
+            promoted = TranscriptSegment(
+                id=str(uuid.uuid4()),
+                meeting_id=orphan.meeting_id,
+                start_time=orphan.start_time,
+                end_time=orphan.end_time,
+                text=orphan.text,
+                original_language=orphan.original_language,
+                speaker_id=orphan.speaker_id,
+                confidence=orphan.confidence,
+                quality="low",
+                created_at=datetime.now(tz=timezone.utc),
+                emitted_at_elapsed_seconds=orphan.emitted_at_elapsed_seconds,
+            )
+            logger.info(
+                "qwen_orphan_promoted [%.2f-%.2f] text=%r",
+                orphan.start_time,
+                orphan.end_time,
+                text[:80],
+            )
+            await self._persist_and_emit_segment(promoted, is_qwen_draft=True)
+            self._state.qwen_committed_drafts[promoted.id] = (promoted.start_time, promoted.end_time)
+            self._state.qwen_covered_until = max(
+                self._state.qwen_covered_until or 0.0,
+                orphan.end_time,
+            )
 
     async def _reconcile_preview_candidate(
         self,
@@ -1072,13 +1321,29 @@ class SessionManager:
                 samples = np.concatenate([chunk.samples for chunk in selected]).astype(np.float32, copy=False)
                 if len(samples) > target_frames:
                     samples = samples[-target_frames:]
-                    buf_start = selected[-1].start_time + (
-                        len(selected[-1].samples) - min(len(selected[-1].samples), len(samples))
-                    ) / sample_rate
                     total_selected_frames = sum(len(chunk.samples) for chunk in selected)
                     buf_start = selected[0].start_time + max(0, total_selected_frames - len(samples)) / sample_rate
                 else:
                     buf_start = selected[0].start_time
+
+                # Clip the front to the last formally committed Whisper position.
+                # Qwen re-decoding already-committed speech wastes compute and
+                # causes the preview to display the tail of the previous (already
+                # committed) sentence, making it look like a "previous sentence"
+                # subtitle.  No overlap: the window starts exactly at the commit
+                # boundary so every preview shows only genuinely new speech.
+                # The window then grows naturally as speech continues, producing
+                # the "growing subtitles" effect.
+                committed = self._state.last_emitted_end_time
+                if committed is not None and committed > 0.0:
+                    clip_start = max(buf_start, committed)
+                    if clip_start > buf_start:
+                        trim_frames = int((clip_start - buf_start) * sample_rate)
+                        if trim_frames >= len(samples):
+                            return None
+                        samples = samples[trim_frames:]
+                        buf_start = clip_start
+
                 return samples.copy(), sample_rate, buf_start
 
             def clear_weak_rescue_buffer() -> None:
@@ -1100,6 +1365,9 @@ class SessionManager:
                 recent_audio_chunks.clear()
                 recent_audio_duration = 0.0
                 self._state.fast_preview_segment = None
+                # Clear pending Qwen drafts — they belong to the previous source
+                # and Whisper will never cover them on the new source.
+                self._state.qwen_committed_drafts.clear()
 
             async def maybe_rescue_weak_speech(
                 *,
@@ -1215,6 +1483,7 @@ class SessionManager:
                         self._schedule_summary(self._maybe_emit_rolling())
                         self._schedule_summary(self._maybe_emit_memory())
                         self._schedule_summary(self._maybe_emit_cumulative())
+                        self._schedule_summary(self._maybe_emit_refined_transcript())
                     overlap_buf = np.zeros(0, dtype=np.float32)
                     return
 
@@ -1227,7 +1496,7 @@ class SessionManager:
                 extended = np.concatenate([overlap_buf, merged]) if len(overlap_buf) > 0 else merged
                 asr_buf_start = buf_start - overlap_duration
     
-                prompt = self._cfg.vocabulary_hint or None
+                prompt = self._build_whisper_prompt()
                 effective_lang = self._cfg.forced_language or (
                     self._state.locked_language if self._cfg.language_lock_enabled else None
                 )
@@ -1247,13 +1516,29 @@ class SessionManager:
                         else (merged.copy() if overlap_frames > 0 else np.zeros(0, dtype=np.float32))
                     )
                     return
-    
+
                 overlap_buf = (
                     merged[-overlap_frames:].copy()
                     if overlap_frames > 0 and len(merged) >= overlap_frames
                     else (merged.copy() if overlap_frames > 0 else np.zeros(0, dtype=np.float32))
                 )
-    
+
+                # Drop Whisper segments that fall entirely within a time region
+                # already promoted by Qwen — prevents duplicate formal entries.
+                if self._state.qwen_covered_until is not None:
+                    covered = self._state.qwen_covered_until
+                    n_before = len(segments)
+                    segments = [
+                        s for s in segments
+                        if (asr_buf_start + s.end_time) > covered + 0.1
+                    ]
+                    if len(segments) < n_before:
+                        logger.debug(
+                            "whisper_dedup: dropped %d segment(s) already covered by Qwen (covered_until=%.2f)",
+                            n_before - len(segments),
+                            covered,
+                        )
+
                 dia_segments = None
                 if self._cfg.diarizer is not None:
                     dia_segments = await loop.run_in_executor(
@@ -1262,7 +1547,7 @@ class SessionManager:
                             m, sr, offset_seconds=bs,
                         ),
                     )
-    
+
                 repetition_tripped = False
                 candidate_segments: list[TranscriptSegment] = []
                 for asr_seg in segments:
@@ -1394,6 +1679,7 @@ class SessionManager:
                 self._schedule_summary(self._maybe_emit_rolling())
                 self._schedule_summary(self._maybe_emit_memory())
                 self._schedule_summary(self._maybe_emit_cumulative())
+                self._schedule_summary(self._maybe_emit_refined_transcript())
 
             queue_chunk_seconds = max(0.05, self._cfg.audio_chunk_seconds)
             audio_queue_maxsize = max(
@@ -1432,7 +1718,11 @@ class SessionManager:
                             self._state.fast_preview_segment = None
                             await self._emit_transcript_preview()
                             continue
-                        if self._state.pending_segments or self._state.preview_candidate_segment is not None:
+                        formal_pending = (
+                            bool(self._state.pending_segments)
+                            or self._state.preview_candidate_segment is not None
+                        )
+                        if formal_pending and not self._can_continue_preview_during_formal():
                             continue
                         if self._state.fast_preview_inflight:
                             self._state.fast_preview_skipped += 1
@@ -1446,21 +1736,21 @@ class SessionManager:
                         if self._asr_safeguard_active():
                             self._state.fast_preview_skipped += 1
                             continue
-                        formal_rtf = self._state.asr_realtime_factor
-                        if (
-                            formal_rtf is not None
-                            and formal_rtf > self._cfg.fast_preview_max_asr_realtime_factor
-                        ):
-                            self._state.fast_preview_skipped += 1
-                            continue
-                        preview_rtf = self._state.fast_preview_realtime_factor
-                        if (
-                            self._has_dedicated_preview_asr()
-                            and preview_rtf is not None
-                            and preview_rtf > self._cfg.fast_preview_max_asr_realtime_factor
-                        ):
-                            self._state.fast_preview_skipped += 1
-                            continue
+                        # When Qwen has its own executor the formal-Whisper RTF is
+                        # irrelevant to preview throughput — they run on separate
+                        # thread pools.  Only gate on Whisper RTF when preview
+                        # shares the same executor (no dedicated preview ASR).
+                        if not self._has_dedicated_preview_asr():
+                            formal_rtf = self._state.asr_realtime_factor
+                            if (
+                                formal_rtf is not None
+                                and formal_rtf > self._cfg.fast_preview_max_asr_realtime_factor
+                            ):
+                                self._state.fast_preview_skipped += 1
+                                continue
+                        # No RTF gate for dedicated preview ASR: fast_preview_inflight
+                        # already prevents concurrent runs; stale RTF from a small
+                        # post-commit window would self-reinforce and block indefinitely.
 
                         snap = snapshot_recent_audio()
                         if snap is None:
@@ -1471,9 +1761,10 @@ class SessionManager:
                             self._state.fast_preview_segment = None
                             await self._emit_transcript_preview()
                             continue
+                        if formal_pending:
+                            self._state.preview_continued_during_formal += 1
 
                         conditioned = audio_conditioner.process_samples(samples)
-                        prompt = self._cfg.vocabulary_hint or None
                         effective_lang = self._cfg.forced_language or (
                             self._state.locked_language if self._cfg.language_lock_enabled else None
                         )
@@ -1483,7 +1774,7 @@ class SessionManager:
                                 conditioned,
                                 sample_rate,
                                 buf_start=buf_start,
-                                prompt=prompt,
+                                prompt=self._cfg.vocabulary_hint or None,
                                 forced_language=effective_lang,
                             )
                         except Exception as exc:
@@ -1493,6 +1784,10 @@ class SessionManager:
                         if seg is not None:
                             self._state.fast_preview_segment = seg
                             await self._emit_transcript_preview(seg)
+
+                        # Safety net: promote any Qwen previews that are too old
+                        # without formal Whisper coverage ("no missed sentences").
+                        await self._promote_time_stranded_previews()
                 except asyncio.CancelledError:
                     raise
 
@@ -1623,7 +1918,7 @@ class SessionManager:
                         overlap_duration = len(overlap_buf) / sample_rate
                         extended = np.concatenate([overlap_buf, merged]) if len(overlap_buf) > 0 else merged
                         asr_buf_start = accum_start_time - overlap_duration
-                        prompt = self._cfg.vocabulary_hint or None
+                        prompt = self._build_whisper_prompt()
                         effective_lang = self._cfg.forced_language or (
                             self._state.locked_language if self._cfg.language_lock_enabled else None
                         )
@@ -1639,6 +1934,12 @@ class SessionManager:
                             logger.warning("ASR failed on final flush, skipping: %s", exc)
                             await self._emit("error", ErrorPayload(code="asr_error", message=str(exc)))
                             segments = []
+                        if self._state.qwen_covered_until is not None:
+                            covered = self._state.qwen_covered_until
+                            segments = [
+                                s for s in segments
+                                if (asr_buf_start + s.end_time) > covered + 0.1
+                            ]
                     for asr_seg in segments:
                         if asr_seg.start_time < overlap_duration:
                             continue
@@ -1691,6 +1992,7 @@ class SessionManager:
                     await self._emit_oldest_pending_segment()
 
                 await self._flush_preview_candidate()
+                await self._drain_qwen_orphan_queue()
 
                 # Wait for in-flight summary tasks before final summary.
                 if self._summary_tasks:
@@ -2219,7 +2521,6 @@ class SessionManager:
             return "drop"
 
         duration = max(0.0, seg.end_time - seg.start_time)
-        dense_text = re.sub(r"\s+", "", text)
         signal_count = 0
 
         if (
@@ -2237,10 +2538,14 @@ class SessionManager:
             and seg.compression_ratio >= self._cfg.suspicious_segment_compression_ratio
         ):
             signal_count += 1
-        if duration <= 0.45 and len(dense_text) >= 8:
-            signal_count += 1
-        if duration > 0.0 and (len(dense_text) / duration) >= 35.0:
-            signal_count += 1
+        # Structural duration/density heuristics intentionally removed.
+        # Whisper's own three signals (no_speech_prob, avg_logprob, compression_ratio)
+        # are the model's built-in hallucination detectors and are authoritative for
+        # all languages.  Duration/density rules misfired on:
+        #   - Short English/German words ("yesterday", "Bundestag") at fast speech rates
+        #   - Any segment where Whisper under-reports timestamp duration (common)
+        #   - Normal CJK speech (one character ≈ one syllable, density looks high)
+        # Removing them reduces false drops across EN / DE / ZH equally.
 
         if signal_count < 2:
             return "keep"
@@ -2378,14 +2683,62 @@ class SessionManager:
             emitted_at_elapsed_seconds=seg.emitted_at_elapsed_seconds,
         )
 
-    async def _persist_and_emit_segment(self, seg: TranscriptSegment) -> None:
+    async def _whisper_replaces_qwen_drafts(self, whisper_seg: TranscriptSegment) -> None:
+        """Remove Qwen-draft segments that overlap with an incoming Whisper segment.
+
+        Qwen fast-promotes segments as quality="low" placeholders so the user
+        sees text quickly.  When Whisper commits the same time region its output
+        is preferred: the draft is deleted from the DB and a
+        ``transcript_segment_removed`` event lets the frontend swap it out.
+        """
+        if not self._state.qwen_committed_drafts:
+            return
+        to_remove = [
+            seg_id
+            for seg_id, (s, e) in self._state.qwen_committed_drafts.items()
+            if s < whisper_seg.end_time and e > whisper_seg.start_time
+        ]
+        if not to_remove:
+            return
+        for seg_id in to_remove:
+            del self._state.qwen_committed_drafts[seg_id]
+            self._state.segments = [s for s in self._state.segments if s.id != seg_id]
+            self._cfg.storage.delete_segment(seg_id)
+            await self._emit(
+                "transcript_segment_removed",
+                TranscriptSegmentRemovedPayload(segment_id=seg_id),
+            )
+            logger.info(
+                "qwen_draft_replaced [%.2f-%.2f] removed_draft=%s",
+                whisper_seg.start_time,
+                whisper_seg.end_time,
+                seg_id[:8],
+            )
+
+    async def _persist_and_emit_segment(
+        self, seg: TranscriptSegment, *, is_qwen_draft: bool = False
+    ) -> None:
+        if not is_qwen_draft:
+            await self._whisper_replaces_qwen_drafts(seg)
         self._state.segments.append(seg)
         self._cfg.storage.insert_segment(seg)
         self._state.last_emitted_text = seg.text.strip()
-        self._state.last_emitted_end_time = seg.end_time
+        # Only the formal Whisper commit advances the clip boundary used by
+        # snapshot_recent_audio().  Qwen-draft promotions must NOT move it:
+        # that would cause the next preview window to start at the draft's
+        # end_time, making short post-commit windows and stale-suppression false
+        # positives that produce the "previous sentence still showing" bug.
+        if not is_qwen_draft:
+            self._state.last_emitted_end_time = seg.end_time
+        # Clear the fast-preview overlay whenever Whisper formally commits any
+        # segment whose time range overlaps the current preview.  The previous
+        # condition (preview.end_time <= commit.end_time + 0.1) was too narrow:
+        # it left previews showing already-committed content when the preview's
+        # end_time extended past the commit boundary by more than 0.1 s.
         if (
-            self._state.fast_preview_segment is not None
-            and self._state.fast_preview_segment.end_time <= seg.end_time + 0.1
+            not is_qwen_draft
+            and self._state.fast_preview_segment is not None
+            and self._state.fast_preview_segment.start_time < seg.end_time
         ):
             self._state.fast_preview_segment = None
         # Alignment diagnostics: compare overlapping recent preview text with formal text.
@@ -2400,8 +2753,6 @@ class SessionManager:
             p for p in self._state.recent_preview_segments
             if p.start_time < formal.end_time and p.end_time > formal.start_time
         ]
-        if not overlapping:
-            return
         formal_text = formal.text.strip()
         for preview in overlapping:
             preview_text = preview.text.strip()
@@ -2418,10 +2769,48 @@ class SessionManager:
                 ratio,
             )
         # Prune matched segments to avoid unbounded growth.
-        self._state.recent_preview_segments = [
-            p for p in self._state.recent_preview_segments
-            if p not in overlapping
-        ]
+        if overlapping:
+            self._state.recent_preview_segments = [
+                p for p in self._state.recent_preview_segments
+                if p not in overlapping
+            ]
+        self._mark_unconfirmed_previews_after_formal(formal)
+
+    def _mark_unconfirmed_previews_after_formal(self, formal: TranscriptSegment) -> None:
+        """Count previews that formal ASR has advanced past without overlapping.
+
+        This is diagnostic-only: it never persists Qwen preview text. A high count
+        suggests that either Qwen hallucinated temporary text or the formal lane
+        missed/filtered speech that preview heard.
+        """
+        if not self._state.recent_preview_segments:
+            return
+        grace = max(0.3, self._cfg.preview_stale_tolerance_seconds)
+        confirmed_until = formal.end_time - grace
+        if confirmed_until <= 0:
+            return
+
+        remaining = []
+        for preview in self._state.recent_preview_segments:
+            if preview.end_time <= confirmed_until:
+                text = preview.text.strip()
+                if text:
+                    self._state.preview_unconfirmed_after_formal += 1
+                    self._state.preview_unconfirmed_last_text = text[:160]
+                    logger.debug(
+                        "preview unconfirmed after formal: preview=[%.2f-%.2f] formal=[%.2f-%.2f] text=%r",
+                        preview.start_time,
+                        preview.end_time,
+                        formal.start_time,
+                        formal.end_time,
+                        text[:80],
+                    )
+                    # Queue for promotion when dedicated preview ASR (Qwen) is active.
+                    if self._has_dedicated_preview_asr():
+                        self._state.qwen_orphan_queue.append(preview)
+                continue
+            remaining.append(preview)
+        self._state.recent_preview_segments = remaining
 
     async def _translate_segment(self, seg: TranscriptSegment, target_language: LanguageCode) -> None:
         if seg.original_language == target_language:
@@ -2560,6 +2949,52 @@ class SessionManager:
             return tail
         return list(self._state.segments[-10:])
 
+    def _refinement_context_segments(self) -> list[TranscriptSegment]:
+        """Formal transcript span used for a non-authoritative LLM cleanup pass."""
+
+        tail = self._segments_in_window(self._cfg.refinement_window_seconds)
+        if tail:
+            return tail
+        return list(self._state.segments[-12:])
+
+    def _refinement_hint_context(self, segments: list[TranscriptSegment]) -> str:
+        """Compact Qwen/preview hints for transcript refinement.
+
+        This context is intentionally diagnostic-only. The raw formal transcript
+        remains the source of truth; the LLM may use these hints to flag likely
+        gaps or obvious ASR corrections, but the refined snapshot is never fed
+        back into persistence or later ASR.
+        """
+
+        if not segments:
+            return ""
+        start = min(s.start_time for s in segments)
+        end = max(s.end_time for s in segments)
+        previews = [
+            p for p in self._state.recent_preview_segments
+            if p.start_time < end and p.end_time > start and getattr(p, "text", "").strip()
+        ]
+        previews = previews[-8:]
+        lines = [
+            "Fusion context for transcript refinement.",
+            "Compare Whisper/formal transcript and Qwen/preview hints case by case.",
+            "Do not assume either engine is globally better; choose the locally more plausible wording from timing, language, overlap, and context.",
+            "If neither source is reliable, keep the safer wording and mark the conflict as low confidence.",
+            f"Preview alignment compared: {self._state.preview_alignment_compared}",
+            f"Last preview/formal similarity: {self._state.preview_alignment_similarity_last if self._state.preview_alignment_similarity_last is not None else 'unknown'}",
+            f"Preview unconfirmed after formal: {self._state.preview_unconfirmed_after_formal}",
+        ]
+        if self._state.preview_unconfirmed_last_text:
+            lines.append(f"Last unconfirmed preview text: {self._state.preview_unconfirmed_last_text}")
+        if previews:
+            lines.append("Recent temporary preview hints in this window:")
+            for preview in previews:
+                text = preview.text.strip().replace("\n", " ")
+                lines.append(f"- [{preview.start_time:.1f}-{preview.end_time:.1f}] {text[:220]}")
+        else:
+            lines.append("Recent temporary preview hints in this window: none")
+        return "\n".join(lines)
+
     async def _build_and_emit_snapshot(
         self,
         *,
@@ -2576,6 +3011,7 @@ class SessionManager:
             "rolling_summary",
             "cumulative_meeting_summary",
             "final_summary",
+            "refined_transcript",
         } else "rolling_summary"
         loop = asyncio.get_running_loop()
         content = await loop.run_in_executor(
@@ -2699,6 +3135,38 @@ class SessionManager:
                 self._state.latest_cumulative_text = snap.content
         finally:
             self._state.cumulative_in_flight = False
+
+    async def _maybe_emit_refined_transcript(self) -> None:
+        await self._emit_refined_transcript(force=False)
+
+    async def _emit_refined_transcript(self, *, force: bool) -> None:
+        if self._state.refinement_in_flight:
+            return
+        now = self._state.elapsed_seconds
+        due = (now - self._state.last_refinement_at) >= self._cfg.refinement_interval_seconds
+        if not due and not force:
+            return
+        context_segments = self._refinement_context_segments()
+        if len(context_segments) < self._cfg.min_segments_for_refinement and not force:
+            return
+        if not context_segments:
+            return
+        start = min(s.start_time for s in context_segments)
+        end = max(s.end_time for s in context_segments)
+        hint_context = self._refinement_hint_context(context_segments)
+        self._state.refinement_in_flight = True
+        try:
+            snap = await self._build_and_emit_snapshot(
+                summary_type="refined_transcript",
+                segments=context_segments,
+                time_start=start,
+                time_end=end,
+                previous_summary=hint_context or None,
+            )
+            if snap is not None:
+                self._state.last_refinement_at = now
+        finally:
+            self._state.refinement_in_flight = False
 
     async def _emit_final(self) -> None:
         if self._state.retry_windows_total > 0:

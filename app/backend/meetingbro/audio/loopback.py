@@ -119,6 +119,15 @@ class SystemAudioLoopbackSource(AudioSource):
         stop = self._stop
 
         def _reader() -> None:
+            # COM must be initialized on each thread before WASAPI calls.
+            # CoInitializeEx returns S_OK (0) on first init or S_FALSE (1) if
+            # already initialized by this thread; only call CoUninitialize when
+            # we were the ones who initialized it.
+            import ctypes
+            _ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+            COINIT_MULTITHREADED = 0x0
+            _hr = _ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
+            _com_owned = _hr in (0, 1)
             try:
                 with mic.recorder(samplerate=native_rate, blocksize=native_block) as rec:
                     logger.info(
@@ -144,6 +153,8 @@ class SystemAudioLoopbackSource(AudioSource):
             except Exception:
                 logger.exception("loopback reader thread crashed")
             finally:
+                if _com_owned:
+                    _ole32.CoUninitialize()
                 # Sentinel so the async iterator can wake up and exit cleanly.
                 q.put(None)  # type: ignore[arg-type]
 

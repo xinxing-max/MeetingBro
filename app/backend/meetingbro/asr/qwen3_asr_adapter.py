@@ -126,6 +126,43 @@ def _wrong_script(text: str, forced_language: Optional[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Incomplete-preview filter
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate the model produced a trailing-ellipsis fragment that
+# looks like mid-thought output rather than a complete utterance.
+_TRAILING_ELLIPSIS_RE = re.compile(
+    r"(?:\.{2,}|\u2026|\u3002{2,}|\u2014|\u2013|-)\s*$",
+    re.UNICODE,
+)
+
+# Mostly-punctuation guard: if > 60 % of all characters are punctuation or
+# whitespace the whole output is treated as noise.
+_PUNCT_OR_SPACE_RE = re.compile(r"[\s\u0021-\u002f\u003a-\u0040\u005b-\u0060\u007b-\u007e\u3000-\u303f\uff00-\uffef]", re.UNICODE)
+
+
+def _looks_incomplete_preview(text: str) -> bool:
+    """Return ``True`` when *text* looks like a trailing-ellipsis or otherwise
+    incomplete fragment that should not be shown in the preview UI.
+
+    Checks:
+    1. Text ends with ASCII ellipsis ``...``, Unicode ellipsis ``\u2026``,
+       CJK triple-period ``\u3002\u3002\u3002``, or a dangling dash
+       (``-``, ``\u2014``, ``\u2013``).
+    2. More than 60 % of all characters are punctuation/whitespace (pure noise).
+    """
+    if not text:
+        return False
+    if _TRAILING_ELLIPSIS_RE.search(text):
+        return True
+    total = len(text)
+    punct_count = sum(1 for c in text if _PUNCT_OR_SPACE_RE.match(c))
+    if total > 0 and punct_count / total > 0.60:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Output quality heuristics
 # ---------------------------------------------------------------------------
 

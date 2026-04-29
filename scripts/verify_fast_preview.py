@@ -23,7 +23,8 @@ sys.path.insert(0, str(ROOT / "app" / "backend"))
 from meetingbro.asr.base import ASRAdapter, ASRSegment  # noqa: E402
 from meetingbro.audio.capture import AudioChunk, AudioSource  # noqa: E402
 from meetingbro.exporter import export_meeting  # noqa: E402
-from meetingbro.session.manager import SessionConfig, SessionManager  # noqa: E402
+from meetingbro.session.manager import SessionConfig, SessionEvent, SessionManager  # noqa: E402
+from meetingbro.schemas import TranscriptSegment  # noqa: E402
 from meetingbro.storage.db import Storage  # noqa: E402
 from meetingbro.summarization.base import Summarizer  # noqa: E402
 from meetingbro.translation.base import Translator  # noqa: E402
@@ -115,6 +116,7 @@ class _CaseResult:
     transcript_text: str
     summary_text: str
     fast_preview_skipped: int
+    preview_continued_during_formal: int
     shared_calls: int
     preview_calls: int
     summarizer_calls: int
@@ -127,6 +129,7 @@ async def _run_case(
     formal_asr_rtf: float | None = None,
     preview_asr_backend_name: str = "unknown",
     preview_asr_fallback_on_error: bool = True,
+    seed_formal_pending: bool = False,
 ) -> _CaseResult:
     with tempfile.TemporaryDirectory() as tmp:
         storage = Storage(Path(tmp) / "fast_preview.db")
@@ -168,7 +171,23 @@ async def _run_case(
 
         collector = asyncio.create_task(collect())
         await manager.start()
+        if seed_formal_pending:
+            # The fast-preview loop only needs pending formal work to be truthy.
+            # Use a low-confidence/short preview candidate rather than a pending
+            # segment so the session finalizer never persists this synthetic sentinel.
+            manager._state.preview_candidate_segment = TranscriptSegment(
+                id=str(uuid.uuid4()),
+                meeting_id=manager.meeting_id,
+                start_time=0.0,
+                end_time=0.1,
+                text="synthetic formal pending sentinel",
+                original_language="en",
+                confidence=0.0,
+                created_at=datetime.now(),
+            )
         await asyncio.sleep(0.7)
+        if seed_formal_pending:
+            manager._state.preview_candidate_segment = None
         await manager.stop()
         await asyncio.wait_for(collector, timeout=1.0)
 
@@ -198,6 +217,7 @@ async def _run_case(
         transcript_text=transcript_text,
         summary_text=summary_text,
         fast_preview_skipped=manager._state.fast_preview_skipped,
+        preview_continued_during_formal=manager._state.preview_continued_during_formal,
         shared_calls=shared_asr.calls,
         preview_calls=0 if preview_asr is None else preview_asr.calls,
         summarizer_calls=summarizer.calls,
@@ -263,10 +283,9 @@ async def main() -> int:
     )
 
     overloaded_shared = _StaticASR(text=None)
-    overloaded_preview = _StaticASR(text="should not run")
     overloaded = await _run_case(
         shared_asr=overloaded_shared,
-        preview_asr=overloaded_preview,
+        preview_asr=None,
         formal_asr_rtf=0.90,
     )
     ok_overloaded = (
@@ -462,6 +481,64 @@ async def main() -> int:
         return 1
     print("OK: qwen3 no-fallback mode skips preview without borrowing shared ASR")
 
+    # (f) Qwen3 live preview should continue while formal text is pending.
+    # This is the key UX split: Qwen keeps the live subtitle moving while
+    # Whisper/formal work settles behind it.
+    qwen3_pending_shared = _StaticASR(text=None)
+    qwen3_pending_preview = _StaticASR(text="qwen3 live while formal pending")
+    qwen3_pending = await _run_case(
+        shared_asr=qwen3_pending_shared,
+        preview_asr=qwen3_pending_preview,
+        preview_asr_backend_name="qwen3",
+        preview_asr_fallback_on_error=False,
+        seed_formal_pending=True,
+    )
+    ok_qwen3_pending = (
+        _is_temporary_only(qwen3_pending, "qwen3 live while formal pending")
+        and qwen3_pending.shared_calls == 0
+        and qwen3_pending.preview_calls >= 1
+        and qwen3_pending.preview_continued_during_formal >= 1
+    )
+    print(
+        "qwen3-pending-formal-live:",
+        f"previews={len(qwen3_pending.previews)}",
+        f"committed={len(qwen3_pending.committed)}",
+        f"shared_calls={qwen3_pending.shared_calls}",
+        f"preview_calls={qwen3_pending.preview_calls}",
+        f"continued={qwen3_pending.preview_continued_during_formal}",
+    )
+    if not ok_qwen3_pending:
+        print("FAIL: qwen3 dedicated preview should continue while formal text is pending")
+        return 1
+    print("OK: qwen3 dedicated preview continues while formal text is pending")
+
+    # (g) Non-Qwen dedicated preview remains conservative while formal text is pending.
+    # This prevents another Whisper-family preview backend from competing with the
+    # formal Whisper lane in the old way.
+    non_qwen_pending_shared = _StaticASR(text=None)
+    non_qwen_pending_preview = _StaticASR(text="should not preview while pending")
+    non_qwen_pending = await _run_case(
+        shared_asr=non_qwen_pending_shared,
+        preview_asr=non_qwen_pending_preview,
+        preview_asr_backend_name="faster_whisper",
+        seed_formal_pending=True,
+    )
+    ok_non_qwen_pending = (
+        len(non_qwen_pending.previews) == 0
+        and non_qwen_pending.preview_calls == 0
+        and non_qwen_pending.preview_continued_during_formal == 0
+    )
+    print(
+        "non-qwen-pending-formal-guard:",
+        f"previews={len(non_qwen_pending.previews)}",
+        f"preview_calls={non_qwen_pending.preview_calls}",
+        f"continued={non_qwen_pending.preview_continued_during_formal}",
+    )
+    if not ok_non_qwen_pending:
+        print("FAIL: non-qwen preview should still pause while formal text is pending")
+        return 1
+    print("OK: non-qwen preview still pauses while formal text is pending")
+
     # ------------------------------------------------------------------
     # Local unit tests for script filter and filler suppression
     # (no SessionManager, no model required)
@@ -646,6 +723,62 @@ async def main() -> int:
     print("OK: all Qwen3ASRAdapter.transcribe() unit tests passed")
 
     # ------------------------------------------------------------------
+    # _looks_incomplete_preview unit tests
+    # ------------------------------------------------------------------
+
+    from meetingbro.asr.qwen3_asr_adapter import _looks_incomplete_preview  # noqa: E402
+
+    _incomplete_cases: list[tuple[str, bool, str]] = [
+        # Should be suppressed (incomplete)
+        ("Nein, wer k\u00f6nnte es...", True, "trailing ASCII ellipsis"),
+        ("This is incomplete\u2026", True, "trailing Unicode ellipsis \u2026"),
+        ("...", True, "only ASCII ellipsis"),
+        ("\u3002\u3002\u3002", True, "CJK triple-period"),
+        ("Warte mal \u2014", True, "trailing em-dash"),
+        ("Something \u2013", True, "trailing en-dash"),
+        ("Let me think-", True, "trailing ASCII dash"),
+        # Should NOT be suppressed (complete)
+        ("\u8fd9\u662f\u4e00\u4e2a\u5b8c\u6574\u53e5\u5b50\u3002", False, "complete Chinese sentence"),
+        ("This is a complete sentence.", False, "complete English sentence"),
+        ("Guten Morgen, wie geht es Ihnen?", False, "complete German sentence"),
+    ]
+
+    incomplete_failures = 0
+    for text, expect_suppressed, label in _incomplete_cases:
+        got = _looks_incomplete_preview(text)
+        status = "OK" if got == expect_suppressed else "FAIL"
+        if got != expect_suppressed:
+            incomplete_failures += 1
+        print(f"  incomplete-preview [{status}] {label}: suppressed={got} (expected {expect_suppressed})")
+
+    if incomplete_failures:
+        print(f"FAIL: {incomplete_failures} incomplete-preview case(s) failed")
+        return 1
+    print("OK: all _looks_incomplete_preview cases passed")
+
+    # Verify that trailing-ellipsis text now PASSES through transcribe() so
+    # the preview lane can show growing/partial text in real-time.  The
+    # incomplete-preview filter was intentionally moved OUT of transcribe() so
+    # Qwen's partial output is visible as it accumulates.
+    _a_ell = _make_adapter()
+    _a_ell._recognizer = _FakeRecognizer("Nein, wer k\u00f6nnte es...")
+    _r_ell = _a_ell.transcribe(_samples_1s, 16_000)
+    if not _r_ell:
+        print("FAIL: trailing-ellipsis text should now pass through transcribe() for real-time preview")
+        return 1
+    print("OK: trailing-ellipsis text now passes through transcribe() (partial text shown in preview)")
+
+    _a_complete = _make_adapter()
+    _a_complete._recognizer = _FakeRecognizer("This is a complete sentence.")
+    _r_complete = _a_complete.transcribe(_samples_1s, 16_000)
+    if not _r_complete:
+        print("FAIL: complete sentence should NOT be filtered in transcribe()")
+        return 1
+    print("OK: complete sentence correctly passes through transcribe()")
+
+    print("OK: all _looks_incomplete_preview transcribe() integration tests passed")
+
+    # ------------------------------------------------------------------
     # Stale-preview suppression + alignment diagnostics unit tests
     # (direct calls to SessionManager internals; no audio loop needed)
     # ------------------------------------------------------------------
@@ -729,28 +862,81 @@ async def main() -> int:
         return 1
     print("OK: alignment diagnostics: counter incremented, ratio in range, overlapping segment pruned")
 
-    # Test B: non-overlapping preview is NOT compared and NOT pruned
+    # Test B: future non-overlapping preview is NOT compared and NOT pruned
     _m_noalign = _make_manager()
-    _old_preview = _make_segment(start_time=0.0, end_time=1.0, text="Old preview")
+    _future_preview = _make_segment(start_time=8.0, end_time=9.0, text="Future preview")
     _later_formal = _make_segment(start_time=5.0, end_time=7.0, text="Later formal")
-    _m_noalign._state.recent_preview_segments.append(_old_preview)
+    _m_noalign._state.recent_preview_segments.append(_future_preview)
     _m_noalign._run_alignment_diagnostics(_later_formal)
     _ok_noalign_zero = _m_noalign._state.preview_alignment_compared == 0
     _ok_noalign_kept = len(_m_noalign._state.recent_preview_segments) == 1
+    _ok_noalign_unconfirmed_zero = _m_noalign._state.preview_unconfirmed_after_formal == 0
     print(
         "alignment-no-overlap:",
         f"compared={_m_noalign._state.preview_alignment_compared}",
         f"kept={_ok_noalign_kept}",
+        f"unconfirmed={_m_noalign._state.preview_unconfirmed_after_formal}",
     )
     if not _ok_noalign_zero:
         print("FAIL: alignment counter should remain 0 for non-overlapping segments")
         return 1
     if not _ok_noalign_kept:
-        print("FAIL: non-overlapping preview segment should NOT be pruned from ring buffer")
+        print("FAIL: future non-overlapping preview segment should NOT be pruned from ring buffer")
+        return 1
+    if not _ok_noalign_unconfirmed_zero:
+        print("FAIL: future non-overlapping preview should NOT be marked unconfirmed")
         return 1
     print("OK: alignment diagnostics: non-overlapping segment not compared and not pruned")
 
-    # Test C: stale suppression — preview segment end_time ≤ last_emitted_end_time + tolerance
+    # Test C: old non-overlapping preview is marked unconfirmed once formal has passed it
+    _m_unconfirmed = _make_manager()
+    _orphan_preview = _make_segment(start_time=0.0, end_time=1.0, text="orphan preview")
+    _later_formal_2 = _make_segment(start_time=5.0, end_time=7.0, text="later formal")
+    _m_unconfirmed._state.recent_preview_segments.append(_orphan_preview)
+    _m_unconfirmed._run_alignment_diagnostics(_later_formal_2)
+    _ok_unconfirmed_count = _m_unconfirmed._state.preview_unconfirmed_after_formal == 1
+    _ok_unconfirmed_text = _m_unconfirmed._state.preview_unconfirmed_last_text == "orphan preview"
+    _ok_unconfirmed_pruned = len(_m_unconfirmed._state.recent_preview_segments) == 0
+    print(
+        "preview-unconfirmed-after-formal:",
+        f"count={_m_unconfirmed._state.preview_unconfirmed_after_formal}",
+        f"last={_m_unconfirmed._state.preview_unconfirmed_last_text!r}",
+        f"pruned={_ok_unconfirmed_pruned}",
+    )
+    if not _ok_unconfirmed_count:
+        print("FAIL: old non-overlapping preview should increment unconfirmed counter")
+        return 1
+    if not _ok_unconfirmed_text:
+        print("FAIL: unconfirmed last text should be recorded for diagnostics")
+        return 1
+    if not _ok_unconfirmed_pruned:
+        print("FAIL: unconfirmed preview should be pruned from ring buffer to avoid double counting")
+        return 1
+    print("OK: preview unconfirmed diagnostic increments and prunes old non-overlapping preview")
+
+    # Test D: critical transcript_segment makes room by dropping queued non-critical event
+    _m_critical = _make_manager()
+    _m_critical._event_queue = asyncio.Queue(maxsize=1)
+    _m_critical._event_queue.put_nowait(SessionEvent(type="transcript_preview", payload={"segment": None}))
+    _critical_seg = _make_segment(start_time=0.0, end_time=1.0, text="critical formal")
+    await _m_critical._emit("transcript_segment", _critical_seg)
+    _critical_event = _m_critical._event_queue.get_nowait()
+    _ok_critical_kept = _critical_event.type == "transcript_segment"
+    _ok_critical_drop_count = _m_critical._queue_drop_count == 1
+    print(
+        "critical-transcript-event:",
+        f"event={_critical_event.type}",
+        f"drop_count={_m_critical._queue_drop_count}",
+    )
+    if not _ok_critical_kept:
+        print("FAIL: transcript_segment should replace queued non-critical event when queue is full")
+        return 1
+    if not _ok_critical_drop_count:
+        print("FAIL: dropping queued non-critical event should increment drop counter")
+        return 1
+    print("OK: critical transcript_segment is not dropped when event queue is full")
+
+    # Test E: stale suppression ? preview segment end_time ? last_emitted_end_time + tolerance
     _m_stale = _make_manager()
     _stale_preview = _make_segment(start_time=0.0, end_time=2.0, text="stale preview")
     _m_stale._state.last_emitted_end_time = 2.0  # formal has covered up to 2.0 s

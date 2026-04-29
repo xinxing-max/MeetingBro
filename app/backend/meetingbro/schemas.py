@@ -16,6 +16,7 @@ SummaryType = Literal[
     "time_window_summary",
     "speaker_summary",
     "final_summary",
+    "refined_transcript",
     "chapter_list",
     "action_item_list",
 ]
@@ -108,14 +109,21 @@ class SessionStatePayload(BaseModel):
     fast_preview_last_audio_seconds: Optional[float] = None
     fast_preview_last_wall_seconds: Optional[float] = None
     fast_preview_realtime_factor: Optional[float] = None
+    preview_continued_during_formal: int = 0
     preview_stale_suppressed: int = 0
     preview_alignment_compared: int = 0
     preview_alignment_similarity_avg: Optional[float] = None
     preview_alignment_similarity_last: Optional[float] = None
+    preview_unconfirmed_after_formal: int = 0
+    preview_unconfirmed_last_text: Optional[str] = None
     mixed_microphone_gain: Optional[float] = None
     mixed_system_gain: Optional[float] = None
     mixed_effective_microphone_gain: Optional[float] = None
     mixed_auto_balance_enabled: Optional[bool] = None
+
+
+class TranscriptSegmentRemovedPayload(BaseModel):
+    segment_id: str
 
 
 class TranscriptPreviewPayload(BaseModel):

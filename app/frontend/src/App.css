@@ -343,9 +343,10 @@ html, body, #root {
   gap: 12px;
   padding: 12px;
   grid-template-columns: minmax(0, 1.9fr) minmax(320px, 1.1fr);
-  grid-template-rows: minmax(220px, 1.05fr) minmax(220px, 0.95fr) minmax(260px, 1.05fr);
+  grid-template-rows: minmax(210px, 1fr) minmax(190px, 0.85fr) minmax(210px, 0.95fr) minmax(260px, 1.05fr);
   grid-template-areas:
     "transcript rolling"
+    "transcript refined"
     "transcript cumulative"
     "notes diagnostics";
   min-height: 0;
@@ -455,9 +456,9 @@ html, body, #root {
 .transcript { grid-area: transcript; }
 .diagnostics { grid-area: diagnostics; }
 .notes { grid-area: notes; }
-
-.grid > section:nth-of-type(2) { grid-area: rolling; }
-.grid > section:nth-of-type(3) { grid-area: cumulative; }
+.rolling-panel { grid-area: rolling; }
+.refined-panel { grid-area: refined; }
+.cumulative-panel { grid-area: cumulative; }
 
 .summary-panel {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(255, 251, 243, 0.86));
@@ -497,6 +498,7 @@ html, body, #root {
 }
 
 .rolling-panel .panel-body,
+.refined-panel .panel-body,
 .cumulative-panel .panel-body {
   padding-top: 16px;
 }
@@ -737,12 +739,31 @@ html, body, #root {
   background: rgba(239, 68, 68, 0.14);
 }
 
+.preview-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 6px 0 2px;
+}
+
 .transcript-body .preview-segment {
-  background: linear-gradient(90deg, rgba(245, 158, 11, 0.08), rgba(245, 158, 11, 0.02));
-  border-bottom-style: solid;
-  opacity: 0.78;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 14px;
+  row-gap: 3px;
+  padding: 7px 10px;
+  border: 1px solid rgba(245, 158, 11, 0.18);
+  border-radius: 12px;
+  background: linear-gradient(90deg, rgba(255, 247, 237, 0.92), rgba(255, 251, 235, 0.62));
+  box-shadow: 0 6px 18px rgba(146, 64, 14, 0.05);
   animation: preview-fade 1.2s ease-in-out infinite alternate;
 }
+
+.transcript-body .preview-segment.preview-age-1 { opacity: 0.74; }
+.transcript-body .preview-segment.preview-age-2 { opacity: 0.58; }
+.transcript-body .preview-segment.preview-age-3 { opacity: 0.44; }
+.transcript-body .preview-segment.preview-age-4 { opacity: 0.34; }
 
 .transcript-body .bookmark-marker {
   margin: 8px 0;
@@ -763,13 +784,23 @@ html, body, #root {
   font-weight: 600;
 }
 
-.transcript-body .preview-segment .ts {
+.preview-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  white-space: nowrap;
+}
+
+.preview-hearing {
   color: #9a3412;
   font-weight: 600;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 .preview-experimental-badge {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
   font-size: 0.68rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -779,22 +810,20 @@ html, body, #root {
   border: 1px solid rgba(245, 158, 11, 0.35);
   border-radius: 4px;
   padding: 1px 5px;
-  margin-right: 6px;
   vertical-align: middle;
   cursor: default;
 }
 
-.transcript-body .preview-segment span:last-child {
+.transcript-body .preview-segment .preview-segment-text {
   color: #4b5563;
   font-style: italic;
-}
-
-.transcript-body .preview-segment .preview-segment-text {
   display: block;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 
 .transcript-bottom-anchor {
@@ -1015,6 +1044,7 @@ html, body, #root {
     grid-template-areas:
       "transcript"
       "rolling"
+      "refined"
       "cumulative"
       "diagnostics"
       "notes";
@@ -1096,6 +1126,8 @@ html, body, #root {
   }
   .transcript-body .preview-segment {
     background: linear-gradient(90deg, rgba(251, 191, 36, 0.14), rgba(251, 191, 36, 0.04));
+    border-color: rgba(245, 158, 11, 0.26);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
   }
   .preview-experimental-badge {
     color: #fbbf24;
@@ -1108,8 +1140,8 @@ html, body, #root {
   }
   .transcript-body .bookmark-marker .ts { color: #fbbf24; }
   .transcript-body .bookmark-marker .segment-text span:first-child { color: #fde68a; }
-  .transcript-body .preview-segment .ts { color: #fbbf24; }
-  .transcript-body .preview-segment span:last-child { color: #d4d4d8; }
+  .preview-hearing { color: #fbbf24; }
+  .transcript-body .preview-segment .preview-segment-text { color: #d4d4d8; }
   .jump-latest-btn {
     border-color: rgba(96, 165, 250, 0.28);
     background: rgba(37, 99, 235, 0.94);

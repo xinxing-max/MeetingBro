@@ -7,6 +7,7 @@ export type SummaryType =
   | "time_window_summary"
   | "speaker_summary"
   | "final_summary"
+  | "refined_transcript"
   | "chapter_list"
   | "action_item_list";
 
@@ -94,10 +95,13 @@ export interface SessionStatePayload {
   fast_preview_last_audio_seconds: number | null;
   fast_preview_last_wall_seconds: number | null;
   fast_preview_realtime_factor: number | null;
+  preview_continued_during_formal?: number;
   preview_stale_suppressed?: number;
   preview_alignment_compared?: number;
   preview_alignment_similarity_avg?: number | null;
   preview_alignment_similarity_last?: number | null;
+  preview_unconfirmed_after_formal?: number;
+  preview_unconfirmed_last_text?: string | null;
   mixed_microphone_gain: number | null;
   mixed_system_gain: number | null;
   mixed_effective_microphone_gain: number | null;
@@ -106,6 +110,7 @@ export interface SessionStatePayload {
 
 export type SessionEvent =
   | { type: "transcript_segment"; payload: TranscriptSegment }
+  | { type: "transcript_segment_removed"; payload: { segment_id: string } }
   | { type: "transcript_translation"; payload: { segment_id: string; language: LanguageCode; text: string } }
   | { type: "transcript_preview"; payload: { segment: TranscriptSegment | null; preview_backend?: string; preview_is_experimental?: boolean; preview_quality_note?: string | null } }
   | { type: "summary_snapshot"; payload: SummarySnapshot }

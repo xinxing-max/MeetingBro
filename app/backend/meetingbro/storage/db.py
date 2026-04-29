@@ -172,6 +172,11 @@ class Storage:
             )
             self._conn.commit()
 
+    def delete_segment(self, segment_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM transcript_segments WHERE id = ?", (segment_id,))
+            self._conn.commit()
+
     def update_segment_translations(self, segment_id: str, translations: dict[str, str]) -> None:
         with self._lock:
             self._conn.execute(

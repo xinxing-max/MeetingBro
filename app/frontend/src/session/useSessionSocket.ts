@@ -12,6 +12,42 @@ import type {
 
 const DEFAULT_WS = "ws://127.0.0.1:8765/ws/session";
 const VOCABULARY_STORAGE_KEY = "meetingbro.vocabulary";
+const PREVIEW_FORMAL_COVER_TOLERANCE_SECONDS = 0.3;
+const MAX_PREVIEW_STACK = 5;
+
+function isPreviewCoveredByFormal(preview: TranscriptSegment, formal: TranscriptSegment): boolean {
+  return preview.end_time <= formal.end_time + PREVIEW_FORMAL_COVER_TOLERANCE_SECONDS;
+}
+
+function mergePreviewStack(stack: TranscriptSegment[], nextPreview: TranscriptSegment): TranscriptSegment[] {
+  const trimmedText = nextPreview.text.trim();
+  if (!trimmedText) return stack;
+
+  const withoutCoveredDuplicates = stack.filter((item) => {
+    const sameWindow =
+      Math.abs(item.start_time - nextPreview.start_time) < 0.12 &&
+      Math.abs(item.end_time - nextPreview.end_time) < 0.12;
+    return !(sameWindow || item.text.trim() === trimmedText);
+  });
+
+  const latest = withoutCoveredDuplicates.at(-1);
+  if (latest) {
+    const startsClose = nextPreview.start_time - latest.start_time < 0.9;
+    const endsClose = nextPreview.end_time - latest.end_time < 0.9;
+    const latestText = latest.text.trim();
+    const shorter = Math.min(latestText.length, trimmedText.length);
+    let prefix = 0;
+    while (prefix < shorter && latestText[prefix] === trimmedText[prefix]) {
+      prefix += 1;
+    }
+    const similarPrefix = shorter > 0 && prefix / shorter >= 0.72;
+    if ((startsClose && endsClose) || (similarPrefix && endsClose)) {
+      return [...withoutCoveredDuplicates.slice(0, -1), nextPreview].slice(-MAX_PREVIEW_STACK);
+    }
+  }
+
+  return [...withoutCoveredDuplicates, nextPreview].slice(-MAX_PREVIEW_STACK);
+}
 
 declare global {
   interface Window {
@@ -58,6 +94,7 @@ export interface SessionView {
   sessionStats: SessionStatePayload | null;
   segments: TranscriptSegment[];
   previewSegment: TranscriptSegment | null;
+  previewSegments: TranscriptSegment[];
   isExperimentalPreview: boolean;
   latestByType: Partial<Record<SummaryType, SummarySnapshot>>;
   historyByType: Partial<Record<SummaryType, SummarySnapshot[]>>;
@@ -82,6 +119,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
   const [sessionStats, setSessionStats] = useState<SessionStatePayload | null>(null);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [previewSegment, setPreviewSegment] = useState<TranscriptSegment | null>(null);
+  const [previewSegments, setPreviewSegments] = useState<TranscriptSegment[]>([]);
   const [isExperimentalPreview, setIsExperimentalPreview] = useState(false);
   const [latestByType, setLatestByType] = useState<SessionView["latestByType"]>({});
   const [historyByType, setHistoryByType] = useState<SessionView["historyByType"]>({});
@@ -123,12 +161,14 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     const holdCommittedPreview = (segment: TranscriptSegment) => {
       clearPreviewHold();
       setPreviewSegment(segment);
+      setPreviewSegments([segment]);
       previewHoldTimerRef.current = window.setTimeout(() => {
         setPreviewSegment((prev) => {
           if (!prev) return prev;
           if (prev.id !== segment.id) return prev;
           return null;
         });
+        setPreviewSegments((prev) => prev.filter((item) => item.id !== segment.id));
         previewHoldTimerRef.current = null;
       }, 320);
     };
@@ -137,6 +177,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
       if (nextPreview == null) {
         clearQueuedPreview();
         setPreviewSegment(null);
+        setPreviewSegments([]);
         setIsExperimentalPreview(false);
         return;
       }
@@ -175,6 +216,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
       queuedPreviewRef.current = nextPreview;
       previewTimerRef.current = window.setTimeout(() => {
         setPreviewSegment(nextPreview);
+        setPreviewSegments((prev) => mergePreviewStack(prev, nextPreview));
         previewTimerRef.current = null;
         queuedPreviewRef.current = null;
       }, updateDelayMs);
@@ -186,7 +228,10 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
         wsRef.current = null;
       }
       clearQueuedPreview();
-        clearPreviewHold();
+      clearPreviewHold();
+      setPreviewSegment(null);
+      setPreviewSegments([]);
+      setIsExperimentalPreview(false);
       setConnected(false);
       setState("disconnected");
       return;
@@ -199,6 +244,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     clearQueuedPreview();
     clearPreviewHold();
     setPreviewSegment(null);
+    setPreviewSegments([]);
     setIsExperimentalPreview(false);
     setLatestByType({});
     setHistoryByType({});
@@ -236,9 +282,10 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
             }
             break;
           case "transcript_segment":
-            clearQueuedPreview();
             clearPreviewHold();
-            setIsExperimentalPreview(false);
+            if (queuedPreviewRef.current && isPreviewCoveredByFormal(queuedPreviewRef.current, msg.payload)) {
+              clearQueuedPreview();
+            }
             setPreviewSegment((prev) => {
               if (!prev) return prev;
               const matchesCommitted =
@@ -246,12 +293,21 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
                 Math.abs(prev.start_time - msg.payload.start_time) < 0.01 &&
                 Math.abs(prev.end_time - msg.payload.end_time) < 0.01;
               if (matchesCommitted) {
+                setIsExperimentalPreview(false);
                 holdCommittedPreview(msg.payload);
                 return msg.payload;
               }
-              return prev.start_time <= msg.payload.end_time ? null : prev;
+              if (isPreviewCoveredByFormal(prev, msg.payload)) {
+                setIsExperimentalPreview(false);
+                return null;
+              }
+              return prev;
             });
+            setPreviewSegments((prev) => prev.filter((item) => !isPreviewCoveredByFormal(item, msg.payload)));
             setSegments((prev) => [...prev, msg.payload]);
+            break;
+          case "transcript_segment_removed":
+            setSegments((prev) => prev.filter((s) => s.id !== msg.payload.segment_id));
             break;
           case "transcript_translation":
             setSegments((prev) => prev.map((segment) => {
@@ -440,6 +496,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     sessionStats,
     segments,
     previewSegment,
+    previewSegments,
     isExperimentalPreview,
     latestByType,
     historyByType,

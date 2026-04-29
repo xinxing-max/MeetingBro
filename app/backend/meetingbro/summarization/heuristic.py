@@ -118,6 +118,20 @@ class HeuristicSummarizer(Summarizer):
         if not transcript_text:
             return ""
 
+        if kind == "refined_transcript":
+            lines = [
+                f"- [{s.start_time:.1f}-{s.end_time:.1f}] {s.text.strip()}"
+                for s in segments
+                if s.text.strip()
+            ]
+            return "\n".join([
+                "## Refined Transcript",
+                *(lines or ["- None yet"]),
+                "",
+                "## Possible Missing / Low Confidence",
+                "- Not evaluated in heuristic mode",
+            ])
+
         if kind == "rolling_summary":
             max_s = self._rolling
             label = "Recent discussion"

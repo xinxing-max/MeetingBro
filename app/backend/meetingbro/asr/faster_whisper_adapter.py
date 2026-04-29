@@ -37,7 +37,7 @@ class FasterWhisperAdapter(ASRAdapter):
         model_size: str = "medium",
         device: str = "cpu",
         compute_type: str = "int8",
-        beam_size: int = 3,
+        beam_size: int = 1,
         cpu_threads: int = 0,
         num_workers: int = 1,
         vad_threshold: float = 0.3,

@@ -310,10 +310,11 @@ export default function App() {
   const [refreshBaselineId, setRefreshBaselineId] = useState<string | null>(null);
   const [bilingualExport, setBilingualExport] = useState(false);
   const [restartPromptOpen, setRestartPromptOpen] = useState(false);
-  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, isExperimentalPreview, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, requestSummary, pauseSession, resumeSession, stopSession } =
+  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, previewSegments, isExperimentalPreview, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, requestSummary, pauseSession, resumeSession, stopSession } =
     useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage, runtimeProfile });
 
   const rolling = latestByType.rolling_summary;
+  const refined = latestByType.refined_transcript;
   const cumulative = latestByType.cumulative_meeting_summary;
   const chapterSnapshot = latestByType.chapter_list;
   const actionItemSnapshot = latestByType.action_item_list;
@@ -477,10 +478,13 @@ export default function App() {
   const fastPreviewEmitted = sessionStats?.fast_preview_emitted ?? 0;
   const fastPreviewSkipped = sessionStats?.fast_preview_skipped ?? 0;
   const fastPreviewRtf = sessionStats?.fast_preview_realtime_factor ?? null;
+  const previewContinuedDuringFormal = sessionStats?.preview_continued_during_formal ?? 0;
   const previewStaleSuppressed = sessionStats?.preview_stale_suppressed ?? 0;
   const previewAlignmentCompared = sessionStats?.preview_alignment_compared ?? 0;
   const previewAlignmentSimilarityAvg = sessionStats?.preview_alignment_similarity_avg ?? null;
   const previewAlignmentSimilarityLast = sessionStats?.preview_alignment_similarity_last ?? null;
+  const previewUnconfirmedAfterFormal = sessionStats?.preview_unconfirmed_after_formal ?? 0;
+  const previewUnconfirmedLastText = sessionStats?.preview_unconfirmed_last_text ?? null;
   const delayTone = getDelayTone(transcriptLagSeconds);
   const activeSource = sessionStats?.source ?? source;
   const mixedMicGain = sessionStats?.mixed_microphone_gain ?? null;
@@ -1032,18 +1036,30 @@ export default function App() {
                 </div>
               );
             })}
-            {previewSegment && (
-              <div className="segment preview-segment">
-                <span className="ts">hearing…</span>
-                {isExperimentalPreview && (
-                  <span
-                    className="preview-experimental-badge"
-                    title="Fast experimental preview; final transcript may change"
-                  >
-                    Preview
-                  </span>
-                )}
-                <span className="preview-segment-text">{previewSegment.text}</span>
+            {previewSegments.length > 0 && (
+              <div className="preview-stack" aria-live="polite" aria-label="Live preview transcript">
+                {previewSegments.map((segment, index) => {
+                  const age = previewSegments.length - index - 1;
+                  return (
+                    <div
+                      key={segment.id}
+                      className={`segment preview-segment preview-age-${Math.min(age, 4)}`}
+                    >
+                      <span className="preview-status">
+                        <span className="preview-hearing">hearing…</span>
+                        {isExperimentalPreview && (
+                          <span
+                            className="preview-experimental-badge"
+                            title="Fast experimental preview; final transcript may change"
+                          >
+                            Preview
+                          </span>
+                        )}
+                      </span>
+                      <span className="preview-segment-text">{segment.text}</span>
+                    </div>
+                  );
+                })}
               </div>
             )}
             <div ref={transcriptBottomRef} className="transcript-bottom-anchor" />
@@ -1075,6 +1091,17 @@ export default function App() {
           onRefresh={() => handleRefreshSummary("rolling_summary")}
           refreshDisabled={!connected || state !== "running" || segments.length === 0}
           refreshBusy={refreshingSummary === "rolling_summary"}
+        />
+
+        <SummaryPanel
+          title="Refined Transcript"
+          subtitle="background LLM cleanup using Whisper plus Qwen preview hints"
+          snapshot={refined}
+          history={historyByType.refined_transcript ?? []}
+          sessionStartedAt={sessionStartedAt}
+          accent="#7c3aed"
+          className="summary-panel refined-panel"
+          onSaveToNotes={handleSaveToNotes}
         />
 
         <SummaryPanel
@@ -1191,6 +1218,11 @@ export default function App() {
               </span>
             </div>
             <div className="diagnostic-card">
+              <span className="diagnostic-label">Preview Continued</span>
+              <strong className="diagnostic-value">{previewContinuedDuringFormal}</strong>
+              <span className="diagnostic-note">Qwen preview updates while formal text is pending</span>
+            </div>
+            <div className="diagnostic-card">
               <span className="diagnostic-label">Preview Stale Suppressed</span>
               <strong className="diagnostic-value">{previewStaleSuppressed}</strong>
               <span className="diagnostic-note">previews dropped (covered by formal)</span>
@@ -1204,6 +1236,13 @@ export default function App() {
               </strong>
               <span className="diagnostic-note">
                 compared {previewAlignmentCompared} · last {previewAlignmentSimilarityLast != null ? previewAlignmentSimilarityLast.toFixed(2) : "—"}
+              </span>
+            </div>
+            <div className={`diagnostic-card delay-card delay-${previewUnconfirmedAfterFormal > 0 ? "warn" : "ok"}`}>
+              <span className="diagnostic-label">Preview Unconfirmed</span>
+              <strong className="diagnostic-value">{previewUnconfirmedAfterFormal}</strong>
+              <span className="diagnostic-note">
+                {previewUnconfirmedLastText ? `last: ${previewUnconfirmedLastText}` : "no preview has been passed by formal without overlap"}
               </span>
             </div>
             <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : "ok"}`}>

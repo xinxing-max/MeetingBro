@@ -10,6 +10,7 @@ SummaryKind = Literal[
     "rolling_summary",
     "cumulative_meeting_summary",
     "final_summary",
+    "refined_transcript",
 ]
 
 
