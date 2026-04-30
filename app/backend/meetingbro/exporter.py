@@ -229,6 +229,32 @@ def _write_summary(
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def _write_clean_conversation(
+    path: Path,
+    *,
+    meeting: dict[str, str | None],
+    snapshots: list[SummarySnapshot],
+) -> bool:
+    latest = _latest_by_type(snapshots)
+    snap = latest.get("refined_transcript")
+    if snap is None or not snap.content.strip():
+        return False
+
+    lines: list[str] = [
+        "# Clean Conversation",
+        "",
+        f"- Meeting ID: `{meeting['id']}`",
+        f"- Started: {_display_time(meeting.get('started_at'))}",
+        f"- Ended: {_display_time(meeting.get('ended_at'))}",
+        f"- Covered: {_format_seconds(snap.time_start)}â€“{_format_seconds(snap.time_end)}",
+        f"- Language: `{snap.language}`",
+        "",
+        snap.content.strip(),
+    ]
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return True
+
+
 def export_meeting(
     storage: Storage,
     *,
@@ -256,6 +282,7 @@ def export_meeting(
     export_dir.mkdir(parents=True, exist_ok=True)
 
     transcript_path = export_dir / "transcript.md"
+    clean_conversation_path = export_dir / "clean_conversation.md"
     summary_path = export_dir / "summary.md"
     metadata_path = export_dir / "metadata.json"
 
@@ -268,6 +295,9 @@ def export_meeting(
         target_language=target_language,
     )
     _write_summary(summary_path, meeting=meeting, snapshots=snapshots, notes=notes)
+    files = ["transcript.md", "summary.md", "metadata.json"]
+    if _write_clean_conversation(clean_conversation_path, meeting=meeting, snapshots=snapshots):
+        files.insert(1, "clean_conversation.md")
 
     metadata = {
         "meeting_id": meeting_id,
@@ -283,7 +313,7 @@ def export_meeting(
         "segment_count": len(segments),
         "summary_count": len(snapshots),
         "notes_count": len(notes),
-        "files": ["transcript.md", "summary.md", "metadata.json"],
+        "files": files,
         **client_metadata,
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -291,5 +321,5 @@ def export_meeting(
     return ExportMeetingResponse(
         meeting_id=meeting_id,
         export_dir=str(export_dir),
-        files=["transcript.md", "summary.md", "metadata.json"],
+        files=files,
     )

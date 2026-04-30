@@ -11,6 +11,11 @@ RUNTIME_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
     # Good default for real meetings: pre-VAD keeps long runs stable while early
     # flush and silence-boundary commits keep the first result responsive.
     "balanced": {
+        "resource_governor_policy": "balanced",
+        "resource_pressure_rtf_threshold": 0.90,
+        "resource_critical_rtf_threshold": 1.25,
+        "resource_pressure_backlog_seconds": 3.0,
+        "resource_critical_backlog_seconds": 6.0,
         "chunk_seconds": 0.5,
         "asr_accumulation_seconds": 1.5,
         "asr_early_flush_enabled": True,
@@ -28,6 +33,11 @@ RUNTIME_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
     # Prefer faster visible feedback. This may emit slightly smaller chunks and
     # can be less stable on long/noisy audio than balanced/robust.
     "low_latency": {
+        "resource_governor_policy": "conservative",
+        "resource_pressure_rtf_threshold": 0.75,
+        "resource_critical_rtf_threshold": 1.05,
+        "resource_pressure_backlog_seconds": 2.0,
+        "resource_critical_backlog_seconds": 4.0,
         "chunk_seconds": 0.5,
         "asr_accumulation_seconds": 1.0,
         "asr_early_flush_enabled": True,
@@ -45,6 +55,11 @@ RUNTIME_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
     # Prefer stability over first-word latency: longer context and less
     # aggressive silence commits reduce fragmenting and hallucination risk.
     "robust": {
+        "resource_governor_policy": "quality",
+        "resource_pressure_rtf_threshold": 1.00,
+        "resource_critical_rtf_threshold": 1.35,
+        "resource_pressure_backlog_seconds": 4.0,
+        "resource_critical_backlog_seconds": 7.0,
         "chunk_seconds": 0.75,
         "asr_accumulation_seconds": 2.0,
         "asr_early_flush_enabled": True,
@@ -62,6 +77,11 @@ RUNTIME_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
     # Explicit mixed-language profile; currently close to balanced but documents
     # and enforces language-lock-off behavior for Chinese/English/German meetings.
     "multilingual": {
+        "resource_governor_policy": "balanced",
+        "resource_pressure_rtf_threshold": 0.90,
+        "resource_critical_rtf_threshold": 1.25,
+        "resource_pressure_backlog_seconds": 3.0,
+        "resource_critical_backlog_seconds": 6.0,
         "chunk_seconds": 0.5,
         "asr_accumulation_seconds": 1.5,
         "asr_early_flush_enabled": True,
@@ -79,6 +99,11 @@ RUNTIME_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
     # For mostly one-language meetings in auto-detect mode. Forced-language mode
     # still bypasses the lock inside SessionManager.
     "single_language": {
+        "resource_governor_policy": "balanced",
+        "resource_pressure_rtf_threshold": 0.90,
+        "resource_critical_rtf_threshold": 1.25,
+        "resource_pressure_backlog_seconds": 3.0,
+        "resource_critical_backlog_seconds": 6.0,
         "chunk_seconds": 0.5,
         "asr_accumulation_seconds": 1.5,
         "asr_early_flush_enabled": True,

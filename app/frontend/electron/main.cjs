@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, screen } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, screen } = require("electron");
 const path = require("node:path");
 
 const isDev = !app.isPackaged;
@@ -14,12 +14,15 @@ function createWindow() {
     minWidth: 1280,
     minHeight: 780,
     center: true,
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
+  win.setMenu(null);
+  win.setMenuBarVisibility(false);
 
   if (isDev) {
     win.loadURL("http://localhost:5173");
@@ -29,6 +32,8 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
+
   ipcMain.handle("meetingbro:select-export-directory", async (_event, suggestedName) => {
     const defaultName = suggestedName || `meetingbro_export_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}`;
     const result = await dialog.showSaveDialog({

@@ -125,10 +125,10 @@ class HeuristicSummarizer(Summarizer):
                 if s.text.strip()
             ]
             return "\n".join([
-                "## Refined Transcript",
+                "## Clean Conversation",
                 *(lines or ["- None yet"]),
                 "",
-                "## Possible Missing / Low Confidence",
+                "## Uncertain / Conflicts",
                 "- Not evaluated in heuristic mode",
             ])
 

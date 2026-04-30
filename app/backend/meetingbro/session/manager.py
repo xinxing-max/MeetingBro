@@ -49,6 +49,11 @@ class SessionConfig:
     storage: Storage
     preview_asr: Optional[ASRAdapter] = None
     preview_asr_backend_name: str = "unknown"
+    hardware_profile_label: str = "unknown"
+    hardware_summary: Optional[str] = None
+    formal_asr_device: str = "cpu"
+    preview_asr_device: Optional[str] = None
+    compute_gpu_available: bool = False
     preview_asr_fallback_on_error: bool = True
     preview_stale_tolerance_seconds: float = 0.30
     audio_source_name: str = "mic"
@@ -63,8 +68,8 @@ class SessionConfig:
     memory_interval_seconds: float = 120.0  # cadence target for compressed meeting memory refresh
     cumulative_interval_seconds: float = 180.0  # cadence target for cumulative refresh
     summary_tail_seconds: float = 120.0  # recent raw transcript kept beside compressed memory
-    refinement_interval_seconds: float = 60.0  # cadence target for LLM transcript refinement snapshots
-    refinement_window_seconds: float = 120.0  # raw formal transcript window refined with Qwen preview hints
+    refinement_interval_seconds: float = 180.0  # cadence target for clean-conversation snapshots
+    refinement_window_seconds: float = 0.0  # <=0 means full conversation so far
     min_segments_for_rolling: int = 1
     min_segments_for_memory: int = 3
     min_segments_for_cumulative: int = 3
@@ -118,6 +123,11 @@ class SessionConfig:
     weak_speech_rescue_rms_max: float = 0.02
     weak_speech_rescue_fast_rms_max: float = 0.01
     weak_speech_rescue_fast_window_seconds: float = 2.5
+    resource_governor_policy: str = "balanced"
+    resource_pressure_rtf_threshold: float = 0.90
+    resource_critical_rtf_threshold: float = 1.25
+    resource_pressure_backlog_seconds: float = 3.0
+    resource_critical_backlog_seconds: float = 6.0
     weak_speech_rescue_window_seconds: float = 6.0
     weak_speech_rescue_cooldown_seconds: float = 8.0
     # Default off: mixed-language meetings should not be forced into one language.
@@ -144,6 +154,13 @@ class SessionConfig:
     # is promoted live as a formal segment.  This is the "no missed sentences"
     # safety net for chatty meetings with no silence pauses.
     qwen_orphan_max_age_seconds: float = 2.0
+    # Softer startup protection: Qwen often emits useful text before Whisper has
+    # produced the first formal segment. During the first few seconds, allow one
+    # earlier low-quality Qwen draft so the meeting opening is not lost; Whisper
+    # still replaces the draft when it later covers the same time span.
+    qwen_startup_draft_enabled: bool = True
+    qwen_startup_draft_window_seconds: float = 20.0
+    qwen_startup_draft_grace_seconds: float = 1.2
     # Executor sizing is not a user-facing tuning surface. Defaults are chosen
     # automatically in main.py and may be overridden only via hidden env vars.
     asr_executor_workers: int = 1
@@ -205,6 +222,9 @@ class _State:
     asr_safeguard_reason: Optional[str] = None
     asr_safeguard_cooldown_windows: int = 0
     asr_safeguard_events: int = 0
+    resource_pressure_level: str = "normal"
+    resource_governor_reason: Optional[str] = None
+    resource_governor_skips: int = 0
     weak_rescue_attempts: int = 0
     weak_rescue_emitted: int = 0
     weak_rescue_buffer_seconds: float = 0.0
@@ -240,6 +260,7 @@ class _State:
     # from the DB and a transcript_segment_removed event is emitted so Whisper's
     # higher-quality version takes its place in the frontend.
     qwen_committed_drafts: dict = field(default_factory=dict)
+    qwen_startup_draft_promoted: bool = False
     first_chunk_wall_time: Optional[float] = None
     last_chunk_wall_time: Optional[float] = None
     last_voiced_chunk_wall_time: Optional[float] = None
@@ -310,8 +331,25 @@ class SessionManager:
     def _active_state_name(self) -> str:
         return "running" if self._pause_gate.is_set() else "paused"
 
+    def _compute_activity_status(self) -> tuple[bool, bool, Optional[str]]:
+        formal_device = (self._cfg.formal_asr_device or "cpu").lower()
+        preview_device = (self._cfg.preview_asr_device or "cpu").lower()
+        formal_active = self._state.asr_inflight_start_wall_time is not None
+        preview_active = self._state.fast_preview_inflight
+        gpu_active = (formal_active and formal_device == "cuda") or (preview_active and preview_device == "cuda")
+        cpu_active = (formal_active and formal_device != "cuda") or (preview_active and preview_device != "cuda")
+        labels: list[str] = []
+        if formal_active:
+            phase = self._state.asr_inflight_phase or "formal"
+            labels.append(f"Whisper {phase} on {formal_device}")
+        if preview_active:
+            backend = self._cfg.preview_asr_backend_name or "preview"
+            labels.append(f"{backend} preview on {preview_device}")
+        return cpu_active, gpu_active, " ? ".join(labels) if labels else None
+
     def _session_state_payload(self, *, state: str) -> SessionStatePayload:
         self._prune_background_task_lists()
+        compute_cpu_active, compute_gpu_active, compute_activity_label = self._compute_activity_status()
         mixed_microphone_gain = None
         mixed_system_gain = None
         mixed_effective_microphone_gain = None
@@ -327,6 +365,21 @@ class SessionManager:
             elapsed_seconds=self._state.elapsed_seconds,
             source=self._cfg.audio_source_name,
             runtime_profile=self._cfg.runtime_profile,
+            hardware_profile=self._cfg.hardware_profile_label,
+            hardware_summary=self._cfg.hardware_summary,
+            compute_cpu_active=compute_cpu_active,
+            compute_cpu_available=True,
+            compute_cpu_configured=(
+                (self._cfg.formal_asr_device or "cpu").lower() != "cuda"
+                or (self._cfg.preview_asr_device or "cpu").lower() != "cuda"
+            ),
+            compute_gpu_active=compute_gpu_active,
+            compute_gpu_available=self._cfg.compute_gpu_available,
+            compute_gpu_configured=(
+                (self._cfg.formal_asr_device or "cpu").lower() == "cuda"
+                or (self._cfg.preview_asr_device or "cpu").lower() == "cuda"
+            ),
+            compute_activity_label=compute_activity_label,
             audio_chunk_seconds=self._cfg.audio_chunk_seconds,
             asr_accumulation_seconds=self._cfg.asr_accumulation_seconds,
             language_lock_enabled=self._cfg.language_lock_enabled,
@@ -342,6 +395,10 @@ class SessionManager:
             asr_safeguard_active=self._asr_safeguard_active(),
             asr_safeguard_reason=self._state.asr_safeguard_reason,
             asr_safeguard_events=self._state.asr_safeguard_events,
+            resource_pressure_level=self._state.resource_pressure_level,
+            resource_governor_policy=self._cfg.resource_governor_policy,
+            resource_governor_reason=self._state.resource_governor_reason,
+            resource_governor_skips=self._state.resource_governor_skips,
             weak_rescue_attempts=self._state.weak_rescue_attempts,
             weak_rescue_emitted=self._state.weak_rescue_emitted,
             weak_rescue_buffer_seconds=self._state.weak_rescue_buffer_seconds,
@@ -377,6 +434,12 @@ class SessionManager:
             mixed_system_gain=mixed_system_gain,
             mixed_effective_microphone_gain=mixed_effective_microphone_gain,
             mixed_auto_balance_enabled=mixed_auto_balance_enabled,
+        )
+
+    async def _emit_compute_activity_state(self) -> None:
+        await self._emit(
+            "session_state",
+            self._session_state_payload(state=self._active_state_name()),
         )
 
     def update_runtime_settings(
@@ -833,6 +896,59 @@ class SessionManager:
                     return combined[:200]
         return base or None
 
+    def _merge_overlapping_qwen_previews(
+        self,
+        previews: list[TranscriptSegment],
+    ) -> list[TranscriptSegment]:
+        """Merge overlapping rolling Qwen previews before draft promotion.
+
+        Qwen preview windows overlap heavily. Keeping only the newest window can
+        lose the beginning of a meeting; keeping every window creates duplicate
+        draft transcript rows. This preserves the earliest covered time span
+        while using the newest/most-contextual text as the draft wording.
+        """
+
+        if not previews:
+            return []
+        ordered = sorted(previews, key=lambda s: (s.start_time, s.end_time))
+        groups: list[list[TranscriptSegment]] = []
+        current: list[TranscriptSegment] = []
+        current_end = 0.0
+        for preview in ordered:
+            if not current or preview.start_time <= current_end + 0.05:
+                current.append(preview)
+                current_end = max(current_end, preview.end_time)
+                continue
+            groups.append(current)
+            current = [preview]
+            current_end = preview.end_time
+        if current:
+            groups.append(current)
+
+        merged: list[TranscriptSegment] = []
+        for group in groups:
+            text_source = max(
+                group,
+                key=lambda s: (s.end_time, len(self._preview_text_key(s.text))),
+            )
+            merged.append(
+                TranscriptSegment(
+                    id=text_source.id,
+                    meeting_id=text_source.meeting_id,
+                    start_time=min(s.start_time for s in group),
+                    end_time=max(s.end_time for s in group),
+                    text=text_source.text,
+                    original_language=text_source.original_language,
+                    speaker_id=text_source.speaker_id,
+                    confidence=text_source.confidence,
+                    quality=text_source.quality,
+                    translations=dict(text_source.translations),
+                    created_at=text_source.created_at,
+                    emitted_at_elapsed_seconds=text_source.emitted_at_elapsed_seconds,
+                )
+            )
+        return merged
+
     async def _promote_time_stranded_previews(self) -> None:
         """Live "no missed sentences" safety net: promote Qwen previews that are
         older than ``qwen_orphan_max_age_seconds`` with no formal Whisper coverage.
@@ -848,7 +964,17 @@ class SessionManager:
             return
 
         now = self._state.elapsed_seconds
-        max_age = self._cfg.qwen_orphan_max_age_seconds
+        startup_active = (
+            self._cfg.qwen_startup_draft_enabled
+            and not self._state.qwen_startup_draft_promoted
+            and self._state.last_emitted_end_time is None
+            and now <= self._cfg.qwen_startup_draft_window_seconds
+        )
+        max_age = (
+            self._cfg.qwen_startup_draft_grace_seconds
+            if startup_active
+            else self._cfg.qwen_orphan_max_age_seconds
+        )
         covered_until = max(
             self._state.last_emitted_end_time or 0.0,
             self._state.qwen_covered_until or 0.0,
@@ -867,14 +993,11 @@ class SessionManager:
 
         self._state.recent_preview_segments = remaining
 
-        # Deduplicate rolling-window snapshots: for overlapping previews keep
-        # the newest (highest end_time) — it has the most decoder context.
-        to_promote = sorted(to_promote, key=lambda s: s.end_time)
-        deduped: list[TranscriptSegment] = []
-        for seg in reversed(to_promote):
-            if not any(s.start_time < seg.end_time and s.end_time > seg.start_time for s in deduped):
-                deduped.append(seg)
-        deduped.reverse()
+        deduped = self._merge_overlapping_qwen_previews(to_promote)
+        if startup_active and deduped:
+            # One startup draft closes the opening gap; normal orphan promotion
+            # handles later uncovered Qwen previews.
+            deduped = deduped[:1]
 
         for orphan in deduped:
             text = orphan.text.strip()
@@ -913,6 +1036,8 @@ class SessionManager:
             )
             await self._persist_and_emit_segment(promoted, is_qwen_draft=True)
             self._state.qwen_committed_drafts[promoted.id] = (promoted.start_time, promoted.end_time)
+            if startup_active:
+                self._state.qwen_startup_draft_promoted = True
             self._state.qwen_covered_until = max(
                 self._state.qwen_covered_until or 0.0,
                 orphan.end_time,
@@ -929,20 +1054,9 @@ class SessionManager:
         if not self._state.qwen_orphan_queue:
             return
 
-        # Sort chronologically and deduplicate: for overlapping rolling-window
-        # snapshots of the same speech, keep only the latest (highest end_time)
-        # for each time region — it has the most context from Qwen's decoder.
         queue = sorted(self._state.qwen_orphan_queue, key=lambda s: s.end_time)
         self._state.qwen_orphan_queue.clear()
-
-        deduped: list[TranscriptSegment] = []
-        for seg in reversed(queue):  # newest-first pass
-            if not any(
-                s.start_time < seg.end_time and s.end_time > seg.start_time
-                for s in deduped
-            ):
-                deduped.append(seg)
-        deduped.reverse()  # back to chronological order
+        deduped = self._merge_overlapping_qwen_previews(queue)
 
         for orphan in deduped:
             text = orphan.text.strip()
@@ -2032,9 +2146,63 @@ class SessionManager:
                 )
                 break
 
+    def _update_resource_pressure(self) -> str:
+        rtf = self._state.asr_realtime_factor or 0.0
+        backlog = self._state.audio_input_backlog_seconds
+        pending_background = sum(1 for task in self._summary_tasks if not task.done()) + sum(
+            1 for task in self._translation_task_order if not task.done()
+        )
+        level = "normal"
+        reason = None
+        if self._asr_safeguard_active():
+            level = "critical"
+            reason = self._state.asr_safeguard_reason or "ASR safeguard active"
+        elif rtf >= self._cfg.resource_critical_rtf_threshold:
+            level = "critical"
+            reason = f"ASR RTF {rtf:.2f} above critical threshold"
+        elif backlog >= self._cfg.resource_critical_backlog_seconds:
+            level = "critical"
+            reason = f"audio backlog {backlog:.1f}s above critical threshold"
+        elif rtf >= self._cfg.resource_pressure_rtf_threshold:
+            level = "pressure"
+            reason = f"ASR RTF {rtf:.2f} above pressure threshold"
+        elif backlog >= self._cfg.resource_pressure_backlog_seconds:
+            level = "pressure"
+            reason = f"audio backlog {backlog:.1f}s above pressure threshold"
+        elif pending_background >= 4 and self._cfg.resource_governor_policy == "conservative":
+            level = "pressure"
+            reason = f"background queue has {pending_background} pending task(s)"
+
+        self._state.resource_pressure_level = level
+        self._state.resource_governor_reason = reason
+        return level
+
+    def _governor_allows_background(self, kind: str) -> bool:
+        level = self._update_resource_pressure()
+        policy = (self._cfg.resource_governor_policy or "balanced").lower()
+        if level == "critical":
+            return False
+        if level == "pressure":
+            if kind in {"memory", "cumulative", "refined_transcript", "translation_backfill"}:
+                return False
+            if kind == "rolling" and policy == "conservative":
+                return False
+        return True
+
+    def _governor_skip(self, kind: str) -> None:
+        self._state.resource_governor_skips += 1
+        logger.debug(
+            "resource governor skipped %s level=%s reason=%s",
+            kind,
+            self._state.resource_pressure_level,
+            self._state.resource_governor_reason,
+        )
+
     def _schedule_summary(self, coro) -> None:
         """Run a summary coroutine as a background task."""
-        if self._asr_safeguard_active():
+        self._update_resource_pressure()
+        if self._state.resource_pressure_level == "critical":
+            self._governor_skip("summary")
             coro.close()
             return
         task = asyncio.create_task(coro)
@@ -2109,6 +2277,9 @@ class SessionManager:
         self._summary_tasks = {task for task in self._summary_tasks if not task.done()}
 
     def _backfill_live_translations(self) -> None:
+        if not self._governor_allows_background("translation_backfill"):
+            self._governor_skip("translation_backfill")
+            return
         if self._cfg.live_translation_language is None:
             return
         limit = max(0, self._cfg.live_translation_backfill_limit)
@@ -2126,6 +2297,9 @@ class SessionManager:
             self._schedule_translation(latest, self._cfg.live_translation_language)
 
     def _next_translation_segment(self, target_language: LanguageCode) -> Optional[TranscriptSegment]:
+        if self._state.resource_pressure_level == "critical":
+            self._governor_skip("translation")
+            return None
         requested_segment_id = self._translation_requested_segment_ids.get(target_language)
         if requested_segment_id is not None:
             for seg in reversed(self._state.segments):
@@ -2328,6 +2502,7 @@ class SessionManager:
             self._state.asr_inflight_start_wall_time = time.monotonic()
             self._state.asr_inflight_audio_seconds = audio_seconds
             self._state.asr_inflight_phase = "realtime"
+            await self._emit_compute_activity_state()
             start = time.perf_counter()
             segments = await loop.run_in_executor(
                 self._asr_executor,
@@ -2354,6 +2529,7 @@ class SessionManager:
                 logger.info("retrying ASR window with higher-quality preset")
                 self._state.asr_inflight_start_wall_time = time.monotonic()
                 self._state.asr_inflight_phase = "retry"
+                await self._emit_compute_activity_state()
                 retry_start = time.perf_counter()
                 retry_segments = await loop.run_in_executor(
                     self._asr_executor,
@@ -2379,6 +2555,7 @@ class SessionManager:
             self._state.asr_inflight_start_wall_time = None
             self._state.asr_inflight_audio_seconds = None
             self._state.asr_inflight_phase = None
+            await self._emit_compute_activity_state()
 
     async def _transcribe_fast_preview_window(
         self,
@@ -2396,6 +2573,7 @@ class SessionManager:
 
         self._state.fast_preview_attempts += 1
         self._state.fast_preview_inflight = True
+        await self._emit_compute_activity_state()
         start = time.perf_counter()
         try:
             segments = await self._run_fast_preview_transcribe(
@@ -2411,6 +2589,7 @@ class SessionManager:
             self._state.fast_preview_last_wall_seconds = wall
             self._state.fast_preview_realtime_factor = wall / max(audio_seconds, 1e-6)
             self._state.fast_preview_inflight = False
+            await self._emit_compute_activity_state()
 
         last_committed_rel = None
         if self._state.last_emitted_end_time is not None:
@@ -2950,8 +3129,10 @@ class SessionManager:
         return list(self._state.segments[-10:])
 
     def _refinement_context_segments(self) -> list[TranscriptSegment]:
-        """Formal transcript span used for a non-authoritative LLM cleanup pass."""
+        """Formal transcript span used for a non-authoritative clean conversation."""
 
+        if self._cfg.refinement_window_seconds <= 0:
+            return list(self._state.segments)
         tail = self._segments_in_window(self._cfg.refinement_window_seconds)
         if tail:
             return tail
@@ -2976,7 +3157,7 @@ class SessionManager:
         ]
         previews = previews[-8:]
         lines = [
-            "Fusion context for transcript refinement.",
+            "Fusion context for producing a clean conversation record.",
             "Compare Whisper/formal transcript and Qwen/preview hints case by case.",
             "Do not assume either engine is globally better; choose the locally more plausible wording from timing, language, overlap, and context.",
             "If neither source is reliable, keep the safer wording and mark the conflict as low confidence.",
@@ -3043,6 +3224,9 @@ class SessionManager:
         return snap
 
     async def _maybe_emit_rolling(self) -> None:
+        if not self._governor_allows_background("rolling"):
+            self._governor_skip("rolling")
+            return
         await self._emit_rolling(force=False)
 
     async def _emit_rolling(self, *, force: bool) -> None:
@@ -3071,6 +3255,9 @@ class SessionManager:
             self._state.rolling_in_flight = False
 
     async def _maybe_emit_memory(self) -> None:
+        if not self._governor_allows_background("memory"):
+            self._governor_skip("memory")
+            return
         now = self._state.elapsed_seconds
         due = (now - self._state.last_memory_at) >= self._cfg.memory_interval_seconds
         if not due:
@@ -3107,6 +3294,9 @@ class SessionManager:
             self._state.memory_in_flight = False
 
     async def _maybe_emit_cumulative(self) -> None:
+        if not self._governor_allows_background("cumulative"):
+            self._governor_skip("cumulative")
+            return
         await self._emit_cumulative(force=False)
 
     async def _emit_cumulative(self, *, force: bool) -> None:
@@ -3137,6 +3327,9 @@ class SessionManager:
             self._state.cumulative_in_flight = False
 
     async def _maybe_emit_refined_transcript(self) -> None:
+        if not self._governor_allows_background("refined_transcript"):
+            self._governor_skip("refined_transcript")
+            return
         await self._emit_refined_transcript(force=False)
 
     async def _emit_refined_transcript(self, *, force: bool) -> None:

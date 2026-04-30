@@ -64,6 +64,15 @@ export interface SessionStatePayload {
   elapsed_seconds: number;
   source: string;
   runtime_profile: string;
+  hardware_profile?: string | null;
+  hardware_summary?: string | null;
+  compute_cpu_active?: boolean;
+  compute_cpu_available?: boolean;
+  compute_cpu_configured?: boolean;
+  compute_gpu_active?: boolean;
+  compute_gpu_available?: boolean;
+  compute_gpu_configured?: boolean;
+  compute_activity_label?: string | null;
   audio_chunk_seconds: number | null;
   asr_accumulation_seconds: number | null;
   language_lock_enabled: boolean;
@@ -79,6 +88,10 @@ export interface SessionStatePayload {
   asr_safeguard_active: boolean;
   asr_safeguard_reason: string | null;
   asr_safeguard_events: number;
+  resource_pressure_level?: string;
+  resource_governor_policy?: string;
+  resource_governor_reason?: string | null;
+  resource_governor_skips?: number;
   weak_rescue_attempts: number;
   weak_rescue_emitted: number;
   weak_rescue_buffer_seconds: number;

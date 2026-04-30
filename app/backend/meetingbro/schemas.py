@@ -78,6 +78,15 @@ class SessionStatePayload(BaseModel):
     elapsed_seconds: float = 0.0
     source: str = "mic"
     runtime_profile: str = "balanced"
+    hardware_profile: Optional[str] = None
+    hardware_summary: Optional[str] = None
+    compute_cpu_active: bool = False
+    compute_cpu_available: bool = True
+    compute_cpu_configured: bool = False
+    compute_gpu_active: bool = False
+    compute_gpu_available: bool = False
+    compute_gpu_configured: bool = False
+    compute_activity_label: Optional[str] = None
     audio_chunk_seconds: Optional[float] = None
     asr_accumulation_seconds: Optional[float] = None
     language_lock_enabled: bool = False
@@ -93,6 +102,10 @@ class SessionStatePayload(BaseModel):
     asr_safeguard_active: bool = False
     asr_safeguard_reason: Optional[str] = None
     asr_safeguard_events: int = 0
+    resource_pressure_level: str = "normal"
+    resource_governor_policy: str = "balanced"
+    resource_governor_reason: Optional[str] = None
+    resource_governor_skips: int = 0
     weak_rescue_attempts: int = 0
     weak_rescue_emitted: int = 0
     weak_rescue_buffer_seconds: float = 0.0

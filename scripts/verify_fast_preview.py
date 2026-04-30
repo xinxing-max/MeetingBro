@@ -1005,6 +1005,73 @@ async def main() -> int:
         return 1
     print("OK: fresh preview passes through, non-null event emitted, added to ring buffer")
 
+    # Test G: startup Qwen draft promotion preserves the opening span instead of
+    # keeping only the newest rolling preview window.
+    with tempfile.TemporaryDirectory() as _tmp_startup:
+        _startup_storage = Storage(Path(_tmp_startup) / "startup_qwen.db")
+        _m_startup = SessionManager(
+            SessionConfig(
+                audio_source=_RealtimeSource(),
+                asr=_StaticASR(text=None),
+                preview_asr=_StaticASR(text="qwen preview"),
+                preview_asr_backend_name="qwen3",
+                summarizer=_CountingSummarizer(),
+                translator=_NoopTranslator(),
+                storage=_startup_storage,
+                forced_language="en",
+                summary_language="en",
+                qwen_orphan_max_age_seconds=10.0,
+                qwen_startup_draft_enabled=True,
+                qwen_startup_draft_window_seconds=20.0,
+                qwen_startup_draft_grace_seconds=1.0,
+            )
+        )
+        _m_startup._state.elapsed_seconds = 5.0
+        _m_startup._state.recent_preview_segments.extend([
+            _make_segment(start_time=0.0, end_time=3.0, text="opening hello"),
+            _make_segment(start_time=0.5, end_time=3.5, text="opening hello everyone"),
+        ])
+        await _m_startup._promote_time_stranded_previews()
+        _startup_segments = list(_m_startup._state.segments)
+        _startup_storage.close()
+    _ok_startup_count = len(_startup_segments) == 1
+    _startup_seg = _startup_segments[0] if _startup_segments else None
+    _ok_startup_span = (
+        _startup_seg is not None
+        and abs(_startup_seg.start_time - 0.0) < 1e-6
+        and abs(_startup_seg.end_time - 3.5) < 1e-6
+    )
+    _ok_startup_text = _startup_seg is not None and _startup_seg.text == "opening hello everyone"
+    _ok_startup_low = _startup_seg is not None and _startup_seg.quality == "low"
+    _ok_startup_no_formal_clip = _m_startup._state.last_emitted_end_time is None
+    _ok_startup_flag = _m_startup._state.qwen_startup_draft_promoted is True
+    print(
+        "qwen-startup-draft:",
+        f"count={len(_startup_segments)}",
+        f"span={None if _startup_seg is None else (_startup_seg.start_time, _startup_seg.end_time)}",
+        f"text={None if _startup_seg is None else _startup_seg.text!r}",
+        f"startup_flag={_m_startup._state.qwen_startup_draft_promoted}",
+    )
+    if not _ok_startup_count:
+        print("FAIL: startup Qwen protection should promote exactly one draft")
+        return 1
+    if not _ok_startup_span:
+        print("FAIL: startup draft should preserve earliest start and latest end of overlapping previews")
+        return 1
+    if not _ok_startup_text:
+        print("FAIL: startup draft should use the newest/most-contextual Qwen text")
+        return 1
+    if not _ok_startup_low:
+        print("FAIL: startup Qwen draft should be marked low quality")
+        return 1
+    if not _ok_startup_no_formal_clip:
+        print("FAIL: Qwen draft must not advance last_emitted_end_time / formal preview clip boundary")
+        return 1
+    if not _ok_startup_flag:
+        print("FAIL: startup draft promotion flag should be set after promotion")
+        return 1
+    print("OK: Qwen startup draft protects opening speech without advancing formal clip boundary")
+
     print("OK: all stale-suppression and alignment diagnostics unit tests passed")
 
     print("ALL OK")

@@ -18,6 +18,7 @@ from .asr.base import ASRAdapter
 from .asr.faster_whisper_adapter import FasterWhisperAdapter
 from .audio import AudioSource, MicrophoneSource, MixedAudioSource, SystemAudioLoopbackSource, WavFileSource
 from .exporter import export_meeting
+from .hardware import HardwareProfile, detect_hardware_profile
 from .llm.openai_compatible import _load_dotenv_if_present
 from .schemas import (
     CreateNoteRequest,
@@ -101,6 +102,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_str_auto(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip()
+    if not normalized or normalized.lower() == "auto":
+        return default
+    return normalized
+
+
 def _profile_value(profile: dict[str, object], key: str, env_name: str, default: object) -> object:
     if env_name in os.environ:
         return os.environ[env_name]
@@ -144,6 +155,11 @@ def _runtime_settings_from_profile(profile_name: str) -> dict[str, object]:
         "language_lock_enabled": _profile_bool(profile, "language_lock_enabled", "MEETINGBRO_LANGUAGE_LOCK_ENABLED", False),
         "weak_speech_rescue_enabled": _profile_bool(profile, "weak_speech_rescue_enabled", "MEETINGBRO_WEAK_SPEECH_RESCUE_ENABLED", True),
         "weak_speech_rescue_fast_window_seconds": _profile_float(profile, "weak_speech_rescue_fast_window_seconds", "MEETINGBRO_WEAK_SPEECH_RESCUE_FAST_WINDOW_SECONDS", 2.5),
+        "resource_governor_policy": str(_profile_value(profile, "resource_governor_policy", "MEETINGBRO_RESOURCE_GOVERNOR_POLICY", "balanced")),
+        "resource_pressure_rtf_threshold": _profile_float(profile, "resource_pressure_rtf_threshold", "MEETINGBRO_RESOURCE_PRESSURE_RTF_THRESHOLD", 0.9),
+        "resource_critical_rtf_threshold": _profile_float(profile, "resource_critical_rtf_threshold", "MEETINGBRO_RESOURCE_CRITICAL_RTF_THRESHOLD", 1.25),
+        "resource_pressure_backlog_seconds": _profile_float(profile, "resource_pressure_backlog_seconds", "MEETINGBRO_RESOURCE_PRESSURE_BACKLOG_SECONDS", 3.0),
+        "resource_critical_backlog_seconds": _profile_float(profile, "resource_critical_backlog_seconds", "MEETINGBRO_RESOURCE_CRITICAL_BACKLOG_SECONDS", 6.0),
     }
 
 
@@ -152,7 +168,7 @@ def _chunk_seconds_for_profile(profile_name: str) -> float:
     return _profile_float(profile, "chunk_seconds", "MEETINGBRO_CHUNK_SECONDS", 0.5)
 
 
-def _build_preview_asr() -> ASRAdapter | None:
+def _build_preview_asr(hardware: HardwareProfile | None = None) -> ASRAdapter | None:
     backend = os.environ.get("MEETINGBRO_PREVIEW_ASR_BACKEND", "").strip().lower()
 
     if backend == "qwen3":
@@ -167,8 +183,14 @@ def _build_preview_asr() -> ASRAdapter | None:
             )
         return Qwen3ASRAdapter(
             model_dir=model_dir,
-            num_threads=_env_int("MEETINGBRO_PREVIEW_QWEN3_NUM_THREADS", 2),
-            provider=os.environ.get("MEETINGBRO_PREVIEW_QWEN3_PROVIDER", "cpu"),
+            num_threads=_env_int(
+                "MEETINGBRO_PREVIEW_QWEN3_NUM_THREADS",
+                hardware.recommended_qwen_threads if hardware is not None else 2,
+            ),
+            provider=_env_str_auto(
+                "MEETINGBRO_PREVIEW_QWEN3_PROVIDER",
+                hardware.recommended_qwen_provider if hardware is not None else "cpu",
+            ),
             max_total_len=_env_int("MEETINGBRO_PREVIEW_QWEN3_MAX_TOTAL_LEN", 256),
             max_new_tokens=_env_int("MEETINGBRO_PREVIEW_QWEN3_MAX_NEW_TOKENS", 96),
             filter_language_script=_env_bool(
@@ -181,16 +203,18 @@ def _build_preview_asr() -> ASRAdapter | None:
     model_size = os.environ.get("MEETINGBRO_PREVIEW_WHISPER_SIZE", "").strip()
     if not model_size or model_size.lower() == "shared":
         return None
+    preview_default_device = "cpu"
+    if hardware is not None and hardware.recommended_whisper_device != "cuda":
+        preview_default_device = hardware.recommended_whisper_device
+    preview_device = _env_str_auto("MEETINGBRO_PREVIEW_WHISPER_DEVICE", preview_default_device)
+    preview_compute_default = "int8" if preview_device == "cpu" else (
+        hardware.recommended_whisper_compute_type if hardware is not None else "float16"
+    )
+
     return FasterWhisperAdapter(
         model_size=model_size,
-        device=os.environ.get(
-            "MEETINGBRO_PREVIEW_WHISPER_DEVICE",
-            os.environ.get("MEETINGBRO_WHISPER_DEVICE", "cpu"),
-        ),
-        compute_type=os.environ.get(
-            "MEETINGBRO_PREVIEW_WHISPER_COMPUTE_TYPE",
-            os.environ.get("MEETINGBRO_WHISPER_COMPUTE_TYPE", "int8"),
-        ),
+        device=preview_device,
+        compute_type=_env_str_auto("MEETINGBRO_PREVIEW_WHISPER_COMPUTE_TYPE", preview_compute_default),
         beam_size=_env_int("MEETINGBRO_PREVIEW_WHISPER_BEAM_SIZE", 1),
         cpu_threads=_env_int("MEETINGBRO_PREVIEW_WHISPER_CPU_THREADS", 0),
         num_workers=_env_int("MEETINGBRO_PREVIEW_WHISPER_NUM_WORKERS", 1),
@@ -225,11 +249,15 @@ def _build_preview_asr() -> ASRAdapter | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_dotenv_if_present()
+    hardware = detect_hardware_profile()
     storage = Storage(Path(os.environ.get("MEETINGBRO_DB", str(DEFAULT_DB_PATH))))
+    whisper_size = _env_str_auto("MEETINGBRO_WHISPER_SIZE", hardware.recommended_whisper_size)
+    whisper_device = _env_str_auto("MEETINGBRO_WHISPER_DEVICE", hardware.recommended_whisper_device)
+    whisper_compute_type = _env_str_auto("MEETINGBRO_WHISPER_COMPUTE_TYPE", hardware.recommended_whisper_compute_type)
     asr = FasterWhisperAdapter(
-        model_size=os.environ.get("MEETINGBRO_WHISPER_SIZE", "medium"),
-        device=os.environ.get("MEETINGBRO_WHISPER_DEVICE", "cpu"),
-        compute_type=os.environ.get("MEETINGBRO_WHISPER_COMPUTE_TYPE", "int8"),
+        model_size=whisper_size,
+        device=whisper_device,
+        compute_type=whisper_compute_type,
         beam_size=_env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 1),
         cpu_threads=_env_int("MEETINGBRO_WHISPER_CPU_THREADS", 0),
         num_workers=_env_int("MEETINGBRO_WHISPER_NUM_WORKERS", 1),
@@ -241,18 +269,27 @@ async def lifespan(app: FastAPI):
         language_detection_threshold=_env_float("MEETINGBRO_WHISPER_LANGUAGE_DETECTION_THRESHOLD", 0.5),
         language_detection_segments=_env_int("MEETINGBRO_WHISPER_LANGUAGE_DETECTION_SEGMENTS", 1),
     )
-    preview_asr = _build_preview_asr()
+    preview_asr = _build_preview_asr(hardware)
     _preview_backend_env = os.environ.get("MEETINGBRO_PREVIEW_ASR_BACKEND", "").strip().lower()
     if _preview_backend_env == "qwen3":
         _preview_asr_backend_name = "qwen3"
+        _preview_asr_device = _env_str_auto(
+            "MEETINGBRO_PREVIEW_QWEN3_PROVIDER",
+            hardware.recommended_qwen_provider,
+        )
     elif preview_asr is not None:
         _preview_asr_backend_name = "faster_whisper"
+        _preview_asr_device = _env_str_auto("MEETINGBRO_PREVIEW_WHISPER_DEVICE", "cpu")
     else:
         _preview_asr_backend_name = "shared"
+        _preview_asr_device = whisper_device
     app.state.storage = storage
+    app.state.hardware_profile = hardware
     app.state.asr = asr
+    app.state.formal_asr_device = whisper_device
     app.state.preview_asr = preview_asr
     app.state.preview_asr_backend_name = _preview_asr_backend_name
+    app.state.preview_asr_device = _preview_asr_device
     if (
         _preview_asr_backend_name == "qwen3"
         and preview_asr is not None
@@ -275,23 +312,19 @@ async def lifespan(app: FastAPI):
     else:
         app.state.preview_asr_prewarm_future = None
     logger.info(
-        "MeetingBro backend starting db=%s whisper_size=%s whisper_device=%s compute=%s beam=%d cpu_threads=%d whisper_workers=%d preview_backend=%s preview_device=%s preview_compute=%s preview_asr_workers=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f audio_conditioning=%s denoise=%s pre_vad=%s pre_vad_conditioning=%s pre_vad_threshold=%.2f pre_vad_energy_rms=%.4f pre_vad_max=%.1fs weak_rescue=%s weak_rescue_rms=%.4f..%.4f language_lock=%s asr_retry=%s asr_safeguard=%s safeguard_rtf=%.2f suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d translation_backfill=%d translation_max_pending=%d",
+        "MeetingBro backend starting db=%s hardware=%s hardware_summary=%s whisper_size=%s whisper_device=%s compute=%s beam=%d cpu_threads=%d whisper_workers=%d preview_backend=%s preview_device=%s preview_compute=%s preview_asr_workers=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f audio_conditioning=%s denoise=%s pre_vad=%s pre_vad_conditioning=%s pre_vad_threshold=%.2f pre_vad_energy_rms=%.4f pre_vad_max=%.1fs weak_rescue=%s weak_rescue_rms=%.4f..%.4f language_lock=%s asr_retry=%s asr_safeguard=%s safeguard_rtf=%.2f suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d translation_backfill=%d translation_max_pending=%d",
         storage._db_path,
-        os.environ.get("MEETINGBRO_WHISPER_SIZE", "medium"),
-        os.environ.get("MEETINGBRO_WHISPER_DEVICE", "cpu"),
-        os.environ.get("MEETINGBRO_WHISPER_COMPUTE_TYPE", "int8"),
-        _env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 3),
+        hardware.label,
+        hardware.summary,
+        whisper_size,
+        whisper_device,
+        whisper_compute_type,
+        _env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 1),
         _env_int("MEETINGBRO_WHISPER_CPU_THREADS", 0),
         _env_int("MEETINGBRO_WHISPER_NUM_WORKERS", 1),
         os.environ.get("MEETINGBRO_PREVIEW_WHISPER_SIZE", "shared") or "shared",
-        os.environ.get(
-            "MEETINGBRO_PREVIEW_WHISPER_DEVICE",
-            os.environ.get("MEETINGBRO_WHISPER_DEVICE", "cpu"),
-        ),
-        os.environ.get(
-            "MEETINGBRO_PREVIEW_WHISPER_COMPUTE_TYPE",
-            os.environ.get("MEETINGBRO_WHISPER_COMPUTE_TYPE", "int8"),
-        ),
+        _env_str_auto("MEETINGBRO_PREVIEW_WHISPER_DEVICE", "cpu"),
+        _env_str_auto("MEETINGBRO_PREVIEW_WHISPER_COMPUTE_TYPE", "int8"),
         _env_int(
             "MEETINGBRO_PREVIEW_ASR_EXECUTOR_WORKERS",
             _recommended_preview_asr_executor_workers(),
@@ -469,7 +502,15 @@ async def session_ws(
     await ws.accept()
 
     summary_lang: LanguageCode = summary_language if summary_language in ("zh", "en", "de") else "en"  # type: ignore[assignment]
-    profile_name = normalize_runtime_profile(runtime_profile or os.environ.get("MEETINGBRO_RUNTIME_PROFILE"))
+    hardware_profile = getattr(app.state, "hardware_profile", None)
+    default_runtime_profile = (
+        hardware_profile.recommended_runtime_profile
+        if hardware_profile is not None
+        else DEFAULT_RUNTIME_PROFILE
+    )
+    profile_name = normalize_runtime_profile(
+        runtime_profile or os.environ.get("MEETINGBRO_RUNTIME_PROFILE") or default_runtime_profile
+    )
     profile_settings = _runtime_settings_from_profile(profile_name)
     chunk_seconds = _chunk_seconds_for_profile(profile_name)
 
@@ -495,6 +536,11 @@ async def session_ws(
         asr=app.state.asr,
         preview_asr=app.state.preview_asr,
         preview_asr_backend_name=app.state.preview_asr_backend_name,
+        hardware_profile_label=getattr(app.state.hardware_profile, "label", "unknown"),
+        hardware_summary=getattr(app.state.hardware_profile, "summary", None),
+        formal_asr_device=getattr(app.state, "formal_asr_device", "cpu"),
+        preview_asr_device=getattr(app.state, "preview_asr_device", None),
+        compute_gpu_available=getattr(app.state.hardware_profile, "ctranslate2_cuda_available", False),
         preview_asr_fallback_on_error=_env_bool(
             "MEETINGBRO_PREVIEW_FALLBACK_ON_ERROR",
             app.state.preview_asr_backend_name != "qwen3",
@@ -551,13 +597,18 @@ async def session_ws(
         pre_vad_adaptive_trailing_silence_enabled=bool(profile_settings["pre_vad_adaptive_trailing_silence_enabled"]),
         pre_vad_adaptive_fast_trailing_silence_seconds=float(profile_settings["pre_vad_adaptive_fast_trailing_silence_seconds"]),
         pre_vad_max_segment_seconds=_env_float("MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS", 8.0),
-        refinement_interval_seconds=_env_float("MEETINGBRO_REFINEMENT_INTERVAL_SECONDS", 60.0),
-        refinement_window_seconds=_env_float("MEETINGBRO_REFINEMENT_WINDOW_SECONDS", 120.0),
+        refinement_interval_seconds=_env_float("MEETINGBRO_REFINEMENT_INTERVAL_SECONDS", 180.0),
+        refinement_window_seconds=_env_float("MEETINGBRO_REFINEMENT_WINDOW_SECONDS", 0.0),
         min_segments_for_refinement=_env_int("MEETINGBRO_MIN_SEGMENTS_FOR_REFINEMENT", 2),
         weak_speech_rescue_enabled=bool(profile_settings["weak_speech_rescue_enabled"]),
         weak_speech_rescue_rms_min=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MIN", 0.0008),
         weak_speech_rescue_rms_max=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MAX", 0.02),
         weak_speech_rescue_fast_window_seconds=float(profile_settings["weak_speech_rescue_fast_window_seconds"]),
+        resource_governor_policy=str(profile_settings["resource_governor_policy"]),
+        resource_pressure_rtf_threshold=float(profile_settings["resource_pressure_rtf_threshold"]),
+        resource_critical_rtf_threshold=float(profile_settings["resource_critical_rtf_threshold"]),
+        resource_pressure_backlog_seconds=float(profile_settings["resource_pressure_backlog_seconds"]),
+        resource_critical_backlog_seconds=float(profile_settings["resource_critical_backlog_seconds"]),
         weak_speech_rescue_window_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_WINDOW_SECONDS", 6.0),
         weak_speech_rescue_cooldown_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_COOLDOWN_SECONDS", 8.0),
         language_lock_enabled=bool(profile_settings["language_lock_enabled"]),
@@ -572,6 +623,10 @@ async def session_ws(
         fast_preview_max_backlog_seconds=_env_float("MEETINGBRO_FAST_PREVIEW_MAX_BACKLOG_SECONDS", 0.5),
         fast_preview_max_asr_realtime_factor=_env_float("MEETINGBRO_FAST_PREVIEW_MAX_ASR_RTF", 0.65),
         fast_preview_min_rms=_env_float("MEETINGBRO_FAST_PREVIEW_MIN_RMS", 0.002),
+        qwen_orphan_max_age_seconds=_env_float("MEETINGBRO_QWEN_ORPHAN_MAX_AGE_SECONDS", 2.0),
+        qwen_startup_draft_enabled=_env_bool("MEETINGBRO_QWEN_STARTUP_DRAFT_ENABLED", True),
+        qwen_startup_draft_window_seconds=_env_float("MEETINGBRO_QWEN_STARTUP_DRAFT_WINDOW_SECONDS", 20.0),
+        qwen_startup_draft_grace_seconds=_env_float("MEETINGBRO_QWEN_STARTUP_DRAFT_GRACE_SECONDS", 1.2),
         preview_stale_tolerance_seconds=_env_float("MEETINGBRO_PREVIEW_STALE_TOLERANCE_SECONDS", 0.30),
         asr_executor_workers=_env_int(
             "MEETINGBRO_ASR_EXECUTOR_WORKERS",

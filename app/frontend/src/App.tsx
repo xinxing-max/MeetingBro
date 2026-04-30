@@ -63,6 +63,18 @@ function getConfidenceLabel(confidence: number): string | null {
   return null;
 }
 
+function isSystemHealthOnlyMessage(message: string | null): boolean {
+  if (!message) return false;
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("asr is close to falling behind") ||
+    normalized.includes("temporarily skipping retry") ||
+    normalized.includes("asr has been processing") ||
+    normalized.includes("audio input is buffered") ||
+    normalized.includes("backlog")
+  );
+}
+
 function formatElapsedSeconds(seconds: number | null | undefined): string {
   if (seconds == null) return "—";
   const total = Math.max(0, Math.floor(seconds));
@@ -184,7 +196,7 @@ function getMixedGainHint(
 }
 
 function isNearBottom(element: HTMLDivElement): boolean {
-  return element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+  return element.scrollHeight - element.scrollTop - element.clientHeight < 120;
 }
 
 interface SummaryPanelProps {
@@ -195,13 +207,14 @@ interface SummaryPanelProps {
   sessionStartedAt: string | null;
   accent: string;
   className?: string;
+  compact?: boolean;
   onSaveToNotes: (snapshot: SummarySnapshot) => Promise<void>;
   onRefresh?: () => void;
   refreshDisabled?: boolean;
   refreshBusy?: boolean;
 }
 
-function SummaryPanel({ title, subtitle, snapshot, history, sessionStartedAt, accent, className, onSaveToNotes, onRefresh, refreshDisabled = false, refreshBusy = false }: SummaryPanelProps) {
+function SummaryPanel({ title, subtitle, snapshot, history, sessionStartedAt, accent, className, compact = false, onSaveToNotes, onRefresh, refreshDisabled = false, refreshBusy = false }: SummaryPanelProps) {
   const displayedHistory = history.length > 0 ? history : snapshot ? [snapshot] : [];
   const latestSnapshot = displayedHistory.at(-1) ?? snapshot;
   const range = latestSnapshot
@@ -238,6 +251,65 @@ function SummaryPanel({ title, subtitle, snapshot, history, sessionStartedAt, ac
     await onSaveToNotes(latestSnapshot);
   };
 
+  const bodyJSX = (
+    <div
+      ref={bodyRef}
+      className="panel-body summary-history"
+      onScroll={(e) => {
+        autoFollowRef.current = isNearBottom(e.currentTarget);
+      }}
+    >
+      {displayedHistory.length === 0 ? (
+        "waiting for the first snapshot…"
+      ) : (
+        displayedHistory.map((item, idx) => {
+          const itemRange = formatApproxClockRange(sessionStartedAt, item.time_start, item.time_end);
+          const itemRelativeRange = formatRange(item.time_start, item.time_end);
+          const itemCreatedAt = new Date(item.created_at).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          });
+          const isLatest = idx === displayedHistory.length - 1;
+          return (
+            <article key={item.id} className={`summary-history-item ${isLatest ? "latest" : ""}`.trim()}>
+              <div className="summary-history-meta">
+                <span>{itemRange}</span>
+                <span>{itemRelativeRange}</span>
+                <span>{itemCreatedAt}</span>
+              </div>
+              <div>{item.content}</div>
+            </article>
+          );
+        })
+      )}
+    </div>
+  );
+
+  const footerJSX = (
+    <footer>
+      <button onClick={onRefresh} disabled={!onRefresh || refreshDisabled} className={refreshBusy ? "button-busy" : ""} aria-busy={refreshBusy}>
+        {refreshBusy ? "Refreshing…" : "Refresh"}
+      </button>
+      <button onClick={onCopy} disabled={!latestSnapshot}>Copy Latest</button>
+      <button onClick={onExpand} disabled={!latestSnapshot}>Expand</button>
+      <button onClick={onSave} disabled={!latestSnapshot}>Save Latest</button>
+    </footer>
+  );
+
+  if (compact) {
+    return (
+      <div className="workspace-tab-panel">
+        <div className="workspace-tab-meta">
+          <span className="summary-meta">covered {relativeRange} · updated {createdAt}</span>
+          <span className="range">{range}</span>
+        </div>
+        {bodyJSX}
+        {footerJSX}
+      </div>
+    );
+  }
+
   return (
     <section className={`panel ${className ?? ""}`.trim()} style={{ borderTop: `3px solid ${accent}` }}>
       <header>
@@ -248,46 +320,8 @@ function SummaryPanel({ title, subtitle, snapshot, history, sessionStartedAt, ac
         </div>
         <div className="range">{range}</div>
       </header>
-      <div
-        ref={bodyRef}
-        className="panel-body summary-history"
-        onScroll={(e) => {
-          autoFollowRef.current = isNearBottom(e.currentTarget);
-        }}
-      >
-        {displayedHistory.length === 0 ? (
-          "waiting for the first snapshot…"
-        ) : (
-          displayedHistory.map((item, idx) => {
-            const itemRange = formatApproxClockRange(sessionStartedAt, item.time_start, item.time_end);
-            const itemRelativeRange = formatRange(item.time_start, item.time_end);
-            const itemCreatedAt = new Date(item.created_at).toLocaleTimeString([], {
-              hour: "2-digit",
-              minute: "2-digit",
-              second: "2-digit",
-            });
-            const isLatest = idx === displayedHistory.length - 1;
-            return (
-              <article key={item.id} className={`summary-history-item ${isLatest ? "latest" : ""}`.trim()}>
-                <div className="summary-history-meta">
-                  <span>{itemRange}</span>
-                  <span>{itemRelativeRange}</span>
-                  <span>{itemCreatedAt}</span>
-                </div>
-                <div>{item.content}</div>
-              </article>
-            );
-          })
-        )}
-      </div>
-      <footer>
-        <button onClick={onRefresh} disabled={!onRefresh || refreshDisabled} className={refreshBusy ? "button-busy" : ""} aria-busy={refreshBusy}>
-          {refreshBusy ? "Refreshing…" : "Refresh"}
-        </button>
-        <button onClick={onCopy} disabled={!latestSnapshot}>Copy Latest</button>
-        <button onClick={onExpand} disabled={!latestSnapshot}>Expand</button>
-        <button onClick={onSave} disabled={!latestSnapshot}>Save Latest</button>
-      </footer>
+      {bodyJSX}
+      {footerJSX}
     </section>
   );
 }
@@ -310,6 +344,10 @@ export default function App() {
   const [refreshBaselineId, setRefreshBaselineId] = useState<string | null>(null);
   const [bilingualExport, setBilingualExport] = useState(false);
   const [restartPromptOpen, setRestartPromptOpen] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [computeActivityHold, setComputeActivityHold] = useState({ cpu: false, gpu: false });
+  const [vocabularyOpen, setVocabularyOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<"summary" | "clean" | "board" | "notes">("summary");
   const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, previewSegments, isExperimentalPreview, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, requestSummary, pauseSession, resumeSession, stopSession } =
     useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage, runtimeProfile });
 
@@ -398,6 +436,11 @@ export default function App() {
   const actionItems = useMemo(() => actionItemSnapshot ? parseSnapshotList(actionItemSnapshot.content) : [], [actionItemSnapshot]);
   const latestSegment = segments.at(-1);
   const latestVisualSegment = previewSegment ?? latestSegment;
+  const previewStackRevision = useMemo(
+    () => previewSegments.map((segment) => `${segment.id}:${segment.text}`).join("|"),
+    [previewSegments],
+  );
+  const latestSegmentRevision = latestSegment ? `${latestSegment.id}:${latestSegment.text}` : "";
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
@@ -440,9 +483,6 @@ export default function App() {
 
   const transcriptLagSeconds = liveGapSeconds ?? committedLagSeconds;
 
-  const latestSegmentRange = latestVisualSegment
-    ? formatRange(latestVisualSegment.start_time, latestVisualSegment.end_time)
-    : "—";
   const visibleTranscriptSeconds = latestSegment?.end_time ?? null;
   const backpressureAgeSeconds = useMemo(() => {
     const lastBackpressure = sessionStats?.last_backpressure_elapsed_seconds;
@@ -460,7 +500,36 @@ export default function App() {
   const asrAudioSeconds = sessionStats?.asr_last_audio_seconds ?? null;
   const asrSafeguardActive = sessionStats?.asr_safeguard_active ?? false;
   const asrSafeguardEvents = sessionStats?.asr_safeguard_events ?? 0;
+  const resourcePressureLevel = sessionStats?.resource_pressure_level ?? "normal";
+  const resourceGovernorPolicy = sessionStats?.resource_governor_policy ?? "balanced";
+  const resourceGovernorReason = sessionStats?.resource_governor_reason ?? null;
+  const resourceGovernorSkips = sessionStats?.resource_governor_skips ?? 0;
   const activeRuntimeProfile = sessionStats?.runtime_profile ?? runtimeProfile;
+  const activeHardwareProfile = sessionStats?.hardware_profile ?? "auto";
+  const activeHardwareSummary = sessionStats?.hardware_summary ?? "detecting local CPU/GPU profile";
+  const computeCpuActive = sessionStats?.compute_cpu_active ?? false;
+  const computeCpuAvailable = sessionStats?.compute_cpu_available ?? true;
+  const computeCpuConfigured = sessionStats?.compute_cpu_configured ?? false;
+  const computeGpuActive = sessionStats?.compute_gpu_active ?? false;
+  const computeGpuAvailable = sessionStats?.compute_gpu_available ?? false;
+  const computeGpuConfigured = sessionStats?.compute_gpu_configured ?? false;
+  const computeActivityLabel = sessionStats?.compute_activity_label ?? "idle";
+  const cpuChipTitle = computeCpuActive
+    ? computeActivityLabel
+    : computeCpuConfigured
+      ? "CPU is configured for MeetingBro and waiting for Qwen/CPU work"
+      : computeCpuAvailable
+        ? "CPU is available, but no CPU ASR task is currently assigned"
+        : "CPU is not available";
+  const gpuChipTitle = computeGpuActive
+    ? computeActivityLabel
+    : computeGpuConfigured
+      ? "GPU is configured for MeetingBro and waiting for Whisper work"
+      : computeGpuAvailable
+        ? "GPU is available, but MeetingBro is currently configured to use CPU"
+        : "GPU is not available to the current Python ASR runtime";
+  const displayCpuActive = computeCpuActive || computeActivityHold.cpu;
+  const displayGpuActive = computeGpuActive || computeActivityHold.gpu;
   const activeChunkSeconds = sessionStats?.audio_chunk_seconds ?? null;
   const activeAccumSeconds = sessionStats?.asr_accumulation_seconds ?? null;
   const languageLockEnabled = sessionStats?.language_lock_enabled ?? false;
@@ -699,22 +768,30 @@ export default function App() {
   const transcriptBottomRef = useRef<HTMLDivElement>(null);
   const transcriptAutoFollowRef = useRef(true);
   const transcriptProgrammaticScrollRef = useRef(false);
+  const transcriptFollowFrameRef = useRef<number | null>(null);
   const [transcriptAutoFollow, setTranscriptAutoFollow] = useState(true);
 
   const scrollTranscriptToBottom = (behavior: ScrollBehavior = "auto") => {
-    window.requestAnimationFrame(() => {
+    if (transcriptFollowFrameRef.current !== null) {
+      window.cancelAnimationFrame(transcriptFollowFrameRef.current);
+    }
+    transcriptFollowFrameRef.current = window.requestAnimationFrame(() => {
+      transcriptFollowFrameRef.current = null;
       const body = transcriptBodyRef.current;
       if (!body) return;
       transcriptProgrammaticScrollRef.current = true;
-      body.scrollTo({ top: body.scrollHeight, behavior });
-      transcriptBottomRef.current?.scrollIntoView({ block: "end", behavior });
+      if (behavior === "smooth") {
+        body.scrollTo({ top: body.scrollHeight, behavior });
+      } else {
+        body.scrollTop = body.scrollHeight;
+      }
       window.setTimeout(() => {
         const latestBody = transcriptBodyRef.current;
         if (latestBody && transcriptAutoFollowRef.current) {
           latestBody.scrollTop = latestBody.scrollHeight;
         }
         transcriptProgrammaticScrollRef.current = false;
-      }, behavior === "smooth" ? 350 : 80);
+      }, behavior === "smooth" ? 420 : 60);
     });
   };
 
@@ -724,13 +801,38 @@ export default function App() {
     }
   }, [
     visibleSegments.length,
+    latestSegmentRevision,
     visibleSubtitleRevision,
     previewSegment?.id,
     previewSegment?.text,
+    previewStackRevision,
+    previewSegments.length,
     latestSegment?.id,
     latestSubtitleText,
     activeSubtitleLanguage,
   ]);
+
+  useEffect(() => {
+    return () => {
+      if (transcriptFollowFrameRef.current !== null) {
+        window.cancelAnimationFrame(transcriptFollowFrameRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!computeCpuActive && !computeGpuActive) {
+      return;
+    }
+    setComputeActivityHold((prev) => ({
+      cpu: prev.cpu || computeCpuActive,
+      gpu: prev.gpu || computeGpuActive,
+    }));
+    const timer = window.setTimeout(() => {
+      setComputeActivityHold({ cpu: false, gpu: false });
+    }, 1400);
+    return () => window.clearTimeout(timer);
+  }, [computeCpuActive, computeGpuActive]);
 
   const notesBodyRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -851,6 +953,12 @@ export default function App() {
   const vocabularyHint = sessionEnabled
     ? "Add keywords for better recognition. Save anytime, even during a meeting."
     : "Add keywords for better recognition. Save anytime before or during a meeting.";
+  const vocabularyTermCount = useMemo(() => {
+    return vocabulary
+      .split(/[\n,，;；]+/)
+      .map((term) => term.trim())
+      .filter(Boolean).length;
+  }, [vocabulary]);
 
   const transcriptEmptyMessage = !sessionEnabled
     ? "session stopped — press Start to begin capture"
@@ -867,103 +975,146 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <div>
-          <strong>MeetingBro</strong>
-          <span className="sep">·</span>
-          <span>session: {state}</span>
-          {meetingId && (
-            <>
-              <span className="sep">·</span>
-              <span className="muted">{meetingId.slice(0, 8)}</span>
-            </>
-          )}
+        <div className="brand-block">
+          <div className="brand-row">
+            <strong>MeetingBro</strong>
+            <span className={`session-state state-${state}`}>{state}</span>
+            {meetingId && <span className="meeting-id-pill">#{meetingId.slice(0, 8)}</span>}
+            <span className={`compute-chip ${displayCpuActive ? "active" : computeCpuConfigured ? "configured" : computeCpuAvailable ? "available" : "idle"}`} title={cpuChipTitle}>
+              <span className="compute-dot" aria-hidden="true" /> CPU
+            </span>
+            <span className={`compute-chip ${displayGpuActive ? "active" : computeGpuConfigured ? "configured" : computeGpuAvailable ? "available" : "idle"}`} title={gpuChipTitle}>
+              <span className="compute-dot" aria-hidden="true" /> GPU
+            </span>
+          </div>
+          <span className="app-tagline">Live captions ? AI notes ? clean meeting record</span>
         </div>
-        <div className="header-controls">
-          <select value={source} onChange={(e) => setSource(e.target.value)}>
-            <option value="mic">Microphone</option>
-            <option value="loopback">System Audio (Loopback)</option>
-            <option value="mixed">System Audio + Microphone</option>
-          </select>
-          <select value={runtimeProfile} onChange={(e) => handleRuntimeProfileChange(e.target.value)}>
-            <option value="balanced">Mode: Balanced</option>
-            <option value="low_latency">Mode: Low Latency</option>
-            <option value="robust">Mode: Robust Meeting</option>
-            <option value="multilingual">Mode: Multilingual</option>
-            <option value="single_language">Mode: Single Language</option>
-          </select>
-          <select value={speechLanguage} onChange={(e) => setSpeechLanguage(e.target.value)}>
-            <option value="auto">Speech: Auto / Multilingual</option>
-            <option value="en">Speech: English</option>
-            <option value="zh">Speech: 中文</option>
-            <option value="de">Speech: Deutsch</option>
-          </select>
-          <select value={summaryLanguage} onChange={(e) => setSummaryLanguage(e.target.value)}>
-            <option value="en">Summary: English</option>
-            <option value="zh">Summary: 中文</option>
-            <option value="de">Summary: Deutsch</option>
-          </select>
-          <select value={subtitleLanguage} onChange={(e) => setSubtitleLanguage(e.target.value)}>
-            <option value="off">Subtitles: Off</option>
-            <option value="en">Subtitles: English</option>
-            <option value="zh">Subtitles: 中文</option>
-            <option value="de">Subtitles: Deutsch</option>
-          </select>
-          {!sessionEnabled ? (
-            <button className="start-btn" onClick={handleStartSession}>Start</button>
-          ) : (
-            <>
-              {state === "paused" ? (
-                <button className="resume-btn" onClick={resumeSession}>Resume</button>
-              ) : (
-                <button className="pause-btn" onClick={pauseSession} disabled={state !== "running"}>
-                  Pause
+        <div className="header-controls" aria-label="Meeting controls">
+          <div className="settings-controls" aria-label="Capture and language settings">
+            <label className="control-pill">
+              <span>Capture</span>
+              <select value={source} onChange={(e) => setSource(e.target.value)}>
+                <option value="mic">Mic</option>
+                <option value="loopback">System audio</option>
+                <option value="mixed">System + Mic</option>
+              </select>
+            </label>
+            <label className="control-pill">
+              <span>Mode</span>
+              <select value={runtimeProfile} onChange={(e) => handleRuntimeProfileChange(e.target.value)}>
+                <option value="balanced">Balanced</option>
+                <option value="low_latency">Low latency</option>
+                <option value="robust">Robust</option>
+                <option value="multilingual">Multilingual</option>
+                <option value="single_language">Single language</option>
+              </select>
+            </label>
+            <label className="control-pill">
+              <span>Speech</span>
+              <select value={speechLanguage} onChange={(e) => setSpeechLanguage(e.target.value)}>
+                <option value="auto">Auto</option>
+                <option value="en">English</option>
+                <option value="zh">Chinese</option>
+                <option value="de">Deutsch</option>
+              </select>
+            </label>
+            <label className="control-pill">
+              <span>Notes</span>
+              <select value={summaryLanguage} onChange={(e) => setSummaryLanguage(e.target.value)}>
+                <option value="en">English</option>
+                <option value="zh">Chinese</option>
+                <option value="de">Deutsch</option>
+              </select>
+            </label>
+            <label className="control-pill">
+              <span>Captions</span>
+              <select value={subtitleLanguage} onChange={(e) => setSubtitleLanguage(e.target.value)}>
+                <option value="off">Off</option>
+                <option value="en">English</option>
+                <option value="zh">Chinese</option>
+                <option value="de">Deutsch</option>
+              </select>
+            </label>
+          </div>
+          <div className="session-controls" aria-label="Session actions">
+            {!sessionEnabled ? (
+              <button className="start-btn" onClick={handleStartSession}>Start</button>
+            ) : (
+              <>
+                {state === "paused" ? (
+                  <button className="resume-btn" onClick={resumeSession}>Resume</button>
+                ) : (
+                  <button className="pause-btn" onClick={pauseSession} disabled={state !== "running"}>
+                    Pause
+                  </button>
+                )}
+                <button
+                  className="stop-btn"
+                  onClick={() => {
+                    stopSession();
+                    setSessionEnabled(false);
+                  }}
+                >
+                  Stop
                 </button>
-              )}
-              <button
-                className="stop-btn"
-                onClick={() => {
-                  stopSession();
-                  setSessionEnabled(false);
-                }}
-              >
-                Stop
-              </button>
-            </>
-          )}
-          <span className={connected ? "dot ok" : "dot bad"} />
-          {connected ? "connected" : "disconnected"}
+              </>
+            )}
+            <span className={`connection-pill ${connected ? "connected" : "disconnected"}`}>
+              <span className={connected ? "dot ok" : "dot bad"} />
+              {connected ? "Online" : "Offline"}
+            </span>
+          </div>
         </div>
       </header>
 
-      {lastError && <div className="error">{lastError}</div>}
+      {lastError && !isSystemHealthOnlyMessage(lastError) && <div className="error">{lastError}</div>}
 
-      <section className="startup-settings" aria-label="Vocabulary glossary settings">
-        <div className="startup-settings-copy">
-          <strong>Keywords</strong>
-          <p className="muted">{vocabularyHint}</p>
-        </div>
-        <div className="startup-settings-controls">
-          <textarea
-            value={vocabulary}
-            onChange={(e) => setVocabulary(e.target.value)}
-            placeholder="Anthropic, MeetingBro, Libin Mao, faster-whisper, pyannote"
-            rows={2}
-            aria-label="Glossary or vocabulary"
-          />
-          <button type="button" className="secondary-action-btn" onClick={handleSaveVocabulary}>Save Keywords</button>
-        </div>
+      <section className={`startup-settings vocabulary-dock${vocabularyOpen ? " open" : ""}`} aria-label="Names and terms settings">
+        <button
+          type="button"
+          className="vocabulary-toggle"
+          aria-expanded={vocabularyOpen}
+          onClick={() => setVocabularyOpen((open) => !open)}
+        >
+          <span className="vocabulary-toggle-main">
+            <strong>Names &amp; Terms</strong>
+            <span className="vocabulary-toggle-note">Improve recognition for names, acronyms, and project terms</span>
+          </span>
+          <span className="vocabulary-count">
+            {vocabularyTermCount === 0 ? "No terms" : `${vocabularyTermCount} ${vocabularyTermCount === 1 ? "term" : "terms"}`}
+          </span>
+          <span className={`toggle-caret${vocabularyOpen ? " open" : ""}`} aria-hidden="true">▼</span>
+        </button>
+        {vocabularyOpen && (
+          <div className="startup-settings-panel">
+            <p className="muted">{vocabularyHint}</p>
+            <div className="startup-settings-controls">
+              <textarea
+                value={vocabulary}
+                onChange={(e) => setVocabulary(e.target.value)}
+                placeholder="Anthropic, MeetingBro, Libin Mao, faster-whisper, pyannote"
+                rows={2}
+                aria-label="Names, acronyms, or project terms"
+              />
+              <button type="button" className="secondary-action-btn" onClick={handleSaveVocabulary}>Save Terms</button>
+            </div>
+          </div>
+        )}
       </section>
 
       <main className="grid">
         <section className="panel transcript">
           <header>
             <div>
-              <h2>Live Transcript</h2>
-              <p className="subtitle">source of truth, timestamped</p>
+              <h2>
+                Live Captions
+                {state === "running" && <span className="live-dot" aria-label="recording" />}
+              </h2>
+              <p className="subtitle">confirmed · timestamped</p>
               <p className="transcript-lag-meta">
-                <span className={`delay-pill delay-${delayTone}`}>realtime gap {formatLagSeconds(transcriptLagSeconds)}</span>
-                {committedLagSeconds != null ? ` · commit delay ${formatLagSeconds(committedLagSeconds)}` : ""}
-                {elapsedSeconds > 0 ? " · backend clock" : " · frontend estimate"} · latest span {latestSegmentRange}{previewSegment ? " · previewing" : ""}
+                <span className={`delay-pill delay-${delayTone}`}>{formatLagSeconds(transcriptLagSeconds)} behind</span>
+                {committedLagSeconds != null ? ` · commit ${formatLagSeconds(committedLagSeconds)}` : ""}
+                {previewSegment ? " · previewing" : ""}
               </p>
               {bookmarkFeedback && <p className="bookmark-feedback">{bookmarkFeedback}</p>}
             </div>
@@ -1046,13 +1197,16 @@ export default function App() {
                       className={`segment preview-segment preview-age-${Math.min(age, 4)}`}
                     >
                       <span className="preview-status">
-                        <span className="preview-hearing">hearing…</span>
+                        <span className="preview-hearing">
+                          <span className="preview-pulse-dot" aria-hidden="true" />
+                          Listening
+                        </span>
                         {isExperimentalPreview && (
                           <span
                             className="preview-experimental-badge"
-                            title="Fast experimental preview; final transcript may change"
+                            title="Qwen3 fast preview · text is live and may still change"
                           >
-                            Preview
+                            Qwen · Live
                           </span>
                         )}
                       </span>
@@ -1079,333 +1233,407 @@ export default function App() {
           </div>
         </section>
 
-        <SummaryPanel
-          title="Latest Rolling Summary"
-          subtitle="quick catch-up from the most recent 3–5 minutes"
-          snapshot={rolling}
-          history={historyByType.rolling_summary ?? []}
-          sessionStartedAt={sessionStartedAt}
-          accent="#2563eb"
-          className="summary-panel rolling-panel"
-          onSaveToNotes={handleSaveToNotes}
-          onRefresh={() => handleRefreshSummary("rolling_summary")}
-          refreshDisabled={!connected || state !== "running" || segments.length === 0}
-          refreshBusy={refreshingSummary === "rolling_summary"}
-        />
-
-        <SummaryPanel
-          title="Refined Transcript"
-          subtitle="background LLM cleanup using Whisper plus Qwen preview hints"
-          snapshot={refined}
-          history={historyByType.refined_transcript ?? []}
-          sessionStartedAt={sessionStartedAt}
-          accent="#7c3aed"
-          className="summary-panel refined-panel"
-          onSaveToNotes={handleSaveToNotes}
-        />
-
-        <SummaryPanel
-          title="Meeting Board"
-          subtitle="stable meeting state: decisions, actions, open questions"
-          snapshot={cumulative}
-          history={historyByType.cumulative_meeting_summary ?? []}
-          sessionStartedAt={sessionStartedAt}
-          accent="#0f766e"
-          className="summary-panel cumulative-panel"
-          onSaveToNotes={handleSaveToNotes}
-          onRefresh={() => handleRefreshSummary("cumulative_meeting_summary")}
-          refreshDisabled={!connected || state !== "running" || segments.length === 0}
-          refreshBusy={refreshingSummary === "cumulative_meeting_summary"}
-        />
-
-        <section className="panel diagnostics">
-          <header>
-            <div>
-              <h2>Live Diagnostics</h2>
-              <p className="subtitle">latency and retry signals</p>
-            </div>
-            <div className="range">{elapsedSeconds > 0 ? formatElapsedSeconds(elapsedSeconds) : "—"}</div>
-          </header>
-          <div className="panel-body diagnostics-body">
-            <div className={`diagnostic-card advice-card advice-${systemAdviceTone}`}>
-              <span className="diagnostic-label">System Advice</span>
-              <div className="advice-list">
-                {systemAdvice.map((item) => (
-                  <div key={`${item.title}-${item.detail}`} className={`advice-item advice-${item.severity}`}>
-                    <strong>{item.title}</strong>
-                    <span>{item.detail}</span>
-                    {item.action && <em>{item.action}</em>}
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Active Source</span>
-              <strong className="diagnostic-value">{formatSourceLabel(activeSource)}</strong>
-              <span className="diagnostic-note">
-                {activeSource === "mixed"
-                  ? "capturing system audio and microphone"
-                  : activeSource === "loopback" || activeSource === "system"
-                    ? "capturing system output only"
-                    : "capturing microphone only"}
-              </span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Runtime Mode</span>
-              <strong className="diagnostic-value">{formatRuntimeProfileLabel(activeRuntimeProfile)}</strong>
-              <span className="diagnostic-note">
-                chunk {formatLagSeconds(activeChunkSeconds)} · ASR window {formatLagSeconds(activeAccumSeconds)} · lock {languageLockEnabled ? "on" : "off"}
-              </span>
-            </div>
-            <div className={`diagnostic-card gain-card gain-${mixedGainTone}`}>
-              <span className="diagnostic-label">Mixed Gain</span>
-              <strong className="diagnostic-value">{mixedGainRatio}</strong>
-              <span className="diagnostic-note">
-                {activeSource === "mixed"
-                  ? `mic effective ${formatGain(mixedEffectiveMicGain)} · base ${formatGain(mixedMicGain)} · auto ${mixedAutoBalanceEnabled ? "on" : "off"}`
-                  : mixedGainHint}
-              </span>
-              {activeSource === "mixed" && (
-                <span className="diagnostic-note diagnostic-hint">{mixedGainHint}</span>
-              )}
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Subtitles</span>
-              <strong className="diagnostic-value">{subtitleStatus}</strong>
-              <span className="diagnostic-note">{subtitleStatusDetail}</span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Audio Clock</span>
-              <strong className="diagnostic-value">{formatElapsedSeconds(audioClockSeconds)}</strong>
-              <span className="diagnostic-note">{elapsedSeconds > 0 ? "backend progress" : "frontend estimate"}</span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Committed Transcript</span>
-              <strong className="diagnostic-value">{formatElapsedSeconds(visibleTranscriptSeconds)}</strong>
-              <span className="diagnostic-note">{latestSegment ? `last committed · ${formatRange(latestSegment.start_time, latestSegment.end_time)}` : "waiting for committed text"}</span>
-            </div>
-            <div className={`diagnostic-card delay-card delay-${delayTone}`}>
-              <span className="diagnostic-label">Realtime Gap</span>
-              <strong className="diagnostic-value">{formatLagSeconds(transcriptLagSeconds)}</strong>
-              <span className="diagnostic-note">current audio clock minus latest visible transcript</span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Commit Delay</span>
-              <strong className="diagnostic-value">{formatLagSeconds(committedLagSeconds)}</strong>
-              <span className="diagnostic-note">
-                {committedLagSeconds != null
-                  ? "reference only · commit time minus segment end"
-                  : "waiting for committed text"}
-              </span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Retry Summary</span>
-              <strong className="diagnostic-value">{retryTotal}</strong>
-              <span className="diagnostic-note">improved {retryImproved} · unchanged {retryUnchanged} · diverged {retryDiverged}</span>
-            </div>
-            <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : (asrRealtimeFactor != null && asrRealtimeFactor > 0.8 ? "warn" : "ok")}`}>
-              <span className="diagnostic-label">ASR Realtime</span>
-              <strong className="diagnostic-value">{formatRtf(asrRealtimeFactor)}</strong>
-              <span className="diagnostic-note">
-                audio {formatLagSeconds(asrAudioSeconds)} ? ASR {formatLagSeconds(asrWallSeconds)}
-              </span>
-            </div>
-            <div className={`diagnostic-card delay-card delay-${fastPreviewRtf != null && fastPreviewRtf > 0.8 ? "warn" : "ok"}`}>
-              <span className="diagnostic-label">Fast Preview</span>
-              <strong className="diagnostic-value">{fastPreviewEnabled ? formatRtf(fastPreviewRtf) : "off"}</strong>
-              <span className="diagnostic-note">
-                emitted {fastPreviewEmitted} · skipped {fastPreviewSkipped}
-              </span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Preview Continued</span>
-              <strong className="diagnostic-value">{previewContinuedDuringFormal}</strong>
-              <span className="diagnostic-note">Qwen preview updates while formal text is pending</span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Preview Stale Suppressed</span>
-              <strong className="diagnostic-value">{previewStaleSuppressed}</strong>
-              <span className="diagnostic-note">previews dropped (covered by formal)</span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Preview Alignment</span>
-              <strong className="diagnostic-value">
-                {previewAlignmentCompared > 0
-                  ? `${(previewAlignmentSimilarityAvg ?? 0).toFixed(2)} avg`
-                  : "—"}
-              </strong>
-              <span className="diagnostic-note">
-                compared {previewAlignmentCompared} · last {previewAlignmentSimilarityLast != null ? previewAlignmentSimilarityLast.toFixed(2) : "—"}
-              </span>
-            </div>
-            <div className={`diagnostic-card delay-card delay-${previewUnconfirmedAfterFormal > 0 ? "warn" : "ok"}`}>
-              <span className="diagnostic-label">Preview Unconfirmed</span>
-              <strong className="diagnostic-value">{previewUnconfirmedAfterFormal}</strong>
-              <span className="diagnostic-note">
-                {previewUnconfirmedLastText ? `last: ${previewUnconfirmedLastText}` : "no preview has been passed by formal without overlap"}
-              </span>
-            </div>
-            <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : "ok"}`}>
-              <span className="diagnostic-label">Realtime Safeguard</span>
-              <strong className="diagnostic-value">{asrSafeguardActive ? "active" : "clear"}</strong>
-              <span className="diagnostic-note">
-                {asrSafeguardActive
-                  ? (sessionStats?.asr_safeguard_reason ?? "protecting realtime path")
-                  : `events ${asrSafeguardEvents}`}
-              </span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Weak Voice Rescue</span>
-              <strong className="diagnostic-value">{weakRescueAttempts}</strong>
-              <span className="diagnostic-note">
-                emitted {weakRescueEmitted} · buffer {formatLagSeconds(weakRescueBufferSeconds)}
-              </span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Background Queue</span>
-              <strong className="diagnostic-value">{translationPendingCount + summaryPendingCount}</strong>
-              <span className="diagnostic-note">
-                translations {translationPendingCount} ? summaries {summaryPendingCount} ? trims {translationTrimTotal}
-              </span>
-            </div>
-            <div className={`diagnostic-card delay-card delay-${audioInputBacklogSeconds >= 5 ? "warn" : "ok"}`}>
-              <span className="diagnostic-label">Audio Backlog</span>
-              <strong className="diagnostic-value">{formatLagSeconds(audioInputBacklogSeconds)}</strong>
-              <span className="diagnostic-note">input queue drops {audioInputQueueDropTotal}</span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Audio Drops</span>
-              <strong className="diagnostic-value">{audioDropTotal}</strong>
-              <span className="diagnostic-note">capture queue dropped chunks</span>
-            </div>
-            <div className="diagnostic-card">
-              <span className="diagnostic-label">Backpressure</span>
-              <strong className="diagnostic-value">{backpressureAgeSeconds != null ? "recent" : "clear"}</strong>
-              <span className="diagnostic-note">
-                {backpressureAgeSeconds != null
-                  ? `last seen ${formatLagSeconds(backpressureAgeSeconds)} ago at ${formatElapsedSeconds(sessionStats?.last_backpressure_elapsed_seconds)}`
-                  : "no recent slow-ASR flush"}
-              </span>
-            </div>
+        <section className="panel workspace">
+          <div className="workspace-tabs" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "summary"}
+              className={`workspace-tab-btn${activeTab === "summary" ? " active" : ""}`}
+              onClick={() => setActiveTab("summary")}
+            >
+              Summary
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "clean"}
+              className={`workspace-tab-btn${activeTab === "clean" ? " active" : ""}`}
+              onClick={() => setActiveTab("clean")}
+            >
+              Clean Notes
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "board"}
+              className={`workspace-tab-btn${activeTab === "board" ? " active" : ""}`}
+              onClick={() => setActiveTab("board")}
+            >
+              Board
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "notes"}
+              className={`workspace-tab-btn${activeTab === "notes" ? " active" : ""}`}
+              onClick={() => setActiveTab("notes")}
+            >
+              Notes
+            </button>
           </div>
-        </section>
-
-        <section className="panel notes">
-          <header>
-            <div>
-              <h2>Notes / Quick Actions</h2>
-              <p className="subtitle">manual notes + saved snapshots + export</p>
-            </div>
-            <div className="range">{notes.length} saved</div>
-          </header>
-          <div ref={notesBodyRef} className="panel-body">
-            <div className="export-box">
-              <div>
-                <strong>Export meeting files</strong>
-                <p className="muted">Creates transcript.md, summary.md, and metadata.json in the chosen folder.</p>
-                <div className="export-target-row">
-                  <input
-                    type="text"
-                    value={exportRoot}
-                    onChange={(e) => setExportRoot(e.target.value)}
-                    placeholder="Default: project exports/<timestamp> folder"
-                    aria-label="Export folder"
-                  />
-                  {window.meetingbro?.selectExportDirectory && (
-                    <button type="button" className="secondary-export-btn" onClick={handleChooseExportFolder} disabled={exporting}>
-                      Browse…
+          <div className="workspace-content">
+            {activeTab === "summary" && (
+              <SummaryPanel
+                compact
+                title="AI Summary"
+                subtitle="rolling AI digest of the last 3–5 minutes"
+                snapshot={rolling}
+                history={historyByType.rolling_summary ?? []}
+                sessionStartedAt={sessionStartedAt}
+                accent="#2563eb"
+                onSaveToNotes={handleSaveToNotes}
+                onRefresh={() => handleRefreshSummary("rolling_summary")}
+                refreshDisabled={!connected || state !== "running" || segments.length === 0}
+                refreshBusy={refreshingSummary === "rolling_summary"}
+              />
+            )}
+            {activeTab === "clean" && (
+              <SummaryPanel
+                compact
+                title="AI Clean Notes"
+                subtitle="polished conversation record · Whisper + Qwen + LLM"
+                snapshot={refined}
+                history={historyByType.refined_transcript ?? []}
+                sessionStartedAt={sessionStartedAt}
+                accent="#7c3aed"
+                onSaveToNotes={handleSaveToNotes}
+              />
+            )}
+            {activeTab === "board" && (
+              <SummaryPanel
+                compact
+                title="Meeting Board"
+                subtitle="live meeting state · decisions · actions · open questions"
+                snapshot={cumulative}
+                history={historyByType.cumulative_meeting_summary ?? []}
+                sessionStartedAt={sessionStartedAt}
+                accent="#0f766e"
+                onSaveToNotes={handleSaveToNotes}
+                onRefresh={() => handleRefreshSummary("cumulative_meeting_summary")}
+                refreshDisabled={!connected || state !== "running" || segments.length === 0}
+                refreshBusy={refreshingSummary === "cumulative_meeting_summary"}
+              />
+            )}
+            {activeTab === "notes" && (
+              <div className="workspace-tab-panel">
+                <div ref={notesBodyRef} className="panel-body">
+                  <div className="export-box">
+                    <div>
+                      <strong>Export meeting files</strong>
+                      <p className="muted">Creates transcript.md, summary.md, and metadata.json in the chosen folder.</p>
+                      <div className="export-target-row">
+                        <input
+                          type="text"
+                          value={exportRoot}
+                          onChange={(e) => setExportRoot(e.target.value)}
+                          placeholder="Default: project exports/<timestamp> folder"
+                          aria-label="Export folder"
+                        />
+                        {window.meetingbro?.selectExportDirectory && (
+                          <button type="button" className="secondary-export-btn" onClick={handleChooseExportFolder} disabled={exporting}>
+                            Browse…
+                          </button>
+                        )}
+                      </div>
+                      <label style={{ display: "inline-flex", alignItems: "center", gap: 8, marginTop: 10, fontSize: 12 }}>
+                        <input
+                          type="checkbox"
+                          checked={bilingualExport}
+                          onChange={(e) => setBilingualExport(e.target.checked)}
+                        />
+                        Bilingual transcript (original + translation)
+                      </label>
+                      {lastExport && (
+                        <p className="export-path">
+                          Latest export: <code>{lastExport.export_dir}</code>
+                        </p>
+                      )}
+                      {(exporting || actionFeedback) && exportIntent !== "restart" && (
+                        <p className={`action-feedback ${exporting ? "is-busy" : "is-success"}`}>
+                          {exporting ? "Preparing transcript, summary, and metadata…" : actionFeedback}
+                        </p>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      className={`primary-export-btn ${exporting && exportIntent === "manual" ? "button-busy" : ""}`.trim()}
+                      onClick={handleExportMeeting}
+                      disabled={!meetingId || exporting}
+                      aria-busy={exporting && exportIntent === "manual"}
+                    >
+                      {exporting ? "Exporting…" : "Export Meeting"}
                     </button>
+                  </div>
+                  {chapterSnapshot && (
+                    <div>
+                      <strong>Chapters</strong>
+                      {chapters.length === 0 ? (
+                        <p className="muted">No chapters extracted.</p>
+                      ) : (
+                        <ul className="notes-list">
+                          {chapters.map((chapter, index) => (
+                            <li key={`chapter-${index}`}>
+                              <div className="note-meta">
+                                <span>{formatRange(Number(chapter.time_start ?? 0), Number(chapter.time_end ?? 0))}</span>
+                                <span>{String(chapter.title ?? "Untitled chapter")}</span>
+                              </div>
+                              <div>{String(chapter.summary ?? "")}</div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                  {actionItemSnapshot && (
+                    <div>
+                      <strong>Action Items</strong>
+                      {actionItems.length === 0 ? (
+                        <p className="muted">No action items extracted.</p>
+                      ) : (
+                        <ul className="notes-list">
+                          {actionItems.map((item, index) => (
+                            <li key={`action-${index}`}>
+                              <div>{String(item.text ?? "")}</div>
+                              <div className="note-meta">
+                                <span>{item.assignee ? `assignee: ${String(item.assignee)}` : "unassigned"}</span>
+                                <span>{item.due ? `due: ${String(item.due)}` : "no due date"}</span>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                  {notes.length === 0 ? (
+                    <p className="muted">No saved notes yet. Use "Save to notes" on a summary panel.</p>
+                  ) : (
+                    <ul className="notes-list">
+                      {notes.map((n) => (
+                        <li key={n.id}>
+                          <div className="note-meta">
+                            <span>{n.source_type ?? "note"}</span>
+                            <span className="muted">
+                              {new Date(n.created_at).toLocaleTimeString()}
+                            </span>
+                          </div>
+                          <div>{n.content}</div>
+                        </li>
+                      ))}
+                    </ul>
                   )}
                 </div>
-                <label style={{ display: "inline-flex", alignItems: "center", gap: 8, marginTop: 10, fontSize: 12 }}>
-                  <input
-                    type="checkbox"
-                    checked={bilingualExport}
-                    onChange={(e) => setBilingualExport(e.target.checked)}
-                  />
-                  Bilingual transcript (original + translation)
-                </label>
-                {lastExport && (
-                  <p className="export-path">
-                    Latest export: <code>{lastExport.export_dir}</code>
-                  </p>
-                )}
-                {(exporting || actionFeedback) && exportIntent !== "restart" && (
-                  <p className={`action-feedback ${exporting ? "is-busy" : "is-success"}`}>
-                    {exporting ? "Preparing transcript, summary, and metadata…" : actionFeedback}
-                  </p>
-                )}
               </div>
-              <button
-                type="button"
-                className={`primary-export-btn ${exporting && exportIntent === "manual" ? "button-busy" : ""}`.trim()}
-                onClick={handleExportMeeting}
-                disabled={!meetingId || exporting}
-                aria-busy={exporting && exportIntent === "manual"}
-              >
-                {exporting ? "Exporting…" : "Export Meeting"}
-              </button>
-            </div>
-            {chapterSnapshot && (
-              <div>
-                <strong>Chapters</strong>
-                {chapters.length === 0 ? (
-                  <p className="muted">No chapters extracted.</p>
-                ) : (
-                  <ul className="notes-list">
-                    {chapters.map((chapter, index) => (
-                      <li key={`chapter-${index}`}>
-                        <div className="note-meta">
-                          <span>{formatRange(Number(chapter.time_start ?? 0), Number(chapter.time_end ?? 0))}</span>
-                          <span>{String(chapter.title ?? "Untitled chapter")}</span>
-                        </div>
-                        <div>{String(chapter.summary ?? "")}</div>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
-            {actionItemSnapshot && (
-              <div>
-                <strong>Action Items</strong>
-                {actionItems.length === 0 ? (
-                  <p className="muted">No action items extracted.</p>
-                ) : (
-                  <ul className="notes-list">
-                    {actionItems.map((item, index) => (
-                      <li key={`action-${index}`}>
-                        <div>{String(item.text ?? "")}</div>
-                        <div className="note-meta">
-                          <span>{item.assignee ? `assignee: ${String(item.assignee)}` : "unassigned"}</span>
-                          <span>{item.due ? `due: ${String(item.due)}` : "no due date"}</span>
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
-            {notes.length === 0 ? (
-              <p className="muted">No saved notes yet. Use "Save to notes" on a summary panel.</p>
-            ) : (
-              <ul className="notes-list">
-                {notes.map((n) => (
-                  <li key={n.id}>
-                    <div className="note-meta">
-                      <span>{n.source_type ?? "note"}</span>
-                      <span className="muted">
-                        {new Date(n.created_at).toLocaleTimeString()}
-                      </span>
-                    </div>
-                    <div>{n.content}</div>
-                  </li>
-                ))}
-              </ul>
             )}
           </div>
         </section>
       </main>
+
+      <div className="diagnostics-section">
+        <button
+          type="button"
+          className="diagnostics-toggle"
+          onClick={() => setDiagnosticsOpen((o) => !o)}
+          aria-expanded={diagnosticsOpen}
+          aria-controls="diagnostics-drawer"
+        >
+          <span className="diagnostics-toggle-label">System Health</span>
+          <span className={`health-badge health-${systemAdviceTone}`}>
+            {systemAdviceTone === "ok" ? "Healthy" : systemAdviceTone === "warn" ? "Check needed" : "Alert"}
+          </span>
+          {elapsedSeconds > 0 && (
+            <span className="diagnostics-toggle-elapsed">{formatElapsedSeconds(elapsedSeconds)}</span>
+          )}
+          <span className={`toggle-caret${diagnosticsOpen ? " open" : ""}`} aria-hidden="true">▼</span>
+        </button>
+        {diagnosticsOpen && (
+          <div id="diagnostics-drawer" className="diagnostics-drawer">
+            <div className="diagnostics-body">
+              <div className={`diagnostic-card advice-card advice-${systemAdviceTone}`}>
+                <span className="diagnostic-label">System Advice</span>
+                <div className="advice-list">
+                  {systemAdvice.map((item) => (
+                    <div key={`${item.title}-${item.detail}`} className={`advice-item advice-${item.severity}`}>
+                      <strong>{item.title}</strong>
+                      <span>{item.detail}</span>
+                      {item.action && <em>{item.action}</em>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Active Source</span>
+                <strong className="diagnostic-value">{formatSourceLabel(activeSource)}</strong>
+                <span className="diagnostic-note">
+                  {activeSource === "mixed"
+                    ? "capturing system audio and microphone"
+                    : activeSource === "loopback" || activeSource === "system"
+                      ? "capturing system output only"
+                      : "capturing microphone only"}
+                </span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Runtime Mode</span>
+                <strong className="diagnostic-value">{formatRuntimeProfileLabel(activeRuntimeProfile)}</strong>
+                <span className="diagnostic-note">
+                  chunk {formatLagSeconds(activeChunkSeconds)} · ASR window {formatLagSeconds(activeAccumSeconds)} · lock {languageLockEnabled ? "on" : "off"}
+                </span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Hardware Profile</span>
+                <strong className="diagnostic-value">{activeHardwareProfile}</strong>
+                <span className="diagnostic-note">{activeHardwareSummary}</span>
+                {computeGpuAvailable && !computeGpuConfigured && (
+                  <span className="diagnostic-note diagnostic-hint">GPU available but not assigned to ASR</span>
+                )}
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Compute Activity</span>
+                <strong className="diagnostic-value">{computeCpuActive || computeGpuActive ? "active" : "idle"}</strong>
+                <span className="diagnostic-note">{computeActivityLabel}</span>
+              </div>
+              <div className={`diagnostic-card delay-card delay-${resourcePressureLevel === "critical" ? "danger" : resourcePressureLevel === "pressure" ? "warn" : "ok"}`}>
+                <span className="diagnostic-label">Resource Governor</span>
+                <strong className="diagnostic-value">{resourcePressureLevel}</strong>
+                <span className="diagnostic-note">
+                  {resourceGovernorPolicy} ? skips {resourceGovernorSkips}
+                  {resourceGovernorReason ? ` ? ${resourceGovernorReason}` : ""}
+                </span>
+              </div>
+              <div className={`diagnostic-card gain-card gain-${mixedGainTone}`}>
+                <span className="diagnostic-label">Mixed Gain</span>
+                <strong className="diagnostic-value">{mixedGainRatio}</strong>
+                <span className="diagnostic-note">
+                  {activeSource === "mixed"
+                    ? `mic effective ${formatGain(mixedEffectiveMicGain)} · base ${formatGain(mixedMicGain)} · auto ${mixedAutoBalanceEnabled ? "on" : "off"}`
+                    : mixedGainHint}
+                </span>
+                {activeSource === "mixed" && (
+                  <span className="diagnostic-note diagnostic-hint">{mixedGainHint}</span>
+                )}
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Subtitles</span>
+                <strong className="diagnostic-value">{subtitleStatus}</strong>
+                <span className="diagnostic-note">{subtitleStatusDetail}</span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Audio Clock</span>
+                <strong className="diagnostic-value">{formatElapsedSeconds(audioClockSeconds)}</strong>
+                <span className="diagnostic-note">{elapsedSeconds > 0 ? "backend progress" : "frontend estimate"}</span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Committed Transcript</span>
+                <strong className="diagnostic-value">{formatElapsedSeconds(visibleTranscriptSeconds)}</strong>
+                <span className="diagnostic-note">{latestSegment ? `last committed · ${formatRange(latestSegment.start_time, latestSegment.end_time)}` : "waiting for committed text"}</span>
+              </div>
+              <div className={`diagnostic-card delay-card delay-${delayTone}`}>
+                <span className="diagnostic-label">Realtime Gap</span>
+                <strong className="diagnostic-value">{formatLagSeconds(transcriptLagSeconds)}</strong>
+                <span className="diagnostic-note">current audio clock minus latest visible transcript</span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Commit Delay</span>
+                <strong className="diagnostic-value">{formatLagSeconds(committedLagSeconds)}</strong>
+                <span className="diagnostic-note">
+                  {committedLagSeconds != null
+                    ? "reference only · commit time minus segment end"
+                    : "waiting for committed text"}
+                </span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Retry Summary</span>
+                <strong className="diagnostic-value">{retryTotal}</strong>
+                <span className="diagnostic-note">improved {retryImproved} · unchanged {retryUnchanged} · diverged {retryDiverged}</span>
+              </div>
+              <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : (asrRealtimeFactor != null && asrRealtimeFactor > 0.8 ? "warn" : "ok")}`}>
+                <span className="diagnostic-label">ASR Realtime</span>
+                <strong className="diagnostic-value">{formatRtf(asrRealtimeFactor)}</strong>
+                <span className="diagnostic-note">
+                  audio {formatLagSeconds(asrAudioSeconds)} · ASR {formatLagSeconds(asrWallSeconds)}
+                </span>
+              </div>
+              <div className={`diagnostic-card delay-card delay-${fastPreviewRtf != null && fastPreviewRtf > 0.8 ? "warn" : "ok"}`}>
+                <span className="diagnostic-label">Fast Preview</span>
+                <strong className="diagnostic-value">{fastPreviewEnabled ? formatRtf(fastPreviewRtf) : "off"}</strong>
+                <span className="diagnostic-note">
+                  emitted {fastPreviewEmitted} · skipped {fastPreviewSkipped}
+                </span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Preview Continued</span>
+                <strong className="diagnostic-value">{previewContinuedDuringFormal}</strong>
+                <span className="diagnostic-note">Qwen preview updates while formal text is pending</span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Preview Stale Suppressed</span>
+                <strong className="diagnostic-value">{previewStaleSuppressed}</strong>
+                <span className="diagnostic-note">previews dropped (covered by formal)</span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Preview Alignment</span>
+                <strong className="diagnostic-value">
+                  {previewAlignmentCompared > 0
+                    ? `${(previewAlignmentSimilarityAvg ?? 0).toFixed(2)} avg`
+                    : "—"}
+                </strong>
+                <span className="diagnostic-note">
+                  compared {previewAlignmentCompared} · last {previewAlignmentSimilarityLast != null ? previewAlignmentSimilarityLast.toFixed(2) : "—"}
+                </span>
+              </div>
+              <div className={`diagnostic-card delay-card delay-${previewUnconfirmedAfterFormal > 0 ? "warn" : "ok"}`}>
+                <span className="diagnostic-label">Preview Unconfirmed</span>
+                <strong className="diagnostic-value">{previewUnconfirmedAfterFormal}</strong>
+                <span className="diagnostic-note">
+                  {previewUnconfirmedLastText ? `last: ${previewUnconfirmedLastText}` : "no preview has been passed by formal without overlap"}
+                </span>
+              </div>
+              <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : "ok"}`}>
+                <span className="diagnostic-label">Realtime Safeguard</span>
+                <strong className="diagnostic-value">{asrSafeguardActive ? "active" : "clear"}</strong>
+                <span className="diagnostic-note">
+                  {asrSafeguardActive
+                    ? (sessionStats?.asr_safeguard_reason ?? "protecting realtime path")
+                    : `events ${asrSafeguardEvents}`}
+                </span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Weak Voice Rescue</span>
+                <strong className="diagnostic-value">{weakRescueAttempts}</strong>
+                <span className="diagnostic-note">
+                  emitted {weakRescueEmitted} · buffer {formatLagSeconds(weakRescueBufferSeconds)}
+                </span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Background Queue</span>
+                <strong className="diagnostic-value">{translationPendingCount + summaryPendingCount}</strong>
+                <span className="diagnostic-note">
+                  translations {translationPendingCount} · summaries {summaryPendingCount} · trims {translationTrimTotal}
+                </span>
+              </div>
+              <div className={`diagnostic-card delay-card delay-${audioInputBacklogSeconds >= 5 ? "warn" : "ok"}`}>
+                <span className="diagnostic-label">Audio Backlog</span>
+                <strong className="diagnostic-value">{formatLagSeconds(audioInputBacklogSeconds)}</strong>
+                <span className="diagnostic-note">input queue drops {audioInputQueueDropTotal}</span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Audio Drops</span>
+                <strong className="diagnostic-value">{audioDropTotal}</strong>
+                <span className="diagnostic-note">capture queue dropped chunks</span>
+              </div>
+              <div className="diagnostic-card">
+                <span className="diagnostic-label">Backpressure</span>
+                <strong className="diagnostic-value">{backpressureAgeSeconds != null ? "recent" : "clear"}</strong>
+                <span className="diagnostic-note">
+                  {backpressureAgeSeconds != null
+                    ? `last seen ${formatLagSeconds(backpressureAgeSeconds)} ago at ${formatElapsedSeconds(sessionStats?.last_backpressure_elapsed_seconds)}`
+                    : "no recent slow-ASR flush"}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
 
       {restartPromptOpen && (
         <div className="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="restart-dialog-title">

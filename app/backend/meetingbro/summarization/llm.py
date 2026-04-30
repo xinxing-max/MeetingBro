@@ -51,19 +51,21 @@ _PROMPTS = {
         "Be faithful to the provided context; do not invent content."
     ),
     "refined_transcript": (
-        "You are conservatively refining a live meeting transcript in {language}. "
+        "You are producing a clean conversation record for an ongoing meeting in {language}. "
         "You may receive evidence from both Whisper formal transcript segments and "
         "Qwen preview hints. Do NOT assume either engine is always better: decide "
         "case by case from timestamps, overlap, language consistency, surrounding "
         "context, and plausibility. If Qwen is more plausible for a local phrase, "
         "use it; if Whisper is more plausible, use Whisper; if they conflict and "
         "neither is clearly reliable, keep the safer wording and mark the issue "
-        "as low confidence. Never invent facts, speakers, decisions, names, or timestamps. "
-        "Preserve the meeting's mixed Chinese, English, and German content. Output "
-        "Markdown with exactly these headings: ## Refined Transcript and "
-        "## Possible Missing / Low Confidence. Under Refined Transcript, keep "
-        "timestamped transcript-style bullets. Under Possible Missing / Low Confidence, "
-        "list only uncertain gaps or write '- None noticed'."
+        "as uncertain. Never invent facts, speakers, decisions, names, or timestamps. "
+        "Preserve the meeting's mixed Chinese, English, and German content. This is "
+        "not a summary: keep it as a readable dialogue/transcript from the beginning "
+        "of the supplied conversation to the end. Output Markdown with exactly these "
+        "headings: ## Clean Conversation and ## Uncertain / Conflicts. Under "
+        "Clean Conversation, use chronological timestamped dialogue-style bullets. "
+        "Under Uncertain / Conflicts, list only uncertain gaps/conflicts or write "
+        "'- None noticed'."
     ),
 }
 
@@ -157,8 +159,8 @@ class LLMSummarizer(Summarizer):
                 previous_label = "Previous meeting memory"
                 new_label = "New transcript to fold into memory"
             elif kind == "refined_transcript":
-                previous_label = "Preview/Qwen alignment hints (secondary evidence)"
-                new_label = "Formal Whisper transcript to refine"
+                previous_label = "Cross-engine evidence and conflict notes"
+                new_label = "Raw ASR transcript to turn into a clean conversation record"
             else:
                 previous_label = "Compressed meeting memory / prior summary"
                 new_label = "Recent transcript tail"
@@ -175,7 +177,7 @@ class LLMSummarizer(Summarizer):
                 return self._compatible_client.chat(
                     system=system_prompt,
                     user=user_content,
-                    max_tokens=1000 if kind == "refined_transcript" else (900 if kind == "meeting_memory" else 600),
+                    max_tokens=1600 if kind == "refined_transcript" else (900 if kind == "meeting_memory" else 600),
                     temperature=0.2,
                 )
             elif provider == "anthropic":
