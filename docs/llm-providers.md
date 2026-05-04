@@ -217,6 +217,6 @@ MEETINGBRO_LLM_MODEL=bedrock/anthropic.claude-3-haiku-20240307-v1:0
 
 ## Privacy reminder
 
-Only the **text transcript** is sent to the LLM. Audio capture and Whisper transcription run entirely on your machine. No audio data is transmitted to any external service.
+Only the **text transcript** is sent to the LLM provider you configure. Audio capture and Whisper transcription run entirely on your machine. If you use a local LLM such as Ollama, no data leaves your device at all.
 
 To verify this, see [app/backend/meetingbro/llm/openai_compatible.py](../app/backend/meetingbro/llm/openai_compatible.py).

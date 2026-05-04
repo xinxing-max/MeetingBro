@@ -9,7 +9,7 @@ Thank you for your interest! Contributions of all kinds are welcome — bug fixe
 1. **Fork** the repository on GitHub.
 2. **Clone** your fork locally:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/MeetingBro.git
+   git clone https://github.com/armpro24-blip/MeetingBro.git
    cd MeetingBro
    ```
 3. Follow the [installation steps in README.md](README.md#step-by-step-installation).

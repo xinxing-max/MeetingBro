@@ -6,40 +6,60 @@ This document describes MeetingBro's technical architecture for contributors and
 
 ## High-level data flow
 
-```
-Audio source
-    │
-    ▼
-Audio capture (soundcard loopback / sounddevice mic)
-    │
-    ▼
-VAD (Silero) — filters non-speech frames
-    │
-    ▼
-Audio conditioning — normalizes RMS, peak limiting
-    │
-    ├──────────────────────────────┐
-    ▼                              ▼
-Formal ASR (Whisper)          Preview ASR (Qwen3 or tiny-Whisper)
-accurate, ~2–5s latency       fast subtitles, ~0.5–1s latency
-    │                              │
-    └──────────────┬───────────────┘
-                   ▼
-           Session Manager
-                   │
-          ┌────────┴────────┐
-          ▼                 ▼
-   Speaker diarization   Translation (LLM)
-   (energy-based)        zh ↔ en ↔ de
-          │                 │
-          └────────┬─────────┘
-                   ▼
-          Summarization (LLM)
-          ├── Rolling summary (3–5 min window)
-          └── Meeting Board (cumulative)
-                   │
-                   ▼
-          Storage (SQLite) + WebSocket → Frontend (Electron/React)
+```mermaid
+flowchart TD
+    MIC["🎤 Microphone\n(sounddevice)"]
+    SYS["🔊 System Audio\n(WASAPI loopback)"]
+
+    MIC --> CAP
+    SYS --> CAP
+
+    CAP["Audio Capture"]
+    CAP --> VAD
+
+    VAD["Voice Activity Detection\n(Silero VAD)"]
+    VAD --> COND
+
+    COND["Audio Conditioning\n(RMS normalize, peak limit)"]
+    COND --> FORMAL
+    COND --> PREVIEW
+
+    FORMAL["Formal ASR\n(Whisper small/medium)\n~2–5s latency"]
+    PREVIEW["Preview ASR\n(Qwen3 or tiny-Whisper)\n~0.5–1s latency"]
+
+    FORMAL --> SM
+    PREVIEW --> SM
+
+    SM["Session Manager"]
+    SM --> DIAR
+    SM --> TRANS
+    SM --> SUMM
+    SM --> WS
+
+    DIAR["Speaker Diarization\n(energy-based)"]
+    TRANS["Translation\n(LLM — optional)"]
+    SUMM["Summarization\n(LLM — optional)"]
+
+    DIAR --> DB
+    TRANS --> DB
+    SUMM --> DB
+
+    DB[("SQLite\ndata/meetingbro.db")]
+    DB --> EXPORT
+
+    WS["WebSocket"]
+    WS --> FE
+
+    FE["Frontend\n(Electron + React)"]
+    FE --> EXPORT
+
+    EXPORT["Export\nexports/*.md / .json"]
+
+    style MIC fill:#dbeafe,stroke:#3b82f6
+    style SYS fill:#dbeafe,stroke:#3b82f6
+    style FE fill:#dcfce7,stroke:#16a34a
+    style EXPORT fill:#fef9c3,stroke:#ca8a04
+    style DB fill:#f3e8ff,stroke:#9333ea
 ```
 
 ---
@@ -89,7 +109,7 @@ MeetingBro/
 │           ├── types.ts         # TypeScript type contracts
 │           └── session/
 │               └── useSessionSocket.ts  # WebSocket state hook
-├── data/                        # Sample audio, SQLite DB (gitignored)
+├── data/                        # Sample audio (sample_en.wav), SQLite DB (gitignored)
 ├── docs/                        # Documentation
 ├── exports/                     # Meeting export output (gitignored)
 ├── models/                      # ML models (gitignored)
@@ -106,7 +126,7 @@ The backend is a Python FastAPI application. It exposes:
 - **REST endpoints** for creating meetings, exporting, and fetching history
 - **WebSocket endpoint** (`/ws/session/{meeting_id}`) for live session data
 
-The WebSocket protocol:
+### WebSocket protocol
 
 **Backend → Frontend events:**
 
@@ -133,12 +153,14 @@ The WebSocket protocol:
 MeetingBro runs two ASR paths in parallel to balance latency and accuracy:
 
 **Preview ASR** (fast subtitles):
+
 - Model: Qwen3 0.6B int8 (via sherpa-onnx) or tiny-Whisper
 - Latency: ~0.5–1.0 seconds
 - Use: displayed immediately as live subtitles
 - Configurable via `MEETINGBRO_PREVIEW_ASR_BACKEND`
 
 **Formal ASR** (accurate):
+
 - Model: Whisper (small, medium, or auto-selected)
 - Latency: ~2–5 seconds
 - Use: replaces preview text with higher-accuracy result
@@ -151,12 +173,14 @@ Both paths share the same audio buffer but operate on independent worker threads
 ## Two live summary layers
 
 **Rolling Summary:**
+
 - Generated every 60–90 seconds
 - Covers the most recent 3–5 minutes of transcript
 - Answers "what did I just miss?"
 - Stored as `summary_type = "rolling_summary"` in the database
 
 **Meeting Board (cumulative summary):**
+
 - Generated every 3–5 minutes
 - Covers the entire meeting from start to now
 - Structured: topics → decisions → action items → open questions

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  backend:
+    name: Backend — import check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system audio dependencies
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev
+
+      - name: Install backend
+        run: pip install -e "app/backend"
+
+      - name: Verify meetingbro import
+        run: python -c "import meetingbro; print('meetingbro import ok')"
+
+      - name: Run dependency check
+        run: |
+          if [ -f scripts/dep_check.py ]; then
+            python scripts/dep_check.py
+          else
+            echo "dep_check.py not found, skipping"
+          fi
+
+      - name: Run tests (if any exist)
+        run: |
+          if find tests/ -name "*.py" | grep -q .; then
+            pip install pytest
+            pytest tests/
+          else
+            echo "No tests found in tests/, skipping pytest"
+          fi

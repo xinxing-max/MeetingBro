@@ -10,9 +10,9 @@ MeetingBro processes audio in real time but does not save audio recordings. The 
 
 ### Does any of my audio or transcript leave my computer?
 
-**Audio: never.** Audio capture and Whisper transcription happen entirely on your machine.
+**Audio:** Audio capture and Whisper transcription run entirely on your machine. Audio data is not sent to any external service.
 
-**Transcript text:** only if you configure an LLM API (for summaries and translation). In that case, the text transcript is sent to the LLM provider you choose. If you use Ollama (local LLM), nothing leaves your machine at all.
+**Transcript text:** only if you configure a cloud LLM API (for summaries and translation). In that case, the text transcript is sent to the LLM provider you choose. If you use a local LLM such as Ollama, nothing leaves your machine at all.
 
 See [docs/llm-providers.md](llm-providers.md) for privacy details per provider.
 

@@ -1,12 +1,13 @@
 # MeetingBro
 
-**An open-source, local-first AI meeting assistant.**
+**Open-source local-first AI meeting assistant for live transcription, translation, and meeting summaries.**
 
 MeetingBro listens to your meetings, transcribes speech in real time, translates between languages, and generates live summaries — all without requiring any platform plugin or integration.
 
 It works with Zoom, Teams, Google Meet, BBB, and any other platform, because it captures audio directly from your computer rather than connecting to a meeting API.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/armpro24-blip/MeetingBro/actions/workflows/ci.yml/badge.svg)](https://github.com/armpro24-blip/MeetingBro/actions/workflows/ci.yml)
 
 ---
 
@@ -51,7 +52,7 @@ It works with Zoom, Teams, Google Meet, BBB, and any other platform, because it 
 - On **macOS and Linux**, microphone capture works but system audio capture is not yet supported. You can still use MeetingBro for in-person meetings or with a virtual audio cable.
 - **Whisper models download automatically on first run.** The `small` model is about 460 MB. This happens once and is saved to your disk.
 - **The Qwen3 preview model is optional** (about 700 MB). It makes subtitles appear faster. You can skip it and use Whisper-only mode.
-- **An LLM API key is optional.** Without one, transcription still works perfectly. You only need a key for AI-generated summaries and translation. A free-tier key from Groq or OpenRouter is enough to get started.
+- **An LLM API key is optional.** Without one, transcription still works perfectly. You only need a key for AI-generated summaries and translation. Some providers such as Groq or OpenRouter may offer a free tier — check their current pricing pages.
 
 ---
 
@@ -61,7 +62,7 @@ This is the shortest path to a working session. See [Step-by-step installation](
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/MeetingBro.git
+git clone https://github.com/armpro24-blip/MeetingBro.git
 cd MeetingBro
 
 # 2. Create a Python environment
@@ -116,7 +117,7 @@ The Electron window opens. Select your audio device and click **Start Session**.
 ### Step 1 — Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/MeetingBro.git
+git clone https://github.com/armpro24-blip/MeetingBro.git
 cd MeetingBro
 ```
 
@@ -137,6 +138,7 @@ pip install -e "."
 ```
 
 **Windows only** — also install the system audio loopback library:
+
 ```bash
 pip install "soundcard>=0.4"
 ```
@@ -144,6 +146,7 @@ pip install "soundcard>=0.4"
 This lets MeetingBro capture audio from Zoom, Teams, and other apps without any plugin.
 
 Go back to the project root:
+
 ```bash
 cd ../..
 ```
@@ -151,6 +154,7 @@ cd ../..
 ### Step 4 — Configure
 
 Copy the configuration template:
+
 ```bash
 cp .env.example .env       # macOS / Linux
 copy .env.example .env     # Windows Command Prompt
@@ -174,6 +178,7 @@ sherpa_onnx.download_model('sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25', dest='m
 The model is about 700 MB and downloads once.
 
 To skip this step and use Whisper-only preview instead, add this to your `.env`:
+
 ```env
 MEETINGBRO_PREVIEW_ASR_BACKEND=whisper
 ```
@@ -191,6 +196,7 @@ cd ../..
 ## LLM setup for AI summaries
 
 MeetingBro uses an **optional** cloud or local LLM for:
+
 - AI meeting summaries (Rolling Summary and Meeting Board)
 - Translation between Chinese, English, and German
 
@@ -204,11 +210,11 @@ MEETINGBRO_LLM_BASE_URL=https://api.openai.com/v1
 MEETINGBRO_LLM_MODEL=gpt-4o-mini
 ```
 
-Supported providers include **OpenAI, Groq, Mistral AI, OpenRouter, Together AI**, and **Ollama** (fully local — no key, no data sent anywhere).
+Supported providers include **OpenAI, Groq, Mistral AI, OpenRouter, Together AI**, and **Ollama** (fully local — no key, no data sent outside your machine).
 
-→ **See [docs/llm-providers.md](docs/llm-providers.md) for full setup instructions for each provider, including how to get a free key.**
+→ **See [docs/llm-providers.md](docs/llm-providers.md) for full setup instructions for each provider.**
 
-> **Privacy note:** Only the text transcript is sent to the LLM. Audio capture and Whisper transcription run entirely on your machine. No audio is ever transmitted.
+> **Privacy note:** Only the text transcript is sent to the LLM provider you configure. Audio capture and Whisper transcription run entirely on your machine. If you use a local LLM such as Ollama, no data leaves your device at all.
 
 ---
 
@@ -225,6 +231,7 @@ meetingbro-backend
 ```
 
 You should see output like:
+
 ```
 INFO:     Started server process
 INFO:     Uvicorn running on http://127.0.0.1:8000
@@ -275,6 +282,7 @@ Audio source (mic or system audio)
 ```
 
 Two audio capture modes:
+
 - **Online mode** (Windows): captures system audio — works with any meeting platform
 - **Offline mode** (all platforms): captures microphone — works for in-person meetings
 
@@ -287,6 +295,7 @@ See [docs/architecture.md](docs/architecture.md) for a full technical overview.
 Common issues and solutions are in **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 
 Quick checks:
+
 1. Run `python scripts/dep_check.py` to verify all dependencies are installed.
 2. Run `python scripts/list_audio_devices.py` to see available audio devices.
 3. Make sure the backend is running before starting the frontend.
@@ -322,13 +331,22 @@ See **[CONTRIBUTING.md](CONTRIBUTING.md)** for how to set up a development envir
 | Document | Contents |
 |---|---|
 | [README.md](README.md) | This file — overview and quick start |
-| [docs/llm-providers.md](docs/llm-providers.md) | How to get and configure an LLM API key |
+| [docs/llm-providers.md](docs/llm-providers.md) | How to configure an LLM API key |
 | [docs/platform-support.md](docs/platform-support.md) | OS-specific audio setup |
 | [docs/architecture.md](docs/architecture.md) | Technical architecture and component overview |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common problems and solutions |
 | [docs/faq.md](docs/faq.md) | Frequently asked questions |
+| [docs/roadmap.md](docs/roadmap.md) | Development roadmap |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and contribution guide |
-| [agent.md](agent.md) | Product and engineering principles (for contributors) |
+| [docs/product-principles.md](docs/product-principles.md) | Product and engineering principles |
+
+---
+
+## Suggested GitHub topics
+
+Add these topics to the repository on GitHub for discoverability:
+
+`meeting-assistant` `speech-to-text` `transcription` `whisper` `local-ai` `electron` `fastapi` `python` `multilingual` `privacy`
 
 ---
 
