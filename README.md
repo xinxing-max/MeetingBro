@@ -76,7 +76,14 @@ pip install "soundcard>=0.4"   # Windows only — skip on macOS/Linux
 cd ../..
 
 # 4. Copy the config template
-cp .env.example .env           # On Windows: copy .env.example .env
+# macOS / Linux
+cp .env.example .env
+
+# Windows (PowerShell)
+Copy-Item .env.example .env
+
+# Windows (Command Prompt)
+copy .env.example .env
 
 # 5. Install the frontend
 cd app/frontend
@@ -156,8 +163,14 @@ cd ../..
 Copy the configuration template:
 
 ```bash
-cp .env.example .env       # macOS / Linux
-copy .env.example .env     # Windows Command Prompt
+# macOS / Linux
+cp .env.example .env
+
+# Windows (PowerShell)
+Copy-Item .env.example .env
+
+# Windows (Command Prompt)
+copy .env.example .env
 ```
 
 Open `.env` in any text editor. The defaults work without changes, but if you want AI summaries, add your LLM key (see [LLM setup](#llm-setup-for-ai-summaries) below).
@@ -170,20 +183,13 @@ This step is optional but recommended. The Qwen3 model makes live subtitles appe
 pip install sherpa-onnx
 pip install huggingface_hub
 
-huggingface-cli download csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25 \
-    --local-dir models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25
+huggingface-cli download csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25 --local-dir models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25
 ```
 
 If `huggingface-cli` is not on your PATH, use:
 
 ```bash
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-        repo_id='csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25',
-        local_dir='models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25',
-)
-"
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25', local_dir='models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25')"
 ```
 
 The model is about 700 MB and downloads once.

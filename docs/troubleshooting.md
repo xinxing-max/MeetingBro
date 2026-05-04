@@ -192,20 +192,13 @@ If the directory is missing, re-run the download:
 
 ```bash
 pip install huggingface_hub
-huggingface-cli download csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25 \
-  --local-dir models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25
+huggingface-cli download csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25 --local-dir models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25
 ```
 
 If `huggingface-cli` is not on your PATH, use:
 
 ```bash
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id='csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25',
-    local_dir='models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25',
-)
-"
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25', local_dir='models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25')"
 ```
 
 **To disable Qwen3 and fall back to Whisper preview:**
@@ -233,8 +226,11 @@ MEETINGBRO_LLM_MODEL=gpt-4o-mini
 **Test that the API is reachable:**
 
 ```bash
-curl https://api.openai.com/v1/models \
-  -H "Authorization: Bearer your_actual_key"
+# macOS / Linux
+curl https://api.openai.com/v1/models -H "Authorization: Bearer your_actual_key"
+
+# Windows PowerShell / Command Prompt
+curl.exe https://api.openai.com/v1/models -H "Authorization: Bearer your_actual_key"
 ```
 
 If you see a JSON response, the key works. If you see `Unauthorized`, the key is wrong or expired.
