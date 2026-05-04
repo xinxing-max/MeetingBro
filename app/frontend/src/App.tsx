@@ -158,14 +158,11 @@ function formatLanguageLabel(language: "zh" | "en" | "de" | null | undefined): s
 
 function formatRuntimeProfileLabel(profile: string | null | undefined): string {
   switch (profile) {
-    case "low_latency":
-      return "Low Latency";
+    case "summary_only":
+      return "Summary Only";
+    case "performance":
     case "robust":
-      return "Robust Meeting";
-    case "multilingual":
-      return "Multilingual";
-    case "single_language":
-      return "Single Language";
+      return "Performance";
     case "balanced":
       return "Balanced";
     default:
@@ -361,7 +358,7 @@ export default function App() {
   const [exportIntent, setExportIntent] = useState<"manual" | "restart" | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [bookmarkFeedback, setBookmarkFeedback] = useState<string | null>(null);
-  const [refreshingSummary, setRefreshingSummary] = useState<"rolling_summary" | "cumulative_meeting_summary" | null>(null);
+  const [refreshingSummary, setRefreshingSummary] = useState<"rolling_summary" | "cumulative_meeting_summary" | "refined_transcript" | null>(null);
   const [refreshBaselineId, setRefreshBaselineId] = useState<string | null>(null);
   const [bilingualExport, setBilingualExport] = useState(false);
   const [restartPromptOpen, setRestartPromptOpen] = useState(false);
@@ -566,6 +563,7 @@ export default function App() {
   const resourceGovernorReason = sessionStats?.resource_governor_reason ?? null;
   const resourceGovernorSkips = sessionStats?.resource_governor_skips ?? 0;
   const activeRuntimeProfile = sessionStats?.runtime_profile ?? runtimeProfile;
+  const summaryOnlyMode = activeRuntimeProfile === "summary_only";
   const activeHardwareProfile = sessionStats?.hardware_profile ?? "auto";
   const activeHardwareSummary = sessionStats?.hardware_summary ?? "detecting local CPU/GPU profile";
   const computeCpuActive = sessionStats?.compute_cpu_active ?? false;
@@ -636,7 +634,7 @@ export default function App() {
       ? `mic ${formatGain(mixedEffectiveMicGain)} vs system ${formatGain(mixedSystemGain)}`
       : "—";
   const mixedGainHint = getMixedGainHint(mixedGainTone, activeSource);
-  const activeSubtitleLanguage: "zh" | "en" | "de" | null = subtitleLanguage === "off"
+  const activeSubtitleLanguage: "zh" | "en" | "de" | null = summaryOnlyMode || subtitleLanguage === "off"
     ? null
     : ((sessionStats?.live_translation_language ?? subtitleLanguage) as "zh" | "en" | "de");
   const visibleSubtitleRevision = useMemo(() => {
@@ -701,7 +699,7 @@ export default function App() {
         severity: "warn",
         title: "ASR is currently busy",
         detail: lastError ?? "The backend is still processing the current audio window.",
-        action: "Use Low Latency mode, switch to a smaller Whisper model, or turn subtitles off if lag continues.",
+        action: "Use Summary Only mode, switch to a smaller Whisper model, or turn subtitles off if lag continues.",
       });
     } else if (asrSafeguardActive || rtf >= 1.0 || backpressureAgeSeconds != null) {
       advice.push({
@@ -710,14 +708,14 @@ export default function App() {
         detail: asrSafeguardActive
           ? (sessionStats?.asr_safeguard_reason ?? "The backend activated realtime protection.")
           : `Last ASR realtime factor is ${formatRtf(asrRealtimeFactor)}.`,
-        action: "Use Low Latency mode, switch to a smaller Whisper model, turn subtitles off, or disable Fast Preview.",
+        action: "Use Summary Only mode, switch to a smaller Whisper model, or turn subtitles off if lag continues.",
       });
-    } else if (realtimeGap >= 4.0 && activeRuntimeProfile !== "low_latency") {
+    } else if (realtimeGap >= 4.0 && activeRuntimeProfile !== "summary_only") {
       advice.push({
         severity: "warn",
         title: "Transcript is lagging the audio",
         detail: `Latest visible transcript is ${formatLagSeconds(realtimeGap)} behind the audio clock.`,
-        action: "Try Low Latency mode if you prefer faster live captions over larger context.",
+        action: "Try Summary Only mode if you can trade live captions for lower device load.",
       });
     }
 
@@ -726,7 +724,7 @@ export default function App() {
         severity: weakRescueEmitted > 0 ? "warn" : "ok",
         title: "Quiet speech detected",
         detail: `Weak voice rescue attempted ${weakRescueAttempts} time(s), emitted ${weakRescueEmitted}.`,
-        action: "Increase speaker volume, move closer to the microphone, or use Robust Meeting mode.",
+        action: "Increase speaker volume, move closer to the microphone, or use Performance mode.",
       });
     }
 
@@ -744,7 +742,7 @@ export default function App() {
         severity: translationTrimTotal > 0 ? "warn" : "ok",
         title: "Subtitle translation is busy",
         detail: `Pending translations ${translationPendingCount}, trims ${translationTrimTotal}.`,
-        action: "If transcript latency matters more, turn subtitles off during the meeting.",
+        action: "If the machine is struggling, turn subtitles off or use Summary Only mode.",
       });
     }
 
@@ -762,7 +760,7 @@ export default function App() {
         severity: audioInputBacklogSeconds >= 5.0 || audioInputQueueDropTotal > 0 ? "warn" : "ok",
         title: "Audio input is buffered",
         detail: `Backlog ${formatLagSeconds(audioInputBacklogSeconds)}, queue drops ${audioInputQueueDropTotal}.`,
-        action: "Use Low Latency mode, a smaller Whisper model, or disable Fast Preview until backlog stays near 0s.",
+        action: "Use Summary Only mode or a smaller Whisper model until backlog stays near 0s.",
       });
     }
 
@@ -775,16 +773,12 @@ export default function App() {
       });
     }
 
-    if (
-      speechLanguage === "auto" &&
-      recentSpeechLanguages.size >= 2 &&
-      (languageLockEnabled || activeRuntimeProfile === "single_language")
-    ) {
+    if (speechLanguage !== "auto" && recentSpeechLanguages.size >= 2) {
       advice.push({
         severity: "warn",
         title: "Multiple speech languages detected",
         detail: `Recent transcript contains ${Array.from(recentSpeechLanguages).join(", ")}.`,
-        action: "Use Multilingual mode so language detection stays unlocked.",
+        action: "Set Speech to Auto if the meeting is switching languages.",
       });
     }
 
@@ -794,7 +788,7 @@ export default function App() {
         title: "Realtime path looks healthy",
         detail: "No stability, latency, or accuracy warnings are active.",
         action: activeRuntimeProfile === "balanced"
-          ? "Keep Balanced mode unless you need lower latency or extra robustness."
+          ? "Keep Balanced mode unless you need lower load or stronger accuracy bias."
           : `Current mode: ${formatRuntimeProfileLabel(activeRuntimeProfile)}.`,
       });
     }
@@ -923,7 +917,7 @@ export default function App() {
     source: activeSource,
     runtime_profile: activeRuntimeProfile,
     summary_language: summaryLanguage,
-    subtitle_language: subtitleLanguage,
+    subtitle_language: summaryOnlyMode ? "off" : subtitleLanguage,
     export_dir: exportRoot.trim() || undefined,
     bilingual: bilingualExport,
     target_language: bilingualExport ? ((summaryLanguage === "zh" || summaryLanguage === "en" || summaryLanguage === "de") ? summaryLanguage : undefined) : undefined,
@@ -958,8 +952,9 @@ export default function App() {
 
   const handleRuntimeProfileChange = (value: string) => {
     setRuntimeProfile(value);
-    if (value === "multilingual") {
-      setSpeechLanguage("auto");
+    if (value === "summary_only") {
+      setSubtitleLanguage("off");
+      setActiveTab("summary");
     }
   };
 
@@ -1015,7 +1010,7 @@ export default function App() {
         : `Bookmark saved at ${formatElapsedSeconds(audioClockSeconds ?? elapsedSeconds)}`,
     );
   };
-  const handleRefreshSummary = (summaryType: "rolling_summary" | "cumulative_meeting_summary") => {
+  const handleRefreshSummary = (summaryType: "rolling_summary" | "cumulative_meeting_summary" | "refined_transcript") => {
     setRefreshBaselineId(latestByType[summaryType]?.id ?? null);
     setRefreshingSummary(summaryType);
     requestSummary(summaryType);
@@ -1073,10 +1068,8 @@ export default function App() {
               <span>Mode</span>
               <select value={runtimeProfile} onChange={(e) => handleRuntimeProfileChange(e.target.value)}>
                 <option value="balanced">Balanced</option>
-                <option value="low_latency">Low latency</option>
-                <option value="robust">Robust</option>
-                <option value="multilingual">Multilingual</option>
-                <option value="single_language">Single language</option>
+                <option value="performance">Performance</option>
+                <option value="summary_only">Summary only</option>
               </select>
             </label>
             <label className="control-pill">
@@ -1098,7 +1091,7 @@ export default function App() {
             </label>
             <label className="control-pill">
               <span>Captions</span>
-              <select value={subtitleLanguage} onChange={(e) => setSubtitleLanguage(e.target.value)}>
+              <select value={summaryOnlyMode ? "off" : subtitleLanguage} onChange={(e) => setSubtitleLanguage(e.target.value)} disabled={summaryOnlyMode}>
                 <option value="off">Off</option>
                 <option value="en">English</option>
                 <option value="zh">Chinese</option>
@@ -1173,7 +1166,51 @@ export default function App() {
       </section>
 
       <main className="grid">
-        <section className="panel transcript">
+        {summaryOnlyMode ? (
+          <section className="panel transcript summary-only-panel">
+            <header>
+              <div>
+                <h2>
+                  Summary Only
+                  {state === "running" && <span className="live-dot" aria-label="recording" />}
+                </h2>
+                <p className="subtitle">capturing in background · no live captions</p>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <button type="button" className="secondary-action-btn" onClick={handleBookmark} disabled={!connected || state !== "running"}>
+                  Bookmark
+                </button>
+                <div className="range">{segments.length} segments</div>
+              </div>
+            </header>
+            <div className="panel-body summary-only-body">
+              <div className="summary-only-banner">
+                <strong>Realtime captions are intentionally hidden in this mode.</strong>
+                <p>
+                  MeetingBro is still listening and collecting transcript segments, then updating Summary, Clean Notes,
+                  and Board on their own cadence.
+                </p>
+              </div>
+              <div className="summary-only-stats">
+                <div className="summary-only-stat">
+                  <span>Captured</span>
+                  <strong>{segments.length} segments</strong>
+                </div>
+                <div className="summary-only-stat">
+                  <span>Elapsed</span>
+                  <strong>{formatElapsedSeconds(audioClockSeconds ?? elapsedSeconds)}</strong>
+                </div>
+                <div className="summary-only-stat">
+                  <span>Latest summary</span>
+                  <strong>{rolling?.created_at ? formatCreatedAt(rolling.created_at) : "waiting"}</strong>
+                </div>
+              </div>
+              <p className="muted summary-only-tip">
+                Tip: use the Refresh button in Summary or Clean Notes if you want an immediate update.
+              </p>
+            </div>
+          </section>
+        ) : <section className="panel transcript">
           <header>
             <div>
               <h2>
@@ -1345,7 +1382,7 @@ export default function App() {
               </button>
             )}
           </div>
-        </section>
+        </section>}
 
         <section className="panel workspace">
           <div className="workspace-tabs" role="tablist">
@@ -1412,6 +1449,9 @@ export default function App() {
                 sessionStartedAt={sessionStartedAt}
                 accent="#7c3aed"
                 onSaveToNotes={handleSaveToNotes}
+                onRefresh={() => handleRefreshSummary("refined_transcript")}
+                refreshDisabled={!connected || state !== "running" || segments.length === 0}
+                refreshBusy={refreshingSummary === "refined_transcript"}
               />
             )}
             {activeTab === "board" && (

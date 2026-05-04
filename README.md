@@ -20,7 +20,7 @@ It works with Zoom, Teams, Google Meet, BBB, and any other platform, because it 
 | Feature | Details |
 |---|---|
 | **Live transcription** | Real-time speech-to-text using Whisper, running locally on your machine |
-| **Live subtitles** | Fast preview subtitles with ultra-low latency (Qwen3 or tiny-Whisper) |
+| **Live subtitles** | Optional translated subtitles for Chinese, English, and German |
 | **Live translation** | Automatic translation between Chinese, English, and German |
 | **Rolling summary** | AI-generated summary of the last 3–5 minutes, refreshes automatically |
 | **Meeting Board** | Cumulative overview: topics, decisions, action items, open questions |
@@ -51,7 +51,9 @@ It works with Zoom, Teams, Google Meet, BBB, and any other platform, because it 
 - **Windows is the easiest platform** right now. On Windows, MeetingBro can capture system audio (everything your speakers play), so it works with any meeting platform automatically.
 - On **macOS and Linux**, microphone capture works but system audio capture is not yet supported. You can still use MeetingBro for in-person meetings or with a virtual audio cable.
 - **Whisper models download automatically on first run.** The `small` model is about 460 MB. This happens once and is saved to your disk.
-- **The Qwen3 preview model is optional** (about 700 MB). It makes subtitles appear faster. You can skip it and use Whisper-only mode.
+- **MeetingBro has three runtime modes**: `Summary only` for weaker devices, `Balanced` for most laptops/desktops, and `Performance` for stronger machines that can trade more compute for more aggressive realtime behavior.
+- **Speech language is separate from runtime mode.** Set `Speech = Auto` for mixed-language meetings; set a specific speech language when the meeting stays in one language and you want tighter recognition.
+- **The Qwen3 preview model is optional advanced setup** (about 700 MB). Most users should start without it. It is only useful if you explicitly want a separate fast-preview lane on stronger machines.
 - **An LLM API key is optional.** Without one, transcription still works perfectly. You only need a key for AI-generated summaries and translation. Some providers such as Groq or OpenRouter may offer a free tier — check their current pricing pages.
 
 ---
@@ -107,6 +109,27 @@ npm run dev
 ```
 
 The Electron window opens. Select your audio device and click **Start Session**.
+
+### Choose the right mode first
+
+MeetingBro is easier to use if you pick a runtime mode based on your machine instead of turning random switches on and off.
+
+| Mode | Best for | What it does |
+|---|---|---|
+| **Summary only** | Lower-end or older machines | Hides live transcript, minimizes realtime work, keeps transcript processing focused on generating summaries and final notes |
+| **Balanced** | Most users | Best default tradeoff between responsiveness, transcript quality, subtitles, and summaries |
+| **Performance** | Stronger CPUs/GPUs, mostly English meetings | Uses a more aggressive, quality-biased realtime configuration and expects more available compute |
+
+Recommended starting point:
+
+- If your machine struggles or the transcript falls behind, start with **Summary only**.
+- If your machine is average and you want the normal MeetingBro experience, use **Balanced**.
+- If your machine is strong and you want the most aggressive live behavior, try **Performance**.
+
+Language choice is separate:
+
+- Set **Speech = Auto** for multilingual meetings.
+- Set **Speech = English / Chinese / German** for mostly single-language meetings.
 
 ---
 
@@ -175,9 +198,9 @@ copy .env.example .env
 
 Open `.env` in any text editor. The defaults work without changes, but if you want AI summaries, add your LLM key (see [LLM setup](#llm-setup-for-ai-summaries) below).
 
-### Step 5 — (Recommended) Download the Qwen3 preview model
+### Step 5 — (Optional advanced) Download the Qwen3 preview model
 
-This step is optional but recommended. The Qwen3 model makes live subtitles appear faster.
+This step is optional and not required for normal use. Start without it unless you are specifically testing the dedicated fast-preview path on a stronger machine.
 
 ```bash
 pip install sherpa-onnx
@@ -194,7 +217,7 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download(repo
 
 The model is about 700 MB and downloads once.
 
-To skip this step and use Whisper-only preview instead, add this to your `.env`:
+If you do not want the extra preview model, skip this step. To force the preview lane back to Whisper-only behavior, add this to your `.env`:
 
 ```env
 MEETINGBRO_PREVIEW_ASR_BACKEND=whisper
@@ -279,6 +302,12 @@ Before starting a session, verify:
 
 Click **Start Session** and speak a few words. You should see text appear in the transcript panel within a few seconds.
 
+Before your first real meeting, choose a mode that matches your device:
+
+- **Summary only** if you care more about final notes than live transcript.
+- **Balanced** if you want the standard experience.
+- **Performance** if your machine is strong and you want the heaviest realtime setup.
+
 If the Whisper model hasn't been used before, the first transcription may take 10–30 seconds while the model loads. Subsequent transcriptions are faster.
 
 ---
@@ -290,13 +319,16 @@ MeetingBro captures audio from your computer and processes it through a local pi
 ```
 Audio source (mic or system audio)
     ↓ Voice Activity Detection (VAD)
-    ↓ Whisper ASR  ←→  Qwen3 preview (fast subtitles)
+    ↓ Whisper ASR
+    ↓ Optional preview lane (advanced setups only)
     ↓ Speaker diarization (optional)
     ↓ Translation (optional, via LLM)
     ↓ Summarization (optional, via LLM)
     ↓ Live UI (transcript + summaries)
     ↓ Export (Markdown files)
 ```
+
+In the default setup, Whisper is the main engine. The optional Qwen3 preview path is no longer the normal recommendation for average devices.
 
 Two audio capture modes:
 

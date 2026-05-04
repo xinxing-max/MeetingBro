@@ -193,6 +193,7 @@ class _State:
     meeting_id: str
     segments: list[TranscriptSegment] = field(default_factory=list)
     last_rolling_at: float = 0.0
+    latest_rolling_text: Optional[str] = None
     last_memory_at: float = 0.0
     last_cumulative_at: float = 0.0
     last_refinement_at: float = 0.0
@@ -547,6 +548,57 @@ class SessionManager:
 
         if runtime_changed or translation_changed:
             asyncio.create_task(self._emit("session_state", self._session_state_payload(state=self._active_state_name())))
+
+    def update_preview_runtime(
+        self,
+        *,
+        preview_asr: Optional[ASRAdapter],
+        preview_asr_backend_name: str,
+        preview_asr_device: Optional[str],
+        preview_asr_fallback_on_error: bool,
+    ) -> None:
+        lane_changed = (
+            self._cfg.preview_asr is not preview_asr
+            or self._cfg.preview_asr_backend_name != preview_asr_backend_name
+            or self._cfg.preview_asr_device != preview_asr_device
+            or self._cfg.preview_asr_fallback_on_error != preview_asr_fallback_on_error
+        )
+        if not lane_changed:
+            return
+
+        previous_executor = self._preview_asr_executor
+        self._cfg.preview_asr = preview_asr
+        self._cfg.preview_asr_backend_name = preview_asr_backend_name
+        self._cfg.preview_asr_device = preview_asr_device
+        self._cfg.preview_asr_fallback_on_error = preview_asr_fallback_on_error
+        self._preview_asr_disabled = False
+        self._state.fast_preview_segment = None
+        self._clear_preview_candidate()
+
+        if preview_asr is not None:
+            self._preview_asr_executor = ThreadPoolExecutor(
+                max_workers=max(1, self._cfg.preview_asr_executor_workers),
+                thread_name_prefix="meetingbro-preview-asr",
+            )
+        else:
+            self._preview_asr_executor = None
+
+        if previous_executor is not None:
+            previous_executor.shutdown(wait=False, cancel_futures=True)
+
+        logger.info(
+            "updated preview runtime backend=%s dedicated=%s device=%s meeting_id=%s",
+            self._cfg.preview_asr_backend_name,
+            self._cfg.preview_asr is not None,
+            self._cfg.preview_asr_device or "cpu",
+            self._state.meeting_id,
+        )
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        asyncio.create_task(self._emit_transcript_preview())
+        asyncio.create_task(self._emit("session_state", self._session_state_payload(state=self._active_state_name())))
 
     def update_audio_source(
         self,
@@ -3333,6 +3385,8 @@ class SessionManager:
         quality_note = "experimental_fast_preview" if is_experimental else None
         # Resolve which segment to show (explicit argument beats state lookup).
         resolved = segment if segment is not None else self._latest_preview_segment()
+        if self._cfg.runtime_profile == "summary_only":
+            resolved = None
         # Stale-preview suppression: if the segment's time range is already fully
         # covered by the committed formal transcript, suppress it and emit null.
         if resolved is not None and self._state.last_emitted_end_time is not None:
@@ -3523,7 +3577,14 @@ class SessionManager:
         return snap
 
     async def _maybe_emit_rolling(self) -> None:
+        now = self._state.elapsed_seconds
+        overdue = (now - self._state.last_rolling_at) >= (self._cfg.rolling_interval_seconds * 2.0)
         if not self._governor_allows_background("rolling"):
+            # Keep summary-only mode responsive: if rolling has been stale for too
+            # long, allow one catch-up refresh even under pressure.
+            if overdue:
+                await self._emit_rolling(force=True)
+                return
             self._governor_skip("rolling")
             return
         await self._emit_rolling(force=False)
@@ -3547,9 +3608,11 @@ class SessionManager:
                 segments=window_segments,
                 time_start=start,
                 time_end=end,
+                previous_summary=self._state.latest_rolling_text,
             )
             if snap is not None:
                 self._state.last_rolling_at = now
+                self._state.latest_rolling_text = snap.content
         finally:
             self._state.rolling_in_flight = False
 

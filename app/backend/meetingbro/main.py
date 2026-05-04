@@ -160,12 +160,162 @@ def _runtime_settings_from_profile(profile_name: str) -> dict[str, object]:
         "resource_critical_rtf_threshold": _profile_float(profile, "resource_critical_rtf_threshold", "MEETINGBRO_RESOURCE_CRITICAL_RTF_THRESHOLD", 1.25),
         "resource_pressure_backlog_seconds": _profile_float(profile, "resource_pressure_backlog_seconds", "MEETINGBRO_RESOURCE_PRESSURE_BACKLOG_SECONDS", 3.0),
         "resource_critical_backlog_seconds": _profile_float(profile, "resource_critical_backlog_seconds", "MEETINGBRO_RESOURCE_CRITICAL_BACKLOG_SECONDS", 6.0),
+        "rolling_window_seconds": _profile_float(profile, "rolling_window_seconds", "MEETINGBRO_ROLLING_WINDOW_SECONDS", 180.0),
+        "summary_tail_seconds": _profile_float(profile, "summary_tail_seconds", "MEETINGBRO_SUMMARY_TAIL_SECONDS", 120.0),
+        "rolling_interval_seconds": _profile_float(profile, "rolling_interval_seconds", "MEETINGBRO_ROLLING_INTERVAL_SECONDS", 60.0),
+        "memory_interval_seconds": _profile_float(profile, "memory_interval_seconds", "MEETINGBRO_MEMORY_INTERVAL_SECONDS", 120.0),
+        "cumulative_interval_seconds": _profile_float(profile, "cumulative_interval_seconds", "MEETINGBRO_CUMULATIVE_INTERVAL_SECONDS", 180.0),
+        "refinement_interval_seconds": _profile_float(profile, "refinement_interval_seconds", "MEETINGBRO_REFINEMENT_INTERVAL_SECONDS", 180.0),
+        "min_segments_for_rolling": int(_profile_value(profile, "min_segments_for_rolling", "MEETINGBRO_MIN_SEGMENTS_FOR_ROLLING", 1)),
+        "min_segments_for_memory": int(_profile_value(profile, "min_segments_for_memory", "MEETINGBRO_MIN_SEGMENTS_FOR_MEMORY", 3)),
+        "min_segments_for_cumulative": int(_profile_value(profile, "min_segments_for_cumulative", "MEETINGBRO_MIN_SEGMENTS_FOR_CUMULATIVE", 3)),
+        "min_segments_for_refinement": int(_profile_value(profile, "min_segments_for_refinement", "MEETINGBRO_MIN_SEGMENTS_FOR_REFINEMENT", 2)),
+        "live_translation_backfill_limit": int(_profile_value(profile, "live_translation_backfill_limit", "MEETINGBRO_LIVE_TRANSLATION_BACKFILL_LIMIT", 20)),
+        "live_translation_max_pending": int(_profile_value(profile, "live_translation_max_pending", "MEETINGBRO_LIVE_TRANSLATION_MAX_PENDING", 12)),
+        "live_translation_safeguard_max_pending": int(_profile_value(profile, "live_translation_safeguard_max_pending", "MEETINGBRO_LIVE_TRANSLATION_SAFEGUARD_MAX_PENDING", 4)),
+        "fast_preview_enabled": _profile_bool(profile, "fast_preview_enabled", "MEETINGBRO_FAST_PREVIEW_ENABLED", True),
     }
 
 
 def _chunk_seconds_for_profile(profile_name: str) -> float:
     profile = runtime_profile_defaults(profile_name)
     return _profile_float(profile, "chunk_seconds", "MEETINGBRO_CHUNK_SECONDS", 0.5)
+
+
+def _language_lock_enabled_for_speech(forced_language: Optional[str]) -> bool:
+    return forced_language in {"zh", "en", "de"}
+
+
+def _resolve_preview_runtime(
+    *,
+    profile_settings: dict[str, object],
+    preview_asr: Optional[ASRAdapter],
+    preview_backend_name: str,
+    preview_device: Optional[str],
+    formal_device: str,
+) -> tuple[Optional[ASRAdapter], str, Optional[str]]:
+    if bool(profile_settings.get("fast_preview_enabled", True)):
+        return preview_asr, preview_backend_name, preview_device
+    return None, "shared", formal_device
+
+
+def _configured_preview_runtime(
+    hardware: HardwareProfile | None,
+    *,
+    formal_device: str,
+) -> tuple[str, str]:
+    preview_backend = os.environ.get("MEETINGBRO_PREVIEW_ASR_BACKEND", "").strip().lower()
+    if preview_backend == "qwen3":
+        return (
+            "qwen3",
+            _env_str_auto(
+                "MEETINGBRO_PREVIEW_QWEN3_PROVIDER",
+                hardware.recommended_qwen_provider if hardware is not None else "cpu",
+            ),
+        )
+
+    preview_size = os.environ.get("MEETINGBRO_PREVIEW_WHISPER_SIZE", "").strip()
+    if not preview_size or preview_size.lower() == "shared":
+        return "shared", formal_device
+
+    preview_default_device = "cpu"
+    if hardware is not None and hardware.recommended_whisper_device != "cuda":
+        preview_default_device = hardware.recommended_whisper_device
+    return (
+        "faster_whisper",
+        _env_str_auto("MEETINGBRO_PREVIEW_WHISPER_DEVICE", preview_default_device),
+    )
+
+
+def _should_load_preview_asr(
+    *,
+    profile_settings: dict[str, object],
+    preview_backend_name: str,
+) -> bool:
+    return bool(profile_settings.get("fast_preview_enabled", True)) and preview_backend_name != "shared"
+
+
+def _enforce_performance_requires_qwen(
+    profile_name: str,
+    *,
+    preview_backend_name: str,
+) -> tuple[str, Optional[str]]:
+    if profile_name == "performance" and preview_backend_name != "qwen3":
+        return (
+            "balanced",
+            "performance mode requires Qwen preview backend; switched to Balanced",
+        )
+    return profile_name, None
+
+
+def _maybe_start_preview_prewarm(
+    app: FastAPI,
+    *,
+    preview_asr: Optional[ASRAdapter],
+    preview_backend_name: str,
+    profile_name: str,
+    reason: str,
+) -> None:
+    if not (
+        preview_backend_name == "qwen3"
+        and preview_asr is not None
+        and _env_bool("MEETINGBRO_PREVIEW_QWEN3_PREWARM", True)
+        and hasattr(preview_asr, "prewarm")
+    ):
+        app.state.preview_asr_prewarm_future = None
+        return
+
+    loop = asyncio.get_running_loop()
+    prewarm_future = loop.run_in_executor(None, preview_asr.prewarm)  # type: ignore[attr-defined]
+
+    def _log_preview_prewarm_done(task) -> None:
+        try:
+            task.result()
+        except Exception as exc:
+            logger.warning("Qwen3 preview ASR prewarm failed: %s", exc)
+        else:
+            logger.info("Qwen3 preview ASR prewarm completed")
+
+    prewarm_future.add_done_callback(_log_preview_prewarm_done)
+    app.state.preview_asr_prewarm_future = prewarm_future
+    logger.info(
+        "starting Qwen3 preview ASR prewarm reason=%s runtime_profile=%s",
+        reason,
+        profile_name,
+    )
+
+
+async def _ensure_preview_asr_loaded(app: FastAPI, *, profile_name: str) -> None:
+    if getattr(app.state, "preview_asr", None) is not None:
+        return
+    if getattr(app.state, "preview_asr_backend_name", "shared") == "shared":
+        return
+
+    async with app.state.preview_asr_build_lock:
+        if getattr(app.state, "preview_asr", None) is not None:
+            return
+
+        preview_asr = _build_preview_asr(getattr(app.state, "hardware_profile", None))
+        app.state.preview_asr = preview_asr
+        if preview_asr is None:
+            app.state.preview_asr_backend_name = "shared"
+            app.state.preview_asr_device = getattr(app.state, "formal_asr_device", "cpu")
+            app.state.preview_asr_prewarm_future = None
+            return
+
+        logger.info(
+            "loaded preview ASR on demand runtime_profile=%s backend=%s device=%s",
+            profile_name,
+            app.state.preview_asr_backend_name,
+            app.state.preview_asr_device,
+        )
+        _maybe_start_preview_prewarm(
+            app,
+            preview_asr=preview_asr,
+            preview_backend_name=app.state.preview_asr_backend_name,
+            profile_name=profile_name,
+            reason="on_demand",
+        )
 
 
 def _build_preview_asr(hardware: HardwareProfile | None = None) -> ASRAdapter | None:
@@ -255,6 +405,11 @@ def _build_preview_asr(hardware: HardwareProfile | None = None) -> ASRAdapter | 
 async def lifespan(app: FastAPI):
     _load_dotenv_if_present()
     hardware = detect_hardware_profile()
+    startup_runtime_profile = normalize_runtime_profile(
+        os.environ.get("MEETINGBRO_RUNTIME_PROFILE")
+        or getattr(hardware, "recommended_runtime_profile", DEFAULT_RUNTIME_PROFILE)
+    )
+    startup_profile_settings = _runtime_settings_from_profile(startup_runtime_profile)
     storage = Storage(Path(os.environ.get("MEETINGBRO_DB", str(DEFAULT_DB_PATH))))
     whisper_size = _env_str_auto("MEETINGBRO_WHISPER_SIZE", hardware.recommended_whisper_size)
     whisper_device = _env_str_auto("MEETINGBRO_WHISPER_DEVICE", hardware.recommended_whisper_device)
@@ -274,20 +429,16 @@ async def lifespan(app: FastAPI):
         language_detection_threshold=_env_float("MEETINGBRO_WHISPER_LANGUAGE_DETECTION_THRESHOLD", 0.5),
         language_detection_segments=_env_int("MEETINGBRO_WHISPER_LANGUAGE_DETECTION_SEGMENTS", 1),
     )
-    preview_asr = _build_preview_asr(hardware)
-    _preview_backend_env = os.environ.get("MEETINGBRO_PREVIEW_ASR_BACKEND", "").strip().lower()
-    if _preview_backend_env == "qwen3":
-        _preview_asr_backend_name = "qwen3"
-        _preview_asr_device = _env_str_auto(
-            "MEETINGBRO_PREVIEW_QWEN3_PROVIDER",
-            hardware.recommended_qwen_provider,
-        )
-    elif preview_asr is not None:
-        _preview_asr_backend_name = "faster_whisper"
-        _preview_asr_device = _env_str_auto("MEETINGBRO_PREVIEW_WHISPER_DEVICE", "cpu")
-    else:
-        _preview_asr_backend_name = "shared"
-        _preview_asr_device = whisper_device
+    _preview_asr_backend_name, _preview_asr_device = _configured_preview_runtime(
+        hardware,
+        formal_device=whisper_device,
+    )
+    preview_asr = None
+    if _should_load_preview_asr(
+        profile_settings=startup_profile_settings,
+        preview_backend_name=_preview_asr_backend_name,
+    ):
+        preview_asr = _build_preview_asr(hardware)
     app.state.storage = storage
     app.state.hardware_profile = hardware
     app.state.asr = asr
@@ -295,29 +446,24 @@ async def lifespan(app: FastAPI):
     app.state.preview_asr = preview_asr
     app.state.preview_asr_backend_name = _preview_asr_backend_name
     app.state.preview_asr_device = _preview_asr_device
-    if (
-        _preview_asr_backend_name == "qwen3"
-        and preview_asr is not None
-        and _env_bool("MEETINGBRO_PREVIEW_QWEN3_PREWARM", True)
-        and hasattr(preview_asr, "prewarm")
-    ):
-        loop = asyncio.get_running_loop()
-        prewarm_future = loop.run_in_executor(None, preview_asr.prewarm)  # type: ignore[attr-defined]
-
-        def _log_preview_prewarm_done(task) -> None:
-            try:
-                task.result()
-            except Exception as exc:
-                logger.warning("Qwen3 preview ASR prewarm failed: %s", exc)
-            else:
-                logger.info("Qwen3 preview ASR prewarm completed")
-
-        prewarm_future.add_done_callback(_log_preview_prewarm_done)
-        app.state.preview_asr_prewarm_future = prewarm_future
+    app.state.preview_asr_build_lock = asyncio.Lock()
+    if preview_asr is not None:
+        _maybe_start_preview_prewarm(
+            app,
+            preview_asr=preview_asr,
+            preview_backend_name=_preview_asr_backend_name,
+            profile_name=startup_runtime_profile,
+            reason="startup",
+        )
     else:
+        if _preview_asr_backend_name != "shared" and not bool(startup_profile_settings.get("fast_preview_enabled", True)):
+            logger.info(
+                "skipping preview ASR load because runtime profile %s disables fast preview",
+                startup_runtime_profile,
+            )
         app.state.preview_asr_prewarm_future = None
     logger.info(
-        "MeetingBro backend starting db=%s hardware=%s hardware_summary=%s whisper_size=%s whisper_device=%s compute=%s beam=%d cpu_threads=%d whisper_workers=%d preview_backend=%s preview_device=%s preview_compute=%s preview_asr_workers=%d chunk=%.2fs accum=%.2fs silence_rms=%.4f audio_conditioning=%s denoise=%s pre_vad=%s pre_vad_conditioning=%s pre_vad_threshold=%.2f pre_vad_energy_rms=%.4f pre_vad_max=%.1fs weak_rescue=%s weak_rescue_rms=%.4f..%.4f language_lock=%s asr_retry=%s asr_safeguard=%s safeguard_rtf=%.2f suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d translation_backfill=%d translation_max_pending=%d",
+        "MeetingBro backend starting db=%s hardware=%s hardware_summary=%s whisper_size=%s whisper_device=%s compute=%s beam=%d cpu_threads=%d whisper_workers=%d preview_backend=%s preview_device=%s preview_compute=%s preview_asr_workers=%d preview_loaded=%s chunk=%.2fs accum=%.2fs silence_rms=%.4f audio_conditioning=%s denoise=%s pre_vad=%s pre_vad_conditioning=%s pre_vad_threshold=%.2f pre_vad_energy_rms=%.4f pre_vad_max=%.1fs weak_rescue=%s weak_rescue_rms=%.4f..%.4f language_lock=%s asr_retry=%s asr_safeguard=%s safeguard_rtf=%.2f suspicious_no_speech=%.2f suspicious_avg_logprob=%.2f suspicious_compression=%.2f mixed_mic_gain=%.2f mixed_system_gain=%.2f mixed_auto_balance=%s mixed_max_mic_boost=%.2f asr_workers=%d summary_workers=%d translation_workers=%d translation_backfill=%d translation_max_pending=%d",
         storage._db_path,
         hardware.label,
         hardware.summary,
@@ -327,13 +473,14 @@ async def lifespan(app: FastAPI):
         _env_int("MEETINGBRO_WHISPER_BEAM_SIZE", 1),
         _env_int("MEETINGBRO_WHISPER_CPU_THREADS", 0),
         _env_int("MEETINGBRO_WHISPER_NUM_WORKERS", 1),
-        os.environ.get("MEETINGBRO_PREVIEW_WHISPER_SIZE", "shared") or "shared",
-        _env_str_auto("MEETINGBRO_PREVIEW_WHISPER_DEVICE", "cpu"),
+        _preview_asr_backend_name,
+        _preview_asr_device,
         _env_str_auto("MEETINGBRO_PREVIEW_WHISPER_COMPUTE_TYPE", "int8"),
         _env_int(
             "MEETINGBRO_PREVIEW_ASR_EXECUTOR_WORKERS",
             _recommended_preview_asr_executor_workers(),
         ),
+        preview_asr is not None,
         _env_float("MEETINGBRO_CHUNK_SECONDS", 0.5),
         _env_float("MEETINGBRO_ASR_ACCUM_SECONDS", 1.5),
         _env_float("MEETINGBRO_SILENCE_RMS_THRESHOLD", 0.002),
@@ -517,7 +664,46 @@ async def session_ws(
         runtime_profile or os.environ.get("MEETINGBRO_RUNTIME_PROFILE") or default_runtime_profile
     )
     profile_settings = _runtime_settings_from_profile(profile_name)
+    profile_settings["language_lock_enabled"] = _language_lock_enabled_for_speech(forced_language)
     chunk_seconds = _chunk_seconds_for_profile(profile_name)
+    if _should_load_preview_asr(
+        profile_settings=profile_settings,
+        preview_backend_name=getattr(app.state, "preview_asr_backend_name", "shared"),
+    ):
+        await _ensure_preview_asr_loaded(app, profile_name=profile_name)
+    session_preview_asr, session_preview_backend_name, session_preview_device = _resolve_preview_runtime(
+        profile_settings=profile_settings,
+        preview_asr=app.state.preview_asr,
+        preview_backend_name=app.state.preview_asr_backend_name,
+        preview_device=getattr(app.state, "preview_asr_device", None),
+        formal_device=getattr(app.state, "formal_asr_device", "cpu"),
+    )
+    profile_name, performance_warning = _enforce_performance_requires_qwen(
+        profile_name,
+        preview_backend_name=session_preview_backend_name,
+    )
+    if performance_warning is not None:
+        profile_settings = _runtime_settings_from_profile(profile_name)
+        profile_settings["language_lock_enabled"] = _language_lock_enabled_for_speech(forced_language)
+        chunk_seconds = _chunk_seconds_for_profile(profile_name)
+        session_preview_asr, session_preview_backend_name, session_preview_device = _resolve_preview_runtime(
+            profile_settings=profile_settings,
+            preview_asr=app.state.preview_asr,
+            preview_backend_name=app.state.preview_asr_backend_name,
+            preview_device=getattr(app.state, "preview_asr_device", None),
+            formal_device=getattr(app.state, "formal_asr_device", "cpu"),
+        )
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "error",
+                    "payload": ErrorPayload(
+                        code="performance_requires_qwen",
+                        message=performance_warning,
+                    ).model_dump(),
+                }
+            )
+        )
 
     try:
         audio_source = _build_audio_source(source, chunk_seconds=chunk_seconds)
@@ -539,16 +725,16 @@ async def session_ws(
         audio_chunk_seconds=chunk_seconds,
         runtime_profile=profile_name,
         asr=app.state.asr,
-        preview_asr=app.state.preview_asr,
-        preview_asr_backend_name=app.state.preview_asr_backend_name,
+        preview_asr=session_preview_asr,
+        preview_asr_backend_name=session_preview_backend_name,
         hardware_profile_label=getattr(app.state.hardware_profile, "label", "unknown"),
         hardware_summary=getattr(app.state.hardware_profile, "summary", None),
         formal_asr_device=getattr(app.state, "formal_asr_device", "cpu"),
-        preview_asr_device=getattr(app.state, "preview_asr_device", None),
+        preview_asr_device=session_preview_device,
         compute_gpu_available=getattr(app.state.hardware_profile, "ctranslate2_cuda_available", False),
         preview_asr_fallback_on_error=_env_bool(
             "MEETINGBRO_PREVIEW_FALLBACK_ON_ERROR",
-            app.state.preview_asr_backend_name != "qwen3",
+            session_preview_backend_name != "qwen3",
         ),
         summarizer=LLMSummarizer(),
         translator=LLMTranslator(),
@@ -602,9 +788,17 @@ async def session_ws(
         pre_vad_adaptive_trailing_silence_enabled=bool(profile_settings["pre_vad_adaptive_trailing_silence_enabled"]),
         pre_vad_adaptive_fast_trailing_silence_seconds=float(profile_settings["pre_vad_adaptive_fast_trailing_silence_seconds"]),
         pre_vad_max_segment_seconds=_env_float("MEETINGBRO_PRE_VAD_MAX_SEGMENT_SECONDS", 8.0),
-        refinement_interval_seconds=_env_float("MEETINGBRO_REFINEMENT_INTERVAL_SECONDS", 180.0),
+        rolling_window_seconds=float(profile_settings["rolling_window_seconds"]),
+        refinement_interval_seconds=float(profile_settings["refinement_interval_seconds"]),
         refinement_window_seconds=_env_float("MEETINGBRO_REFINEMENT_WINDOW_SECONDS", 0.0),
-        min_segments_for_refinement=_env_int("MEETINGBRO_MIN_SEGMENTS_FOR_REFINEMENT", 2),
+        summary_tail_seconds=float(profile_settings["summary_tail_seconds"]),
+        min_segments_for_refinement=int(profile_settings["min_segments_for_refinement"]),
+        rolling_interval_seconds=float(profile_settings["rolling_interval_seconds"]),
+        memory_interval_seconds=float(profile_settings["memory_interval_seconds"]),
+        cumulative_interval_seconds=float(profile_settings["cumulative_interval_seconds"]),
+        min_segments_for_rolling=int(profile_settings["min_segments_for_rolling"]),
+        min_segments_for_memory=int(profile_settings["min_segments_for_memory"]),
+        min_segments_for_cumulative=int(profile_settings["min_segments_for_cumulative"]),
         weak_speech_rescue_enabled=bool(profile_settings["weak_speech_rescue_enabled"]),
         weak_speech_rescue_rms_min=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MIN", 0.0008),
         weak_speech_rescue_rms_max=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_RMS_MAX", 0.02),
@@ -617,12 +811,12 @@ async def session_ws(
         weak_speech_rescue_window_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_WINDOW_SECONDS", 6.0),
         weak_speech_rescue_cooldown_seconds=_env_float("MEETINGBRO_WEAK_SPEECH_RESCUE_COOLDOWN_SECONDS", 8.0),
         language_lock_enabled=bool(profile_settings["language_lock_enabled"]),
-        live_translation_backfill_limit=_env_int("MEETINGBRO_LIVE_TRANSLATION_BACKFILL_LIMIT", 20),
-        live_translation_max_pending=_env_int("MEETINGBRO_LIVE_TRANSLATION_MAX_PENDING", 12),
-        live_translation_safeguard_max_pending=_env_int("MEETINGBRO_LIVE_TRANSLATION_SAFEGUARD_MAX_PENDING", 4),
+        live_translation_backfill_limit=int(profile_settings["live_translation_backfill_limit"]),
+        live_translation_max_pending=int(profile_settings["live_translation_max_pending"]),
+        live_translation_safeguard_max_pending=int(profile_settings["live_translation_safeguard_max_pending"]),
         audio_input_queue_max_seconds=_env_float("MEETINGBRO_AUDIO_INPUT_QUEUE_MAX_SECONDS", 8.0),
         audio_input_queue_warning_seconds=_env_float("MEETINGBRO_AUDIO_INPUT_QUEUE_WARNING_SECONDS", 3.0),
-        fast_preview_enabled=_env_bool("MEETINGBRO_FAST_PREVIEW_ENABLED", True),
+        fast_preview_enabled=bool(profile_settings["fast_preview_enabled"]),
         fast_preview_interval_seconds=_env_float("MEETINGBRO_FAST_PREVIEW_INTERVAL_SECONDS", 0.5),
         fast_preview_window_seconds=_env_float("MEETINGBRO_FAST_PREVIEW_WINDOW_SECONDS", 3.0),
         fast_preview_max_backlog_seconds=_env_float("MEETINGBRO_FAST_PREVIEW_MAX_BACKLOG_SECONDS", 0.5),
@@ -696,23 +890,66 @@ async def session_ws(
                     if next_summary_language in ("zh", "en", "de")
                     else None
                 )
+                next_profile = normalize_runtime_profile(payload.get("runtime_profile") or manager._cfg.runtime_profile)
                 forced_language = payload.get("forced_language")
                 if forced_language == "auto":
                     forced_language = None
                 elif forced_language not in (None, "zh", "en", "de"):
                     forced_language = manager._cfg.forced_language
                 live_translation_language = payload.get("subtitle_language")
+                if next_profile == "summary_only":
+                    live_translation_language = None
                 if live_translation_language == "off":
                     live_translation_language = None
                 elif live_translation_language not in (None, "zh", "en", "de"):
                     live_translation_language = manager._cfg.live_translation_language
+                if next_profile == "summary_only":
+                    live_translation_language = None
+                next_profile_settings = _runtime_settings_from_profile(next_profile)
+                next_profile_settings["language_lock_enabled"] = _language_lock_enabled_for_speech(forced_language)
+                next_chunk_seconds = _chunk_seconds_for_profile(next_profile)
+                if _should_load_preview_asr(
+                    profile_settings=next_profile_settings,
+                    preview_backend_name=getattr(app.state, "preview_asr_backend_name", "shared"),
+                ):
+                    await _ensure_preview_asr_loaded(app, profile_name=next_profile)
+                next_preview_asr, next_preview_backend_name, next_preview_device = _resolve_preview_runtime(
+                    profile_settings=next_profile_settings,
+                    preview_asr=app.state.preview_asr,
+                    preview_backend_name=app.state.preview_asr_backend_name,
+                    preview_device=getattr(app.state, "preview_asr_device", None),
+                    formal_device=getattr(app.state, "formal_asr_device", "cpu"),
+                )
+                next_profile, performance_warning = _enforce_performance_requires_qwen(
+                    next_profile,
+                    preview_backend_name=next_preview_backend_name,
+                )
+                if performance_warning is not None:
+                    next_profile_settings = _runtime_settings_from_profile(next_profile)
+                    next_profile_settings["language_lock_enabled"] = _language_lock_enabled_for_speech(forced_language)
+                    next_chunk_seconds = _chunk_seconds_for_profile(next_profile)
+                    next_preview_asr, next_preview_backend_name, next_preview_device = _resolve_preview_runtime(
+                        profile_settings=next_profile_settings,
+                        preview_asr=app.state.preview_asr,
+                        preview_backend_name=app.state.preview_asr_backend_name,
+                        preview_device=getattr(app.state, "preview_asr_device", None),
+                        formal_device=getattr(app.state, "formal_asr_device", "cpu"),
+                    )
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "payload": ErrorPayload(
+                                    code="performance_requires_qwen",
+                                    message=performance_warning,
+                                ).model_dump(),
+                            }
+                        )
+                    )
                 next_vocabulary_hint = payload.get("vocabulary_hint", manager._cfg.vocabulary_hint)
                 if next_vocabulary_hint is not None:
                     next_vocabulary_hint = str(next_vocabulary_hint).strip() or None
                 next_source = payload.get("source")
-                next_profile = normalize_runtime_profile(payload.get("runtime_profile") or manager._cfg.runtime_profile)
-                next_profile_settings = _runtime_settings_from_profile(next_profile)
-                next_chunk_seconds = _chunk_seconds_for_profile(next_profile)
                 profile_changed = next_profile != manager._cfg.runtime_profile
                 chunk_changed = abs(next_chunk_seconds - manager._cfg.audio_chunk_seconds) > 1e-6
                 if next_source and (next_source != source or (profile_changed and chunk_changed)):
@@ -734,6 +971,15 @@ async def session_ws(
                             chunk_seconds=next_chunk_seconds,
                         )
                         source = next_source
+                manager.update_preview_runtime(
+                    preview_asr=next_preview_asr,
+                    preview_asr_backend_name=next_preview_backend_name,
+                    preview_asr_device=next_preview_device,
+                    preview_asr_fallback_on_error=_env_bool(
+                        "MEETINGBRO_PREVIEW_FALLBACK_ON_ERROR",
+                        next_preview_backend_name != "qwen3",
+                    ),
+                )
                 manager.update_runtime_settings(
                     forced_language=forced_language,
                     summary_language=summary_lang,

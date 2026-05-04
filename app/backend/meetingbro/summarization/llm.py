@@ -25,11 +25,14 @@ _PROMPTS = {
         "## Open Questions, ## Important Facts. Do not invent content."
     ),
     "rolling_summary": (
-        "You are summarizing the last few minutes of a live meeting transcript. "
+        "You are producing an incremental live update for the last few minutes of a meeting transcript. "
         "The transcript may mix Chinese, English, and German; account for content in all "
         "languages and summarize in {language}. "
-        "Write a concise, factual recap in 2-4 sentences in {language}. "
-        "Cover what was just discussed; do not invent content."
+        "Write a concise factual update in 3-5 sentences in {language}. "
+        "Prioritize what changed since the previous rolling summary: new facts, updated numbers, "
+        "new decisions, newly assigned actions, and changes in certainty. "
+        "If little changed, say that explicitly in one sentence and still mention any concrete "
+        "new detail observed. Avoid generic restatement. Do not invent content."
     ),
     "cumulative_meeting_summary": (
         "You are maintaining a live meeting board for an ongoing meeting. "
@@ -158,6 +161,9 @@ class LLMSummarizer(Summarizer):
             if kind == "meeting_memory":
                 previous_label = "Previous meeting memory"
                 new_label = "New transcript to fold into memory"
+            elif kind == "rolling_summary":
+                previous_label = "Previous rolling summary (baseline)"
+                new_label = "Current transcript window (new evidence)"
             elif kind == "refined_transcript":
                 previous_label = "Cross-engine evidence and conflict notes"
                 new_label = "Raw ASR transcript to turn into a clean conversation record"

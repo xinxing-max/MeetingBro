@@ -79,12 +79,12 @@ def detect_hardware_profile() -> HardwareProfile:
         whisper_device = "cuda"
         whisper_compute = "float16"
         whisper_size = "medium"
-        runtime_profile = "balanced"
+        runtime_profile = "performance"
     else:
         whisper_device = "cpu"
         whisper_compute = "int8"
         whisper_size = "small" if cpu_count <= 4 else "medium"
-        runtime_profile = "low_latency" if cpu_count <= 4 else "balanced"
+        runtime_profile = "summary_only" if cpu_count <= 4 else "balanced"
 
     # Keep preview/Qwen on CPU by default. This separates Qwen preview from a
     # CUDA Whisper formal lane and avoids both models fighting for the same GPU.

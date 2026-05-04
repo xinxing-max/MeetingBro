@@ -89,7 +89,7 @@ export interface SessionOptions {
   summaryLanguage?: string;  // "en" | "zh" | "de"
   speechLanguage?: string;   // "auto" | "en" | "zh" | "de"
   subtitleLanguage?: string; // "off" | "en" | "zh" | "de"
-  runtimeProfile?: string;   // "balanced" | "low_latency" | "robust" | "multilingual" | "single_language"
+  runtimeProfile?: string;   // "balanced" | "performance" | "summary_only"
 }
 
 export interface SessionView {
@@ -114,7 +114,7 @@ export interface SessionView {
   saveBookmark: (label?: string) => Promise<void>;
   applyVocabulary: (value: string) => void;
   exportMeeting: (input?: ExportMeetingInput) => Promise<ExportMeetingResponse | null>;
-  requestSummary: (summaryType: Extract<SummaryType, "rolling_summary" | "cumulative_meeting_summary">) => void;
+  requestSummary: (summaryType: Extract<SummaryType, "rolling_summary" | "cumulative_meeting_summary" | "refined_transcript">) => void;
   pauseSession: () => void;
   resumeSession: () => void;
   stopSession: () => void;
@@ -159,6 +159,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
   const speechLanguage = options.speechLanguage ?? "auto";
   const subtitleLanguage = options.subtitleLanguage ?? "off";
   const runtimeProfile = options.runtimeProfile ?? "balanced";
+  const effectiveSubtitleLanguage = runtimeProfile === "summary_only" ? "off" : subtitleLanguage;
 
   useEffect(() => {
     previewSegmentRef.current = previewSegment;
@@ -582,12 +583,12 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
           source,
           summary_language: summaryLanguage,
           forced_language: speechLanguage,
-          subtitle_language: subtitleLanguage,
+          subtitle_language: effectiveSubtitleLanguage,
           runtime_profile: runtimeProfile,
         },
       }),
     );
-  }, [connected, enabled, source, speechLanguage, subtitleLanguage, summaryLanguage, runtimeProfile]);
+  }, [connected, effectiveSubtitleLanguage, enabled, source, speechLanguage, summaryLanguage, runtimeProfile]);
 
   const stopSession = useCallback(() => {
     const ws = wsRef.current;
@@ -646,7 +647,7 @@ export function useSessionSocket(options: SessionOptions = {}): SessionView {
     );
   }, []);
 
-  const requestSummary = useCallback((summaryType: Extract<SummaryType, "rolling_summary" | "cumulative_meeting_summary">) => {
+  const requestSummary = useCallback((summaryType: Extract<SummaryType, "rolling_summary" | "cumulative_meeting_summary" | "refined_transcript">) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       setLastError("cannot refresh summary — session not ready");
