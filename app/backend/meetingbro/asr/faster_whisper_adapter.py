@@ -62,6 +62,7 @@ class FasterWhisperAdapter(ASRAdapter):
         self._language_detection_threshold = language_detection_threshold
         self._language_detection_segments = max(1, language_detection_segments)
         self._model = None  # lazy
+        self._oom_fallback_activated = False
 
     def _ensure_model(self):
         if self._model is None:
@@ -83,6 +84,37 @@ class FasterWhisperAdapter(ASRAdapter):
                 num_workers=self._num_workers,
             )
         return self._model
+
+    @staticmethod
+    def _is_cuda_oom_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "out of memory" in msg
+            or "cuda failed" in msg and "memory" in msg
+            or "cublas" in msg and "alloc" in msg
+        )
+
+    def _maybe_activate_oom_fallback(self, exc: Exception) -> bool:
+        """Switch CUDA Whisper to CPU/int8 once when we hit OOM.
+
+        This keeps sessions alive on low-VRAM machines instead of repeatedly
+        dropping chunks after the first CUDA OOM.
+        """
+        if self._oom_fallback_activated:
+            return False
+        if self._device.lower() != "cuda":
+            return False
+        if not self._is_cuda_oom_error(exc):
+            return False
+
+        self._oom_fallback_activated = True
+        logger.warning(
+            "faster-whisper CUDA OOM detected; falling back to CPU/int8 for the rest of this session"
+        )
+        self._device = "cpu"
+        self._compute_type = "int8"
+        self._model = None
+        return True
 
     def transcribe(
         self,
@@ -137,7 +169,13 @@ class FasterWhisperAdapter(ASRAdapter):
                 no_speech_threshold=0.4,
             )
 
-        segments_iter, info = model.transcribe(samples, **transcribe_kwargs)
+        try:
+            segments_iter, info = model.transcribe(samples, **transcribe_kwargs)
+        except Exception as exc:
+            if not self._maybe_activate_oom_fallback(exc):
+                raise
+            model = self._ensure_model()
+            segments_iter, info = model.transcribe(samples, **transcribe_kwargs)
         detected_language = forced_language or info.language
         lang = _normalize_language(detected_language)
 

@@ -295,6 +295,9 @@ class SessionManager:
         """
 
     _PREVIEW_CONFIRMATION_WINDOWS = 2
+    _STOP_TASK_TIMEOUT_SECONDS = 6.0
+    _STOP_SUMMARY_WAIT_SECONDS = 1.5
+    _STOP_TRANSLATION_WAIT_SECONDS = 1.0
 
     def __init__(self, config: SessionConfig) -> None:
         self._cfg = config
@@ -338,6 +341,9 @@ class SessionManager:
             thread_name_prefix="meetingbro-translation",
         )
         self._preview_asr_disabled = False
+        # True when user explicitly requested a normal stop from the UI. False
+        # for transport loss / Ctrl+C shutdown where fast exit is preferred.
+        self._graceful_stop_requested = True
 
     @property
     def meeting_id(self) -> str:
@@ -697,7 +703,8 @@ class SessionManager:
         self._task = asyncio.create_task(self._run())
         self._watchdog_task = asyncio.create_task(self._audio_watchdog())
 
-    async def stop(self) -> None:
+    async def stop(self, *, graceful: bool = True) -> None:
+        self._graceful_stop_requested = graceful
         self._stopped.set()
         # Fire aclose() without blocking — for mic/loopback it just sets a threading.Event,
         # so it returns almost instantly.  We don't await here so that if it ever blocks
@@ -711,24 +718,56 @@ class SessionManager:
                 pass
         if self._task is not None:
             try:
-                await asyncio.wait_for(self._task, timeout=15.0)
+                await asyncio.wait_for(self._task, timeout=self._STOP_TASK_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 logger.warning(
-                    "session task did not finish within 15 s (likely blocked in ASR executor) — cancelling"
+                    "session task did not finish within %.1f s (likely blocked in ASR executor) — cancelling",
+                    self._STOP_TASK_TIMEOUT_SECONDS,
                 )
                 self._task.cancel()
-        # Wait for any pending summary background tasks.
-        if self._summary_tasks:
-            done, pending = await asyncio.wait(self._summary_tasks, timeout=10.0)
-            for t in pending:
-                t.cancel()
-            self._summary_tasks.clear()
+        await self._drain_background_tasks(
+            self._summary_tasks,
+            timeout=self._STOP_SUMMARY_WAIT_SECONDS,
+            label="summary",
+        )
+        await self._drain_background_tasks(
+            self._translation_tasks,
+            timeout=self._STOP_TRANSLATION_WAIT_SECONDS,
+            label="translation",
+        )
         self._cfg.storage.end_meeting(self._state.meeting_id)
         self._shutdown_executors()
         await self._emit(
             "session_state",
             self._session_state_payload(state="ended"),
         )
+
+    async def _drain_background_tasks(
+        self,
+        tasks: set[asyncio.Task[None]],
+        *,
+        timeout: float,
+        label: str,
+    ) -> None:
+        """Wait briefly for background tasks, then cancel leftovers.
+
+        Ctrl+C should stop quickly; we keep a short grace period for tasks that
+        are about to finish and then cancel the rest.
+        """
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            logger.info(
+                "stop: cancelling %d pending %s task(s) after %.1fs grace",
+                len(pending),
+                label,
+                timeout,
+            )
+            for task in pending:
+                task.cancel()
+        # Keep only tasks still running; callbacks will prune as they complete.
+        tasks.difference_update(done)
 
     async def _aclose_source(self) -> None:
         try:
@@ -2323,14 +2362,23 @@ class SessionManager:
                 await self._flush_preview_candidate()
                 await self._drain_qwen_orphan_queue()
 
-                # Wait for in-flight summary tasks before final summary.
-                if self._summary_tasks:
-                    await asyncio.wait(self._summary_tasks, timeout=15.0)
-                    self._summary_tasks.clear()
+                if self._stopped.is_set() and not self._graceful_stop_requested:
+                    logger.info(
+                        "fast shutdown requested; skipping summary/memory/finalization"
+                    )
+                    break
 
-                if self._translation_tasks:
-                    await asyncio.wait(self._translation_tasks, timeout=10.0)
-                    self._translation_tasks.clear()
+                # Wait for in-flight summary tasks before final summary.
+                await self._drain_background_tasks(
+                    self._summary_tasks,
+                    timeout=self._STOP_SUMMARY_WAIT_SECONDS,
+                    label="summary",
+                )
+                await self._drain_background_tasks(
+                    self._translation_tasks,
+                    timeout=self._STOP_TRANSLATION_WAIT_SECONDS,
+                    label="translation",
+                )
 
                 await self._emit_memory(force=True)
                 await self._emit_final()
@@ -2400,8 +2448,13 @@ class SessionManager:
         if level == "pressure":
             if kind in {"memory", "cumulative", "refined_transcript", "translation_backfill"}:
                 return False
-            if kind == "rolling" and policy == "conservative":
-                return False
+            if kind == "rolling":
+                # Under sustained pressure, keep CPU/GPU budget for realtime ASR.
+                # Conservative policy always pauses rolling summaries; balanced and
+                # quality pause only when decode is clearly above realtime.
+                rtf = self._state.asr_realtime_factor or 0.0
+                if policy == "conservative" or rtf >= (self._cfg.resource_pressure_rtf_threshold + 0.10):
+                    return False
         return True
 
     def _governor_skip(self, kind: str) -> None:
@@ -2412,6 +2465,24 @@ class SessionManager:
             self._state.resource_pressure_level,
             self._state.resource_governor_reason,
         )
+
+    def _allow_asr_retry(self) -> tuple[bool, Optional[str]]:
+        """Return whether the expensive retry pass should run for this window.
+
+        Retry improves quality for suspicious segments but doubles decode work.
+        On lower-end hardware this can destabilize realtime throughput, so we
+        disable retry adaptively whenever pressure safeguards are active.
+        """
+        if not self._cfg.asr_retry_enabled:
+            return False, "disabled by config"
+        if self._asr_safeguard_active():
+            return False, "ASR safeguard active"
+
+        level = self._update_resource_pressure()
+        if level != "normal":
+            reason = self._state.resource_governor_reason or f"resource level {level}"
+            return False, reason
+        return True, None
 
     def _schedule_summary(self, coro) -> None:
         """Run a summary coroutine as a background task."""
@@ -2512,9 +2583,6 @@ class SessionManager:
             self._schedule_translation(latest, self._cfg.live_translation_language)
 
     def _next_translation_segment(self, target_language: LanguageCode) -> Optional[TranscriptSegment]:
-        if self._state.resource_pressure_level == "critical":
-            self._governor_skip("translation")
-            return None
         requested_segment_id = self._translation_requested_segment_ids.get(target_language)
         if requested_segment_id is not None:
             for seg in reversed(self._state.segments):
@@ -2526,6 +2594,12 @@ class SessionManager:
                 return seg
             else:
                 self._translation_requested_segment_ids.pop(target_language, None)
+
+        if self._state.resource_pressure_level == "critical":
+            # Under critical pressure, preserve only the newest explicitly requested
+            # translation and drop all opportunistic/backfill work.
+            self._governor_skip("translation")
+            return None
 
         limit = max(0, self._cfg.live_translation_backfill_limit)
         if limit == 0:
@@ -2736,10 +2810,13 @@ class SessionManager:
                 wall_seconds=realtime_wall,
                 phase="realtime",
             )
+            has_retry_candidates = any(
+                self._classify_asr_segment(seg) == "retry" for seg in segments
+            )
+            retry_allowed, retry_reason = self._allow_asr_retry()
             if (
-                self._cfg.asr_retry_enabled
-                and not self._asr_safeguard_active()
-                and any(self._classify_asr_segment(seg) == "retry" for seg in segments)
+                has_retry_candidates
+                and retry_allowed
             ):
                 logger.info("retrying ASR window with higher-quality preset")
                 self._state.asr_inflight_start_wall_time = time.monotonic()
@@ -2765,6 +2842,8 @@ class SessionManager:
                 )
                 self._log_retry_outcome(segments, retry_segments)
                 return retry_segments
+            if has_retry_candidates and retry_reason:
+                logger.info("adaptive load shedding: skipping retry (%s)", retry_reason)
             return segments
         finally:
             self._state.asr_inflight_start_wall_time = None

@@ -665,6 +665,7 @@ async def session_ws(
     )
 
     forward_task = asyncio.create_task(_forward_events(manager, ws))
+    stop_requested = False
 
     try:
         while True:
@@ -754,11 +755,12 @@ async def session_ws(
                 if summary_type in {"rolling_summary", "cumulative_meeting_summary"}:
                     await manager.request_summary(summary_type)
             elif data.get("type") == "stop":
+                stop_requested = True
                 break
     except WebSocketDisconnect:
         pass
     finally:
-        await manager.stop()
+        await manager.stop(graceful=stop_requested)
         forward_task.cancel()
         try:
             await forward_task
