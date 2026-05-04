@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import difflib
 import json
@@ -10,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Awaitable, Callable, Optional
 
 import numpy as np
 
@@ -161,6 +162,12 @@ class SessionConfig:
     qwen_startup_draft_enabled: bool = True
     qwen_startup_draft_window_seconds: float = 20.0
     qwen_startup_draft_grace_seconds: float = 1.2
+    # Before a stranded Qwen preview is promoted as a low-quality draft, try one
+    # small Whisper retry on the same time span.  This preserves Qwen's realtime
+    # responsiveness while letting Whisper close gaps when it can.
+    qwen_targeted_retry_enabled: bool = True
+    qwen_targeted_retry_margin_seconds: float = 0.35
+    qwen_targeted_retry_max_audio_seconds: float = 5.0
     # Executor sizing is not a user-facing tuning surface. Defaults are chosen
     # automatically in main.py and may be overridden only via hidden env vars.
     asr_executor_workers: int = 1
@@ -232,12 +239,15 @@ class _State:
     filler_filtered_total: int = 0
     audio_input_backlog_seconds: float = 0.0
     audio_input_queue_drop_total: int = 0
+    audio_queue_wait_seconds: Optional[float] = None
     fast_preview_attempts: int = 0
     fast_preview_emitted: int = 0
     fast_preview_skipped: int = 0
     fast_preview_last_audio_seconds: Optional[float] = None
     fast_preview_last_wall_seconds: Optional[float] = None
     fast_preview_realtime_factor: Optional[float] = None
+    fast_preview_schedule_delay_seconds: Optional[float] = None
+    snapshot_concat_wall_seconds: Optional[float] = None
     fast_preview_inflight: bool = False
     fast_preview_segment: Optional[TranscriptSegment] = None
     preview_continued_during_formal: int = 0
@@ -261,6 +271,11 @@ class _State:
     # higher-quality version takes its place in the frontend.
     qwen_committed_drafts: dict = field(default_factory=dict)
     qwen_startup_draft_promoted: bool = False
+    qwen_targeted_retry_attempts: int = 0
+    qwen_targeted_retry_recovered: int = 0
+    qwen_targeted_retry_failed: int = 0
+    qwen_targeted_retry_skipped: int = 0
+    qwen_targeted_retry_last_reason: Optional[str] = None
     first_chunk_wall_time: Optional[float] = None
     last_chunk_wall_time: Optional[float] = None
     last_voiced_chunk_wall_time: Optional[float] = None
@@ -408,6 +423,8 @@ class SessionManager:
             audio_drop_total=self._audio_drop_total,
             audio_input_backlog_seconds=self._state.audio_input_backlog_seconds,
             audio_input_queue_drop_total=self._state.audio_input_queue_drop_total,
+            audio_queue_wait_seconds=self._state.audio_queue_wait_seconds,
+            event_queue_depth=self._event_queue.qsize(),
             fast_preview_enabled=self._cfg.fast_preview_enabled,
             fast_preview_attempts=self._state.fast_preview_attempts,
             fast_preview_emitted=self._state.fast_preview_emitted,
@@ -415,6 +432,8 @@ class SessionManager:
             fast_preview_last_audio_seconds=self._state.fast_preview_last_audio_seconds,
             fast_preview_last_wall_seconds=self._state.fast_preview_last_wall_seconds,
             fast_preview_realtime_factor=self._state.fast_preview_realtime_factor,
+            fast_preview_schedule_delay_seconds=self._state.fast_preview_schedule_delay_seconds,
+            snapshot_concat_wall_seconds=self._state.snapshot_concat_wall_seconds,
             preview_continued_during_formal=self._state.preview_continued_during_formal,
             preview_stale_suppressed=self._state.preview_stale_suppressed,
             preview_alignment_compared=self._state.preview_alignment_compared,
@@ -430,6 +449,11 @@ class SessionManager:
             preview_alignment_similarity_last=self._state.preview_alignment_similarity_last,
             preview_unconfirmed_after_formal=self._state.preview_unconfirmed_after_formal,
             preview_unconfirmed_last_text=self._state.preview_unconfirmed_last_text,
+            qwen_targeted_retry_attempts=self._state.qwen_targeted_retry_attempts,
+            qwen_targeted_retry_recovered=self._state.qwen_targeted_retry_recovered,
+            qwen_targeted_retry_failed=self._state.qwen_targeted_retry_failed,
+            qwen_targeted_retry_skipped=self._state.qwen_targeted_retry_skipped,
+            qwen_targeted_retry_last_reason=self._state.qwen_targeted_retry_last_reason,
             mixed_microphone_gain=mixed_microphone_gain,
             mixed_system_gain=mixed_system_gain,
             mixed_effective_microphone_gain=mixed_effective_microphone_gain,
@@ -949,7 +973,10 @@ class SessionManager:
             )
         return merged
 
-    async def _promote_time_stranded_previews(self) -> None:
+    async def _promote_time_stranded_previews(
+        self,
+        whisper_retry: Optional[Callable[[TranscriptSegment], Awaitable[bool]]] = None,
+    ) -> None:
         """Live "no missed sentences" safety net: promote Qwen previews that are
         older than ``qwen_orphan_max_age_seconds`` with no formal Whisper coverage.
 
@@ -1013,6 +1040,13 @@ class SessionManager:
             )
             if orphan.end_time <= covered_until + 0.1:
                 continue
+
+            if whisper_retry is not None:
+                recovered = await whisper_retry(orphan)
+                if recovered:
+                    if startup_active:
+                        self._state.qwen_startup_draft_promoted = True
+                    continue
 
             promoted = TranscriptSegment(
                 id=str(uuid.uuid4()),
@@ -1388,7 +1422,7 @@ class SessionManager:
             weak_rescue_start_time: Optional[float] = None
             weak_rescue_duration: float = 0.0
             weak_rescue_last_attempt_end: float = -1_000_000.0
-            recent_audio_chunks: list[AudioChunk] = []
+            recent_audio_chunks: deque[AudioChunk] = deque()
             recent_audio_duration = 0.0
             recent_audio_max_seconds = max(
                 self._cfg.fast_preview_window_seconds + 2.0,
@@ -1409,7 +1443,7 @@ class SessionManager:
                 )
                 recent_audio_duration += len(samples) / chunk.sample_rate
                 while recent_audio_chunks and recent_audio_duration > recent_audio_max_seconds:
-                    old = recent_audio_chunks.pop(0)
+                    old = recent_audio_chunks.popleft()
                     recent_audio_duration = max(
                         0.0,
                         recent_audio_duration - len(old.samples) / old.sample_rate,
@@ -1432,6 +1466,7 @@ class SessionManager:
                 if not selected:
                     return None
                 selected.reverse()
+                concat_start = time.perf_counter()
                 samples = np.concatenate([chunk.samples for chunk in selected]).astype(np.float32, copy=False)
                 if len(samples) > target_frames:
                     samples = samples[-target_frames:]
@@ -1458,7 +1493,175 @@ class SessionManager:
                         samples = samples[trim_frames:]
                         buf_start = clip_start
 
-                return samples.copy(), sample_rate, buf_start
+                out = samples.copy()
+                self._state.snapshot_concat_wall_seconds = time.perf_counter() - concat_start
+                return out, sample_rate, buf_start
+
+            def snapshot_audio_span(
+                start_time: float,
+                end_time: float,
+                *,
+                margin_seconds: float,
+            ) -> tuple[np.ndarray, int, float] | None:
+                if not recent_audio_chunks:
+                    return None
+                sample_rate = recent_audio_chunks[-1].sample_rate
+                span_start = max(0.0, start_time - margin_seconds)
+                span_end = end_time + margin_seconds
+                if span_end <= span_start:
+                    return None
+
+                slices: list[np.ndarray] = []
+                actual_start: Optional[float] = None
+                for chunk in recent_audio_chunks:
+                    if chunk.sample_rate != sample_rate:
+                        continue
+                    chunk_start = chunk.start_time
+                    chunk_end = chunk_start + len(chunk.samples) / sample_rate
+                    if chunk_end <= span_start or chunk_start >= span_end:
+                        continue
+                    start_idx = max(0, int(round((span_start - chunk_start) * sample_rate)))
+                    end_idx = min(len(chunk.samples), int(round((span_end - chunk_start) * sample_rate)))
+                    if end_idx <= start_idx:
+                        continue
+                    if actual_start is None:
+                        actual_start = chunk_start + start_idx / sample_rate
+                    slices.append(chunk.samples[start_idx:end_idx])
+
+                if not slices or actual_start is None:
+                    return None
+                samples = np.concatenate(slices).astype(np.float32, copy=False)
+                return samples.copy(), sample_rate, actual_start
+
+            async def try_whisper_retry_for_qwen(orphan: TranscriptSegment) -> bool:
+                if not self._cfg.qwen_targeted_retry_enabled:
+                    self._state.qwen_targeted_retry_skipped += 1
+                    self._state.qwen_targeted_retry_last_reason = "disabled"
+                    return False
+                if self._update_resource_pressure() != "normal":
+                    self._state.qwen_targeted_retry_skipped += 1
+                    self._state.qwen_targeted_retry_last_reason = self._state.resource_pressure_level
+                    return False
+
+                margin = max(0.0, self._cfg.qwen_targeted_retry_margin_seconds)
+                requested_audio_seconds = (orphan.end_time - orphan.start_time) + (2.0 * margin)
+                if requested_audio_seconds > self._cfg.qwen_targeted_retry_max_audio_seconds:
+                    self._state.qwen_targeted_retry_skipped += 1
+                    self._state.qwen_targeted_retry_last_reason = "span_too_long"
+                    return False
+
+                snap = snapshot_audio_span(orphan.start_time, orphan.end_time, margin_seconds=margin)
+                if snap is None:
+                    self._state.qwen_targeted_retry_skipped += 1
+                    self._state.qwen_targeted_retry_last_reason = "audio_unavailable"
+                    return False
+
+                samples, sample_rate, buf_start = snap
+                if samples.size == 0:
+                    self._state.qwen_targeted_retry_skipped += 1
+                    self._state.qwen_targeted_retry_last_reason = "empty_audio"
+                    return False
+
+                samples = audio_conditioner.process_samples(samples)
+                prompt = self._build_whisper_prompt()
+                effective_lang = self._cfg.forced_language or (
+                    self._state.locked_language if self._cfg.language_lock_enabled else None
+                )
+                audio_seconds = len(samples) / sample_rate
+                self._state.qwen_targeted_retry_attempts += 1
+                self._state.qwen_targeted_retry_last_reason = None
+                logger.info(
+                    "qwen_targeted_retry attempt [%.2f-%.2f] audio=%.2fs text=%r",
+                    orphan.start_time,
+                    orphan.end_time,
+                    audio_seconds,
+                    orphan.text.strip()[:80],
+                )
+
+                try:
+                    self._state.asr_inflight_start_wall_time = time.monotonic()
+                    self._state.asr_inflight_audio_seconds = audio_seconds
+                    self._state.asr_inflight_phase = "qwen_retry"
+                    await self._emit_compute_activity_state()
+                    start = time.perf_counter()
+                    segments = await loop.run_in_executor(
+                        self._asr_executor,
+                        lambda m=samples, sr=sample_rate, p=prompt, fl=effective_lang: self._cfg.asr.transcribe(
+                            m,
+                            sr,
+                            forced_language=fl,
+                            offset_seconds=0.0,
+                            initial_prompt=p,
+                            quality_preset="retry",
+                        ),
+                    )
+                    wall = time.perf_counter() - start
+                    self._record_asr_timing(
+                        audio_seconds=audio_seconds,
+                        wall_seconds=wall,
+                        phase="qwen_retry",
+                    )
+                except Exception as exc:
+                    self._state.qwen_targeted_retry_failed += 1
+                    self._state.qwen_targeted_retry_last_reason = "asr_error"
+                    logger.debug("qwen_targeted_retry failed: %s", exc)
+                    return False
+                finally:
+                    self._state.asr_inflight_start_wall_time = None
+                    self._state.asr_inflight_audio_seconds = None
+                    self._state.asr_inflight_phase = None
+                    await self._emit_compute_activity_state()
+
+                candidates: list[TranscriptSegment] = []
+                for asr_seg in segments:
+                    abs_start = buf_start + asr_seg.start_time
+                    abs_end = buf_start + asr_seg.end_time
+                    if abs_start >= orphan.end_time + margin or abs_end <= orphan.start_time - margin:
+                        continue
+                    if self._is_pure_filler(asr_seg.text, asr_seg.language):
+                        self._state.filler_filtered_total += 1
+                        continue
+                    if self._classify_asr_segment(asr_seg) != "keep":
+                        continue
+                    text = asr_seg.text.strip()
+                    if not text or text == self._state.last_emitted_text:
+                        continue
+                    candidates.append(
+                        TranscriptSegment(
+                            id=str(uuid.uuid4()),
+                            meeting_id=self._state.meeting_id,
+                            start_time=abs_start,
+                            end_time=abs_end,
+                            text=text,
+                            original_language=asr_seg.language,
+                            confidence=asr_seg.confidence,
+                            quality=self._compute_quality(asr_seg),
+                            created_at=datetime.now(tz=timezone.utc),
+                            emitted_at_elapsed_seconds=max(self._state.elapsed_seconds, abs_end),
+                        )
+                    )
+
+                if not candidates:
+                    self._state.qwen_targeted_retry_failed += 1
+                    self._state.qwen_targeted_retry_last_reason = "no_usable_whisper_text"
+                    return False
+
+                for seg in candidates:
+                    await self._persist_and_emit_segment(seg)
+                self._schedule_summary(self._maybe_emit_rolling())
+                self._schedule_summary(self._maybe_emit_memory())
+                self._schedule_summary(self._maybe_emit_cumulative())
+                self._schedule_summary(self._maybe_emit_refined_transcript())
+                self._state.qwen_targeted_retry_recovered += len(candidates)
+                self._state.qwen_targeted_retry_last_reason = "recovered"
+                logger.info(
+                    "qwen_targeted_retry recovered %d segment(s) for [%.2f-%.2f]",
+                    len(candidates),
+                    orphan.start_time,
+                    orphan.end_time,
+                )
+                await self._emit_transcript_preview()
+                return True
 
             def clear_weak_rescue_buffer() -> None:
                 nonlocal weak_rescue_start_time, weak_rescue_duration
@@ -1821,11 +2024,15 @@ class SessionManager:
                 interval = max(0.2, self._cfg.fast_preview_interval_seconds)
                 try:
                     while not self._stopped.is_set():
+                        scheduled_wakeup = loop.time() + interval
                         try:
                             await asyncio.wait_for(self._stopped.wait(), timeout=interval)
                             return
                         except asyncio.TimeoutError:
-                            pass
+                            self._state.fast_preview_schedule_delay_seconds = max(
+                                0.0,
+                                loop.time() - scheduled_wakeup,
+                            )
                         if source_generation != self._audio_source_generation or source is not self._cfg.audio_source:
                             return
                         if not self._pause_gate.is_set():
@@ -1901,7 +2108,9 @@ class SessionManager:
 
                         # Safety net: promote any Qwen previews that are too old
                         # without formal Whisper coverage ("no missed sentences").
-                        await self._promote_time_stranded_previews()
+                        await self._promote_time_stranded_previews(
+                            whisper_retry=try_whisper_retry_for_qwen,
+                        )
                 except asyncio.CancelledError:
                     raise
 
@@ -1937,6 +2146,7 @@ class SessionManager:
                                 self._state.audio_input_backlog_seconds - dropped_seconds,
                             )
                             self._state.audio_input_queue_drop_total += 1
+                        raw_chunk.enqueue_wall_time = time.monotonic()
                         await audio_queue.put(raw_chunk)
                         self._state.audio_input_backlog_seconds += chunk_seconds
                 except Exception as exc:
@@ -1958,6 +2168,11 @@ class SessionManager:
                     raw_chunk = await audio_queue.get()
                     if raw_chunk is None:
                         break
+                    if raw_chunk.enqueue_wall_time is not None:
+                        self._state.audio_queue_wait_seconds = max(
+                            0.0,
+                            time.monotonic() - raw_chunk.enqueue_wall_time,
+                        )
                     chunk_seconds = len(raw_chunk.samples) / raw_chunk.sample_rate
                     self._state.audio_input_backlog_seconds = max(
                         0.0,
@@ -3001,6 +3216,8 @@ class SessionManager:
             return
         self._translation_in_flight.add(task_key)
         try:
+            if self._stopped.is_set():
+                return
             loop = asyncio.get_running_loop()
             translated = await loop.run_in_executor(
                 self._translation_executor,
@@ -3024,6 +3241,9 @@ class SessionManager:
                 ),
             )
         except Exception as exc:
+            if "cannot schedule new futures after shutdown" in str(exc):
+                logger.debug("translation skipped (session shutting down): %s -> %s", seg.id, target_language)
+                return
             logger.warning("live transcript translation failed for %s -> %s: %s", seg.id, target_language, exc)
         finally:
             self._translation_in_flight.discard(task_key)

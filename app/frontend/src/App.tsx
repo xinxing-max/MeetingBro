@@ -1,9 +1,30 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ExportMeetingResponse, SummarySnapshot } from "./types";
+import type { CSSProperties } from "react";
+import type { ExportMeetingResponse, SummarySnapshot, TranscriptSegment } from "./types";
 import { useSessionSocket } from "./session/useSessionSocket";
 import type { ExportMeetingInput } from "./session/useSessionSocket";
 
 const VOCABULARY_STORAGE_KEY = "meetingbro.vocabulary";
+const PREVIEW_HANDOFF_TOLERANCE_SECONDS = 0.35;
+const FORMAL_SEGMENT_STAGGER_MS = 75;
+const FORMAL_CELL_STAGGER_MS = 55;
+const PREVIEW_ROW_STAGGER_MS = 45;
+const PREVIEW_CELL_STAGGER_MS = 45;
+
+type StaggerStyle = CSSProperties & {
+  "--segment-delay"?: string;
+  "--segment-text-delay"?: string;
+  "--preview-status-delay"?: string;
+  "--preview-text-delay"?: string;
+};
+
+function hasPreviewHandoff(segment: TranscriptSegment, previews: readonly TranscriptSegment[]): boolean {
+  return previews.some((preview) => (
+    preview.end_time <= segment.end_time + PREVIEW_HANDOFF_TOLERANCE_SECONDS &&
+    preview.end_time >= segment.start_time - PREVIEW_HANDOFF_TOLERANCE_SECONDS
+  ));
+}
+
 
 function formatRange(start: number, end: number): string {
   const fmt = (s: number) => {
@@ -348,7 +369,7 @@ export default function App() {
   const [computeActivityHold, setComputeActivityHold] = useState({ cpu: false, gpu: false });
   const [vocabularyOpen, setVocabularyOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<"summary" | "clean" | "board" | "notes">("summary");
-  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, previewSegments, isExperimentalPreview, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, requestSummary, pauseSession, resumeSession, stopSession } =
+  const { connected, state, meetingId, sessionStartedAt, elapsedSeconds, sessionStats, segments, previewSegment, previewSegments, isExperimentalPreview, previewDisplayText, previewIsStreaming, departingPreviewSegments, latestByType, historyByType, notes, lastError, saveNote, saveBookmark, applyVocabulary, exportMeeting, requestSummary, pauseSession, resumeSession, stopSession } =
     useSessionSocket({ enabled: sessionEnabled, source, speechLanguage, summaryLanguage, subtitleLanguage, runtimeProfile });
 
   const rolling = latestByType.rolling_summary;
@@ -435,13 +456,53 @@ export default function App() {
   const chapters = useMemo(() => chapterSnapshot ? parseSnapshotList(chapterSnapshot.content) : [], [chapterSnapshot]);
   const actionItems = useMemo(() => actionItemSnapshot ? parseSnapshotList(actionItemSnapshot.content) : [], [actionItemSnapshot]);
   const latestSegment = segments.at(-1);
+  const [newSegmentOrders, setNewSegmentOrders] = useState<Record<string, number>>({});
+  const segmentAnimationKnownIdsRef = useRef<Set<string>>(new Set());
   const latestVisualSegment = previewSegment ?? latestSegment;
+  const handoffPreviewSegments = useMemo(
+    () => [...departingPreviewSegments, ...previewSegments],
+    [departingPreviewSegments, previewSegments],
+  );
+  const shouldShowPreviewStack = state === "running" || departingPreviewSegments.length > 0 || previewSegments.length > 0;
   const previewStackRevision = useMemo(
-    () => previewSegments.map((segment) => `${segment.id}:${segment.text}`).join("|"),
-    [previewSegments],
+    () => handoffPreviewSegments.map((segment) => `${segment.id}:${segment.text}`).join("|"),
+    [handoffPreviewSegments],
   );
   const latestSegmentRevision = latestSegment ? `${latestSegment.id}:${latestSegment.text}` : "";
   const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    const knownIds = segmentAnimationKnownIdsRef.current;
+
+    if (segments.length === 0) {
+      knownIds.clear();
+      setNewSegmentOrders({});
+      return;
+    }
+
+    const newlyAdded = segments.filter((segment) => !knownIds.has(segment.id));
+    segments.forEach((segment) => knownIds.add(segment.id));
+
+    if (newlyAdded.length === 0) {
+      return;
+    }
+
+    const addedOrders = Object.fromEntries(
+      newlyAdded.map((segment, index) => [segment.id, index]),
+    ) as Record<string, number>;
+    const addedIds = new Set(newlyAdded.map((segment) => segment.id));
+    setNewSegmentOrders((prev) => ({ ...prev, ...addedOrders }));
+    const timer = window.setTimeout(() => {
+      setNewSegmentOrders((prev) => {
+        const next = { ...prev };
+        addedIds.forEach((id) => {
+          delete next[id];
+        });
+        return next;
+      });
+    }, 1100);
+    return () => window.clearTimeout(timer);
+  }, [segments]);
 
   useEffect(() => {
     if (!sessionEnabled) return;
@@ -542,11 +603,15 @@ export default function App() {
   const audioDropTotal = sessionStats?.audio_drop_total ?? 0;
   const audioInputBacklogSeconds = sessionStats?.audio_input_backlog_seconds ?? 0;
   const audioInputQueueDropTotal = sessionStats?.audio_input_queue_drop_total ?? 0;
+  const audioQueueWaitSeconds = sessionStats?.audio_queue_wait_seconds ?? null;
+  const eventQueueDepth = sessionStats?.event_queue_depth ?? 0;
   const fastPreviewEnabled = sessionStats?.fast_preview_enabled ?? false;
   const fastPreviewAttempts = sessionStats?.fast_preview_attempts ?? 0;
   const fastPreviewEmitted = sessionStats?.fast_preview_emitted ?? 0;
   const fastPreviewSkipped = sessionStats?.fast_preview_skipped ?? 0;
   const fastPreviewRtf = sessionStats?.fast_preview_realtime_factor ?? null;
+  const fastPreviewScheduleDelay = sessionStats?.fast_preview_schedule_delay_seconds ?? null;
+  const snapshotConcatWall = sessionStats?.snapshot_concat_wall_seconds ?? null;
   const previewContinuedDuringFormal = sessionStats?.preview_continued_during_formal ?? 0;
   const previewStaleSuppressed = sessionStats?.preview_stale_suppressed ?? 0;
   const previewAlignmentCompared = sessionStats?.preview_alignment_compared ?? 0;
@@ -554,6 +619,11 @@ export default function App() {
   const previewAlignmentSimilarityLast = sessionStats?.preview_alignment_similarity_last ?? null;
   const previewUnconfirmedAfterFormal = sessionStats?.preview_unconfirmed_after_formal ?? 0;
   const previewUnconfirmedLastText = sessionStats?.preview_unconfirmed_last_text ?? null;
+  const qwenTargetedRetryAttempts = sessionStats?.qwen_targeted_retry_attempts ?? 0;
+  const qwenTargetedRetryRecovered = sessionStats?.qwen_targeted_retry_recovered ?? 0;
+  const qwenTargetedRetryFailed = sessionStats?.qwen_targeted_retry_failed ?? 0;
+  const qwenTargetedRetrySkipped = sessionStats?.qwen_targeted_retry_skipped ?? 0;
+  const qwenTargetedRetryLastReason = sessionStats?.qwen_targeted_retry_last_reason ?? null;
   const delayTone = getDelayTone(transcriptLagSeconds);
   const activeSource = sessionStats?.source ?? source;
   const mixedMicGain = sessionStats?.mixed_microphone_gain ?? null;
@@ -804,9 +874,9 @@ export default function App() {
     latestSegmentRevision,
     visibleSubtitleRevision,
     previewSegment?.id,
-    previewSegment?.text,
     previewStackRevision,
     previewSegments.length,
+    departingPreviewSegments.length,
     latestSegment?.id,
     latestSubtitleText,
     activeSubtitleLanguage,
@@ -1155,8 +1225,8 @@ export default function App() {
               const s = item.segment;
               const confidenceTone = getConfidenceTone(s.confidence);
               const confidenceLabel = getConfidenceLabel(s.confidence);
-              const qualityStyle = s.quality === "low"
-                ? { opacity: 0.55, fontStyle: "italic" as const }
+              const qualityStyle: CSSProperties | undefined = s.quality === "low"
+                ? { opacity: 0.55, fontStyle: "italic" }
                 : s.quality === "uncertain"
                   ? { opacity: 0.7 }
                   : undefined;
@@ -1165,8 +1235,24 @@ export default function App() {
                 activeSubtitleLanguage != null &&
                 s.original_language !== activeSubtitleLanguage &&
                 !(subtitleText && subtitleText.trim());
+              const segmentOrder = newSegmentOrders[s.id];
+              const isNewSegment = segmentOrder !== undefined;
+              const segmentDelayMs = isNewSegment ? segmentOrder * FORMAL_SEGMENT_STAGGER_MS : 0;
+              const segmentStyle: StaggerStyle | undefined = isNewSegment
+                ? {
+                  ...qualityStyle,
+                  "--segment-delay": `${segmentDelayMs}ms`,
+                  "--segment-text-delay": `${segmentDelayMs + FORMAL_CELL_STAGGER_MS}ms`,
+                }
+                : qualityStyle;
+              const segmentClassName = [
+                "segment",
+                isNewSegment ? "segment-new" : "",
+                isNewSegment && hasPreviewHandoff(s, handoffPreviewSegments) ? "segment-promoted" : "",
+                confidenceTone !== "stable" ? `segment-${confidenceTone}` : "",
+              ].filter(Boolean).join(" ");
               return (
-                <div key={s.id} className={`segment ${confidenceTone !== "stable" ? `segment-${confidenceTone}` : ""}`.trim()} style={qualityStyle}>
+                <div key={s.id} className={segmentClassName} style={segmentStyle}>
                   <span className="ts">
                     {formatCreatedAt(s.created_at)}
                     {confidenceLabel && <em className={`confidence-flag confidence-${confidenceTone}`}>{confidenceLabel}</em>}
@@ -1187,15 +1273,40 @@ export default function App() {
                 </div>
               );
             })}
-            {previewSegments.length > 0 && (
+            {shouldShowPreviewStack && (
               <div className="preview-stack" aria-live="polite" aria-label="Live preview transcript">
-                {previewSegments.map((segment, index) => {
-                  const age = previewSegments.length - index - 1;
+                {departingPreviewSegments.map((segment, index) => {
+                  const previewDelayMs = index * PREVIEW_ROW_STAGGER_MS;
+                  const previewStyle: StaggerStyle = {
+                    "--preview-status-delay": `${previewDelayMs}ms`,
+                    "--preview-text-delay": `${previewDelayMs + PREVIEW_CELL_STAGGER_MS}ms`,
+                  };
                   return (
-                    <div
-                      key={segment.id}
-                      className={`segment preview-segment preview-age-${Math.min(age, 4)}`}
-                    >
+                  <div key={`leaving-${segment.id}`} className="segment preview-segment preview-age-0 preview-leaving" style={previewStyle} aria-hidden="true">
+                    <span className="preview-status">
+                      <span className="preview-hearing">
+                        <span className="preview-pulse-dot" aria-hidden="true" />
+                        Listening
+                      </span>
+                    </span>
+                    <span className="preview-segment-text">{segment.text}</span>
+                  </div>
+                  );
+                })}
+                {previewSegments.length > 0 && previewSegments.map((segment, index) => {
+                  const isNewest = index === previewSegments.length - 1;
+                  const age = previewSegments.length - index - 1;
+                  const displayText = isNewest
+                    ? previewDisplayText ?? (previewIsStreaming ? "" : segment.text)
+                    : segment.text;
+                  const showCursor = isNewest && !previewIsStreaming && previewDisplayText !== null;
+                  const previewDelayMs = (departingPreviewSegments.length + index) * PREVIEW_ROW_STAGGER_MS;
+                  const previewStyle: StaggerStyle = {
+                    "--preview-status-delay": `${previewDelayMs}ms`,
+                    "--preview-text-delay": `${previewDelayMs + PREVIEW_CELL_STAGGER_MS}ms`,
+                  };
+                  return (
+                    <div key={segment.id} className={`segment preview-segment preview-age-${Math.min(age, 4)}`} style={previewStyle}>
                       <span className="preview-status">
                         <span className="preview-hearing">
                           <span className="preview-pulse-dot" aria-hidden="true" />
@@ -1210,7 +1321,10 @@ export default function App() {
                           </span>
                         )}
                       </span>
-                      <span className="preview-segment-text">{segment.text}</span>
+                      <span className="preview-segment-text">
+                        {displayText}
+                        {showCursor && <span className="preview-cursor" aria-hidden="true" />}
+                      </span>
                     </div>
                   );
                 })}
@@ -1561,6 +1675,13 @@ export default function App() {
                 </span>
               </div>
               <div className="diagnostic-card">
+                <span className="diagnostic-label">Realtime Internals</span>
+                <strong className="diagnostic-value">q {eventQueueDepth}</strong>
+                <span className="diagnostic-note">
+                  audio wait {formatLagSeconds(audioQueueWaitSeconds)} · preview wake {formatLagSeconds(fastPreviewScheduleDelay)} · concat {formatLagSeconds(snapshotConcatWall)}
+                </span>
+              </div>
+              <div className="diagnostic-card">
                 <span className="diagnostic-label">Preview Continued</span>
                 <strong className="diagnostic-value">{previewContinuedDuringFormal}</strong>
                 <span className="diagnostic-note">Qwen preview updates while formal text is pending</span>
@@ -1586,6 +1707,14 @@ export default function App() {
                 <strong className="diagnostic-value">{previewUnconfirmedAfterFormal}</strong>
                 <span className="diagnostic-note">
                   {previewUnconfirmedLastText ? `last: ${previewUnconfirmedLastText}` : "no preview has been passed by formal without overlap"}
+                </span>
+              </div>
+              <div className={`diagnostic-card delay-card delay-${qwenTargetedRetryFailed > 0 ? "warn" : "ok"}`}>
+                <span className="diagnostic-label">Qwen Recovery</span>
+                <strong className="diagnostic-value">{qwenTargetedRetryRecovered}</strong>
+                <span className="diagnostic-note">
+                  attempts {qwenTargetedRetryAttempts} · failed {qwenTargetedRetryFailed} · skipped {qwenTargetedRetrySkipped}
+                  {qwenTargetedRetryLastReason ? ` · ${qwenTargetedRetryLastReason}` : ""}
                 </span>
               </div>
               <div className={`diagnostic-card delay-card delay-${asrSafeguardActive ? "danger" : "ok"}`}>

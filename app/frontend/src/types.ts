@@ -101,6 +101,8 @@ export interface SessionStatePayload {
   audio_drop_total: number;
   audio_input_backlog_seconds: number;
   audio_input_queue_drop_total: number;
+  audio_queue_wait_seconds?: number | null;
+  event_queue_depth?: number;
   fast_preview_enabled: boolean;
   fast_preview_attempts: number;
   fast_preview_emitted: number;
@@ -108,6 +110,8 @@ export interface SessionStatePayload {
   fast_preview_last_audio_seconds: number | null;
   fast_preview_last_wall_seconds: number | null;
   fast_preview_realtime_factor: number | null;
+  fast_preview_schedule_delay_seconds?: number | null;
+  snapshot_concat_wall_seconds?: number | null;
   preview_continued_during_formal?: number;
   preview_stale_suppressed?: number;
   preview_alignment_compared?: number;
@@ -115,6 +119,11 @@ export interface SessionStatePayload {
   preview_alignment_similarity_last?: number | null;
   preview_unconfirmed_after_formal?: number;
   preview_unconfirmed_last_text?: string | null;
+  qwen_targeted_retry_attempts?: number;
+  qwen_targeted_retry_recovered?: number;
+  qwen_targeted_retry_failed?: number;
+  qwen_targeted_retry_skipped?: number;
+  qwen_targeted_retry_last_reason?: string | null;
   mixed_microphone_gain: number | null;
   mixed_system_gain: number | null;
   mixed_effective_microphone_gain: number | null;

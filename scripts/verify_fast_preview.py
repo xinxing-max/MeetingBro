@@ -1072,6 +1072,119 @@ async def main() -> int:
         return 1
     print("OK: Qwen startup draft protects opening speech without advancing formal clip boundary")
 
+    # Test H: targeted Whisper retry can consume a stranded Qwen preview and
+    # prevent low-quality Qwen draft promotion.
+    with tempfile.TemporaryDirectory() as _tmp_retry:
+        _retry_storage = Storage(Path(_tmp_retry) / "qwen_retry.db")
+        _m_retry = SessionManager(
+            SessionConfig(
+                audio_source=_RealtimeSource(),
+                asr=_StaticASR(text=None),
+                preview_asr=_StaticASR(text="qwen preview"),
+                preview_asr_backend_name="qwen3",
+                summarizer=_CountingSummarizer(),
+                translator=_NoopTranslator(),
+                storage=_retry_storage,
+                forced_language="en",
+                summary_language="en",
+                qwen_orphan_max_age_seconds=1.0,
+                qwen_startup_draft_enabled=False,
+            )
+        )
+        _m_retry._state.elapsed_seconds = 5.0
+        _m_retry._state.recent_preview_segments.append(
+            _make_segment(start_time=1.0, end_time=2.0, text="qwen should retry")
+        )
+        _retry_calls = 0
+
+        async def _retry_succeeds(_seg: _TS) -> bool:
+            nonlocal _retry_calls
+            _retry_calls += 1
+            await _m_retry._persist_and_emit_segment(
+                _make_segment(start_time=1.0, end_time=2.0, text="whisper recovered")
+            )
+            return True
+
+        await _m_retry._promote_time_stranded_previews(whisper_retry=_retry_succeeds)
+        _retry_segments = list(_m_retry._state.segments)
+        _retry_storage.close()
+    _ok_retry_called = _retry_calls == 1
+    _ok_retry_formal = len(_retry_segments) == 1 and _retry_segments[0].text == "whisper recovered"
+    _ok_retry_no_qwen_draft = len(_m_retry._state.qwen_committed_drafts) == 0
+    print(
+        "qwen-targeted-retry-consumes-orphan:",
+        f"calls={_retry_calls}",
+        f"segments={len(_retry_segments)}",
+        f"drafts={len(_m_retry._state.qwen_committed_drafts)}",
+    )
+    if not _ok_retry_called:
+        print("FAIL: targeted retry callback should be called for a stranded Qwen preview")
+        return 1
+    if not _ok_retry_formal:
+        print("FAIL: successful targeted retry should persist the Whisper recovery segment")
+        return 1
+    if not _ok_retry_no_qwen_draft:
+        print("FAIL: successful targeted retry should prevent Qwen draft promotion")
+        return 1
+    print("OK: targeted Whisper retry can consume a stranded Qwen preview before draft promotion")
+
+    # Test I: if targeted retry cannot recover, the existing Qwen draft safety
+    # net still promotes the preview so speech is not lost.
+    with tempfile.TemporaryDirectory() as _tmp_retry_fallback:
+        _fallback_storage = Storage(Path(_tmp_retry_fallback) / "qwen_retry_fallback.db")
+        _m_retry_fallback = SessionManager(
+            SessionConfig(
+                audio_source=_RealtimeSource(),
+                asr=_StaticASR(text=None),
+                preview_asr=_StaticASR(text="qwen preview"),
+                preview_asr_backend_name="qwen3",
+                summarizer=_CountingSummarizer(),
+                translator=_NoopTranslator(),
+                storage=_fallback_storage,
+                forced_language="en",
+                summary_language="en",
+                qwen_orphan_max_age_seconds=1.0,
+                qwen_startup_draft_enabled=False,
+            )
+        )
+        _m_retry_fallback._state.elapsed_seconds = 5.0
+        _m_retry_fallback._state.recent_preview_segments.append(
+            _make_segment(start_time=1.0, end_time=2.0, text="qwen fallback draft")
+        )
+        _fallback_calls = 0
+
+        async def _retry_fails(_seg: _TS) -> bool:
+            nonlocal _fallback_calls
+            _fallback_calls += 1
+            return False
+
+        await _m_retry_fallback._promote_time_stranded_previews(whisper_retry=_retry_fails)
+        _fallback_segments = list(_m_retry_fallback._state.segments)
+        _fallback_storage.close()
+    _ok_fallback_called = _fallback_calls == 1
+    _ok_fallback_qwen = (
+        len(_fallback_segments) == 1
+        and _fallback_segments[0].text == "qwen fallback draft"
+        and _fallback_segments[0].quality == "low"
+    )
+    _ok_fallback_draft_marked = len(_m_retry_fallback._state.qwen_committed_drafts) == 1
+    print(
+        "qwen-targeted-retry-fallback:",
+        f"calls={_fallback_calls}",
+        f"segments={len(_fallback_segments)}",
+        f"drafts={len(_m_retry_fallback._state.qwen_committed_drafts)}",
+    )
+    if not _ok_fallback_called:
+        print("FAIL: failed targeted retry should still be attempted once")
+        return 1
+    if not _ok_fallback_qwen:
+        print("FAIL: failed targeted retry should fall back to low-quality Qwen draft")
+        return 1
+    if not _ok_fallback_draft_marked:
+        print("FAIL: Qwen fallback draft should be tracked for later Whisper replacement")
+        return 1
+    print("OK: failed targeted retry falls back to existing Qwen draft safety net")
+
     print("OK: all stale-suppression and alignment diagnostics unit tests passed")
 
     print("ALL OK")

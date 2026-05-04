@@ -181,8 +181,13 @@ def _build_preview_asr(hardware: HardwareProfile | None = None) -> ASRAdapter | 
                 "MEETINGBRO_PREVIEW_ASR_BACKEND=qwen3 requires "
                 "MEETINGBRO_PREVIEW_QWEN3_MODEL_DIR to be set."
             )
+        # Resolve relative paths against the project root so the backend can
+        # be started from any working directory.
+        model_dir_path = Path(model_dir)
+        if not model_dir_path.is_absolute():
+            model_dir_path = PROJECT_ROOT / model_dir_path
         return Qwen3ASRAdapter(
-            model_dir=model_dir,
+            model_dir=model_dir_path,
             num_threads=_env_int(
                 "MEETINGBRO_PREVIEW_QWEN3_NUM_THREADS",
                 hardware.recommended_qwen_threads if hardware is not None else 2,
@@ -627,6 +632,9 @@ async def session_ws(
         qwen_startup_draft_enabled=_env_bool("MEETINGBRO_QWEN_STARTUP_DRAFT_ENABLED", True),
         qwen_startup_draft_window_seconds=_env_float("MEETINGBRO_QWEN_STARTUP_DRAFT_WINDOW_SECONDS", 20.0),
         qwen_startup_draft_grace_seconds=_env_float("MEETINGBRO_QWEN_STARTUP_DRAFT_GRACE_SECONDS", 1.2),
+        qwen_targeted_retry_enabled=_env_bool("MEETINGBRO_QWEN_TARGETED_RETRY_ENABLED", True),
+        qwen_targeted_retry_margin_seconds=_env_float("MEETINGBRO_QWEN_TARGETED_RETRY_MARGIN_SECONDS", 0.35),
+        qwen_targeted_retry_max_audio_seconds=_env_float("MEETINGBRO_QWEN_TARGETED_RETRY_MAX_AUDIO_SECONDS", 5.0),
         preview_stale_tolerance_seconds=_env_float("MEETINGBRO_PREVIEW_STALE_TOLERANCE_SECONDS", 0.30),
         asr_executor_workers=_env_int(
             "MEETINGBRO_ASR_EXECUTOR_WORKERS",

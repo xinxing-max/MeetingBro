@@ -115,6 +115,8 @@ class SessionStatePayload(BaseModel):
     audio_drop_total: int = 0
     audio_input_backlog_seconds: float = 0.0
     audio_input_queue_drop_total: int = 0
+    audio_queue_wait_seconds: Optional[float] = None
+    event_queue_depth: int = 0
     fast_preview_enabled: bool = False
     fast_preview_attempts: int = 0
     fast_preview_emitted: int = 0
@@ -122,6 +124,8 @@ class SessionStatePayload(BaseModel):
     fast_preview_last_audio_seconds: Optional[float] = None
     fast_preview_last_wall_seconds: Optional[float] = None
     fast_preview_realtime_factor: Optional[float] = None
+    fast_preview_schedule_delay_seconds: Optional[float] = None
+    snapshot_concat_wall_seconds: Optional[float] = None
     preview_continued_during_formal: int = 0
     preview_stale_suppressed: int = 0
     preview_alignment_compared: int = 0
@@ -129,6 +133,11 @@ class SessionStatePayload(BaseModel):
     preview_alignment_similarity_last: Optional[float] = None
     preview_unconfirmed_after_formal: int = 0
     preview_unconfirmed_last_text: Optional[str] = None
+    qwen_targeted_retry_attempts: int = 0
+    qwen_targeted_retry_recovered: int = 0
+    qwen_targeted_retry_failed: int = 0
+    qwen_targeted_retry_skipped: int = 0
+    qwen_targeted_retry_last_reason: Optional[str] = None
     mixed_microphone_gain: Optional[float] = None
     mixed_system_gain: Optional[float] = None
     mixed_effective_microphone_gain: Optional[float] = None

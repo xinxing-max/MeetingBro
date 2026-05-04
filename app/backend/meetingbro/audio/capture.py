@@ -35,6 +35,7 @@ class AudioChunk:
     samples: np.ndarray  # shape (N,), dtype float32, range ~[-1, 1]
     sample_rate: int
     start_time: float  # seconds since session start
+    enqueue_wall_time: Optional[float] = None  # monotonic timestamp for queue-latency diagnostics
 
 
 class AudioSource(ABC):
