@@ -10,7 +10,7 @@ It works with Zoom, Teams, Google Meet, BBB, and any other platform, because it 
 
 ---
 
-<video src="docs/assets/demo.mp4" autoplay loop muted playsinline width="100%"></video>
+<video src="https://github.com/user-attachments/assets/54111a42-2e80-416f-9ee5-1402a68e3cd7" autoplay loop muted playsinline width="100%"></video>
 
 ---
 
