@@ -193,6 +193,7 @@ class _State:
     meeting_id: str
     segments: list[TranscriptSegment] = field(default_factory=list)
     last_rolling_at: float = 0.0
+    last_rolling_end_time: float = 0.0  # transcript end_time of the last segment included in the previous rolling summary
     latest_rolling_text: Optional[str] = None
     last_memory_at: float = 0.0
     last_cumulative_at: float = 0.0
@@ -3601,17 +3602,28 @@ class SessionManager:
             return
         start = min(s.start_time for s in window_segments)
         end = max(s.end_time for s in window_segments)
+        # Only feed the LLM segments that are genuinely new since the last rolling
+        # summary. The previous_summary already covers everything before
+        # last_rolling_end_time, so re-sending those segments just causes the LLM
+        # to repeat already-summarized content.
+        if self._state.last_rolling_end_time > 0.0:
+            new_segments = [s for s in window_segments if s.end_time > self._state.last_rolling_end_time]
+        else:
+            new_segments = window_segments
+        if not new_segments:
+            return
         self._state.rolling_in_flight = True
         try:
             snap = await self._build_and_emit_snapshot(
                 summary_type="rolling_summary",
-                segments=window_segments,
-                time_start=start,
+                segments=new_segments,
+                time_start=min(s.start_time for s in new_segments),
                 time_end=end,
                 previous_summary=self._state.latest_rolling_text,
             )
             if snap is not None:
                 self._state.last_rolling_at = now
+                self._state.last_rolling_end_time = end
                 self._state.latest_rolling_text = snap.content
         finally:
             self._state.rolling_in_flight = False

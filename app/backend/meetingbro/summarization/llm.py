@@ -25,14 +25,16 @@ _PROMPTS = {
         "## Open Questions, ## Important Facts. Do not invent content."
     ),
     "rolling_summary": (
-        "You are producing an incremental live update for the last few minutes of a meeting transcript. "
+        "You are producing an incremental live update for a meeting. "
         "The transcript may mix Chinese, English, and German; account for content in all "
         "languages and summarize in {language}. "
-        "Write a concise factual update in 3-5 sentences in {language}. "
-        "Prioritize what changed since the previous rolling summary: new facts, updated numbers, "
-        "new decisions, newly assigned actions, and changes in certainty. "
-        "If little changed, say that explicitly in one sentence and still mention any concrete "
-        "new detail observed. Avoid generic restatement. Do not invent content."
+        "You will receive two inputs: (1) the previous rolling summary, which is already done and must NOT "
+        "be repeated or paraphrased, and (2) new transcript since that summary. "
+        "Your job is ONLY to report what is genuinely new in input (2): new facts, updated numbers, "
+        "new decisions, newly assigned actions, reversals, or additions not present in (1). "
+        "Write 2-4 sentences in {language} covering only this new content. "
+        "If the new transcript contains nothing that wasn't already covered in the previous summary, "
+        "say so in one sentence. Never restate or paraphrase the previous summary. Do not invent content."
     ),
     "cumulative_meeting_summary": (
         "You are maintaining a live meeting board for an ongoing meeting. "
@@ -162,8 +164,8 @@ class LLMSummarizer(Summarizer):
                 previous_label = "Previous meeting memory"
                 new_label = "New transcript to fold into memory"
             elif kind == "rolling_summary":
-                previous_label = "Previous rolling summary (baseline)"
-                new_label = "Current transcript window (new evidence)"
+                previous_label = "Previous rolling summary (already covered — do NOT repeat)"
+                new_label = "New transcript since last summary (focus on this)"
             elif kind == "refined_transcript":
                 previous_label = "Cross-engine evidence and conflict notes"
                 new_label = "Raw ASR transcript to turn into a clean conversation record"
