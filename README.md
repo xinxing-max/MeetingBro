@@ -10,6 +10,10 @@ It works with Zoom, Teams, Google Meet, BBB, and any other platform, because it 
 
 ---
 
+<video src="docs/assets/demo.mp4" autoplay loop muted playsinline width="100%"></video>
+
+---
+
 ## What can MeetingBro do?
 
 | Feature | Details |
