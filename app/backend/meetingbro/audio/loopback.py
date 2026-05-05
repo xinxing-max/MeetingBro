@@ -1,12 +1,15 @@
-"""Windows WASAPI system-audio loopback capture.
+"""Cross-platform system-audio loopback capture.
 
 Captures what the default output device is currently rendering — i.e. the audio
 stream the user hears from Teams / Zoom / BBB / a browser tab — and emits it
 through the same :class:`AudioSource` interface the rest of the pipeline uses.
 
-Online-meeting mode. **Windows-only for now**: WASAPI loopback is the native
-Windows mechanism for capturing system output without a virtual cable. macOS
-and Linux will land later via their own platform paths (BlackHole / PipeWire).
+Online-meeting mode: platform-specific loopback paths.
+
+- Windows: WASAPI loopback via ``soundcard``.
+- Linux: PulseAudio/PipeWire monitor capture via ``parec`` / ``pw-cat``.
+- macOS: virtual-loopback input devices (for example BlackHole) via
+  ``sounddevice``.
 
 Implementation notes
 --------------------
@@ -40,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 class SystemAudioLoopbackSource(AudioSource):
-    """Windows WASAPI loopback capture of the default output device.
+    """System loopback capture of meeting audio output.
 
     Parameters
     ----------
@@ -50,8 +53,9 @@ class SystemAudioLoopbackSource(AudioSource):
     chunk_seconds
         Duration of each emitted ``AudioChunk`` in seconds.
     speaker_name
-        Optional output-device name to capture. Substring match against the
-        soundcard speaker name. Defaults to the system default speaker.
+        Optional device hint. On Windows this is matched against the speaker
+        name (WASAPI loopback). On macOS this is matched against the virtual
+        loopback input device name (for example "BlackHole 2ch").
     native_sample_rate
         Capture rate requested from the loopback device. Most Windows output
         devices run at 48 kHz; that's the default here.
@@ -86,8 +90,16 @@ class SystemAudioLoopbackSource(AudioSource):
                 native_sample_rate=native_sample_rate,
             )
             return
+        if sys.platform == "darwin":
+            self._mac_impl = _MacLoopbackImpl(
+                sample_rate=sample_rate,
+                chunk_seconds=chunk_seconds,
+                native_sample_rate=native_sample_rate,
+                device_name=speaker_name,
+            )
+            return
         raise RuntimeError(
-            "SystemAudioLoopbackSource currently supports Windows and Linux only."
+            "SystemAudioLoopbackSource currently supports Windows, macOS, and Linux only."
         )
 
     @property
@@ -95,11 +107,15 @@ class SystemAudioLoopbackSource(AudioSource):
         # If on Linux delegate to implementation
         if hasattr(self, "_linux_impl"):
             return self._linux_impl.sample_rate
+        if hasattr(self, "_mac_impl"):
+            return self._mac_impl.sample_rate
         return self._sample_rate
 
     def drain_drops(self) -> int:
         if hasattr(self, "_linux_impl"):
             return self._linux_impl.drain_drops()
+        if hasattr(self, "_mac_impl"):
+            return self._mac_impl.drain_drops()
         with self._drop_lock:
             n = self._drop_count
             self._drop_count = 0
@@ -125,6 +141,10 @@ class SystemAudioLoopbackSource(AudioSource):
         # If Linux implementation is present, yield from it.
         if hasattr(self, "_linux_impl"):
             async for c in self._linux_impl.stream():
+                yield c
+            return
+        if hasattr(self, "_mac_impl"):
+            async for c in self._mac_impl.stream():
                 yield c
             return
 
@@ -184,7 +204,7 @@ class SystemAudioLoopbackSource(AudioSource):
         t0 = 0.0
         try:
             while not stop.is_set():
-                native_samples = await loop.run_in_executor(None, q.get)
+                native_samples = await loop.run_in_executor(None, lambda: q.get())
                 if native_samples is None:
                     break
                 resampled = _resample_mono(
@@ -208,7 +228,141 @@ class SystemAudioLoopbackSource(AudioSource):
         if hasattr(self, "_linux_impl"):
             await self._linux_impl.aclose()
             return
+        if hasattr(self, "_mac_impl"):
+            await self._mac_impl.aclose()
+            return
         self._stop.set()
+
+
+class _MacLoopbackImpl:
+    """macOS system-audio capture from a virtual loopback input device.
+
+    macOS does not expose direct system-output loopback by default. This path
+    expects a virtual driver (for example BlackHole/Soundflower/Loopback) and
+    records from that input endpoint using ``sounddevice``.
+    """
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 16_000,
+        chunk_seconds: float = 3.0,
+        native_sample_rate: int = 48_000,
+        device_name: Optional[str] = None,
+    ) -> None:
+        self._sample_rate = sample_rate
+        self._chunk_seconds = chunk_seconds
+        self._native_rate = native_sample_rate
+        self._device_name = device_name
+        self._stop = threading.Event()
+        self._q: Optional[queue.Queue] = None
+        self._drop_lock = threading.Lock()
+        self._drop_count: int = 0
+
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
+    def drain_drops(self) -> int:
+        with self._drop_lock:
+            n = self._drop_count
+            self._drop_count = 0
+        return n
+
+    def _resolve_device(self, sd) -> tuple[int, str, int]:
+        devices = sd.query_devices()
+        hint = (self._device_name or "").strip().lower()
+
+        if hint:
+            for index, dev in enumerate(devices):
+                max_inputs = int(dev.get("max_input_channels", 0) or 0)
+                name = str(dev.get("name", ""))
+                if max_inputs > 0 and hint in name.lower():
+                    return index, name, max_inputs
+            raise RuntimeError(
+                f"No macOS loopback input device matching '{self._device_name}' was found."
+            )
+
+        preferred_markers = ("blackhole", "soundflower", "loopback", "vb-cable", "ishowu")
+        for index, dev in enumerate(devices):
+            max_inputs = int(dev.get("max_input_channels", 0) or 0)
+            name = str(dev.get("name", ""))
+            if max_inputs > 0 and any(marker in name.lower() for marker in preferred_markers):
+                return index, name, max_inputs
+
+        raise RuntimeError(
+            "No macOS loopback input device found. Install a virtual audio driver "
+            "(for example BlackHole), route system output into it, then retry."
+        )
+
+    async def stream(self) -> AsyncIterator[AudioChunk]:
+        try:
+            import sounddevice as sd
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("sounddevice is required for macOS loopback capture") from exc
+
+        loop = asyncio.get_running_loop()
+        q: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=32)
+        self._q = q
+
+        device_id, device_name, max_inputs = self._resolve_device(sd)
+        channels = 2 if max_inputs >= 2 else 1
+        native_block = max(1, int(self._native_rate * self._chunk_seconds))
+
+        def _callback(indata, frames, time_info, status):  # noqa: ARG001 - sd API
+            if status:
+                logger.debug("mac loopback status: %s", status)
+            if indata is None or len(indata) == 0:
+                return
+            mono = indata.mean(axis=1).astype(np.float32, copy=False).copy()
+            try:
+                q.put_nowait(mono)
+            except queue.Full:
+                with self._drop_lock:
+                    self._drop_count += 1
+                logger.warning("mac loopback queue full - dropping chunk")
+
+        stream = sd.InputStream(
+            samplerate=self._native_rate,
+            channels=channels,
+            dtype="float32",
+            blocksize=native_block,
+            device=device_id,
+            callback=_callback,
+        )
+        stream.start()
+        logger.info(
+            "mac loopback started device=%s rate=%d block=%d target_rate=%d",
+            device_name,
+            self._native_rate,
+            native_block,
+            self._sample_rate,
+        )
+
+        t0 = 0.0
+        try:
+            while not self._stop.is_set():
+                native_samples = await loop.run_in_executor(None, lambda: q.get())
+                if native_samples is None:
+                    break
+                resampled = _resample_mono(native_samples, self._native_rate, self._sample_rate)
+                if len(resampled) == 0:
+                    continue
+                yield AudioChunk(samples=resampled, sample_rate=self._sample_rate, start_time=t0)
+                t0 += len(resampled) / self._sample_rate
+        finally:
+            stream.stop()
+            stream.close()
+            self._q = None
+            logger.info("mac loopback stopped")
+
+    async def aclose(self) -> None:
+        self._stop.set()
+        if self._q is not None:
+            try:
+                self._q.put_nowait(None)
+            except queue.Full:
+                pass
 
 
 class _LinuxLoopbackImpl:
@@ -312,7 +466,7 @@ class _LinuxLoopbackImpl:
         t0 = 0.0
         try:
             while not self._stop.is_set():
-                native_samples = await loop.run_in_executor(None, q.get)
+                native_samples = await loop.run_in_executor(None, lambda: q.get())
                 if native_samples is None:
                     break
                 resampled = _resample_mono(native_samples, native_rate, self._sample_rate)
