@@ -108,6 +108,19 @@ cd app/frontend
 npm run dev
 ```
 
+# linux 
+```bash
+sudo apt install portaudio19-dev libportaudio2
+pip install sherpa-onnx
+
+pip install huggingface_hub
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25', local_dir='models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25')"
+
+sudo chown root:root /home/ubuntu/Program/MeetingBro-main/app/frontend/node_modules/electron/dist/chrome-sandbox
+sudo chmod 4755 /home/ubuntu/Program/MeetingBro-main/app/frontend/node_modules/electron/dist/chrome-sandbox
+npm run dev
+```
+
 The Electron window opens. Select your audio device and click **Start Session**.
 
 ### Choose the right mode first
